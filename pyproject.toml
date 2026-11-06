@@ -1,6 +1,6 @@
 [project]
 name = "repoctl"
-version = "0.16.0"
+version = "0.16.1"
 description = "Independent repository control-plane runtime"
 requires-python = ">=3.11"
 dependencies = []

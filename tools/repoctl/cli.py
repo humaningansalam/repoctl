@@ -53,7 +53,7 @@ from .settings import debug_mode
 from .task_history_migration import prepare_history_witness, receipt_witness
 from .template_contract import require_compatible_template_contract
 from .tasks import LIVE, Problem, _completion_receipt_path, archive_locator_path, archive_locator_text, completion_receipt_artifact_for_task, REPO_REQUIRED_AREAS, TaskResumeSelectionStatus, _entry_mutation_paths, _require_no_integrity_problems, append_task_log, bind_task_handoff, block_task, cancel_task, collect_completion_receipt_collection, committed_range_baseline_conflicts, create_task_file, discovery_recorded, discovery_scope_delta, finish_task, load_task_resume_binding, load_tasks, live_tasks, repo_changes_since_task_start, resolve_task, resolve_task_baseline_ownerships, select_task_for_resume, start_task, task_content_audit, migrate_task_slop_text, task_baseline_ownership_evidence, task_chosen_matches_start, task_discovery_values, task_worktree_history_is_disjoint, task_handoff_is_generated_template, task_handoff_observation, task_repo_head_at_start, update_task_discovery, validate_live_task_states, validate_tasks, validate_workspace_write_path
-from .upgrade import apply_upgrade, plan_upgrade, upgrade_status, write_plan
+from .upgrade import apply_upgrade, plan_upgrade, require_upgrade_target, upgrade_status, write_plan
 
 
 class RepoctlArgparseError(RuntimeError):
@@ -2230,6 +2230,9 @@ def cmd_task_resume(args: argparse.Namespace) -> int:
             print(f"{task['id']} {task['status']} {task['path']} handoff={guidance['status']}")
             for change in guidance["handoff"].get("context_doc_changes", [])[:5]:
                 print(f"Context Docs {change['change']}: {change['path']} ({change['review_severity']})")
+            coverage = guidance["handoff"].get("context_docs_coverage") or {}
+            if coverage.get("incomplete"):
+                print(f"Context Docs observed={coverage['observed_count']}/{coverage['reference_count']} unobserved={coverage['unobserved_count']} statuses={coverage['status_counts']}")
             if payload["next_actions"]:
                 first = payload["next_actions"][0]
                 print(f"Next ({first['priority']}): {first.get('command') or first.get('path') or first['label']}")
@@ -2383,6 +2386,14 @@ def _task_resume_guidance(
             "severity": "warning",
             "code": "task_context_docs_changed",
             "message": "Explicitly referenced Context Docs changed or are missing; review source evidence before rebinding",
+            "path": task.rel_path,
+        })
+    coverage = handoff.get("context_docs_coverage") or {}
+    if coverage.get("incomplete"):
+        warnings.append({
+            "severity": "warning",
+            "code": "task_context_docs_unobserved",
+            "message": f"Context Docs observed {coverage['observed_count']} of {coverage['reference_count']} references; check statuses and unobserved coverage",
             "path": task.rel_path,
         })
     if overall_status == "inactive" and "handoff_unbound" in handoff_reasons:
@@ -7217,6 +7228,12 @@ def main(argv: list[str] | None = None) -> int:
     if preflight is not None and _requires_template_document_contract(str(preflight.command_id)):
         try:
             require_compatible_template_contract(_contract_workspace_for_args(preflight))
+        except RepoctlError:
+            return _run_cli(parser, raw_argv)
+
+    if preflight is not None and str(preflight.command_id) in {"upgrade.plan", "upgrade.apply"}:
+        try:
+            require_upgrade_target(_contract_workspace_for_args(preflight))
         except RepoctlError:
             return _run_cli(parser, raw_argv)
 

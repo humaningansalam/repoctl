@@ -7,8 +7,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "6b5fc44eb957afde0a18a3932a5472b20cb2881468cc3eca2d8e5b3e67214f71",
-      "size": 924
+      "sha256": "7217995088f873897259476b3861b23823aa5a71814b8b477d4757a165539e0c",
+      "size": 3613
     },
     {
       "path": "contracts/template-document-v1.json",
@@ -107,18 +107,18 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "cd6a951e800217c6f2f4bb0864ba49f9579ec55f87df3d0cee1ca1da9fc395eb",
+      "sha256": "9be17793f0814f2a96fbe04402722962107602b6255c3f5aaa194fbcdb82c896",
       "size": 499
     },
     {
       "path": "repoctl-upgrade-manifest.json",
-      "sha256": "e775e29e70b92b82e6838e405b391a89aae7cdf8d8fbc458b9f0eb60bc66b1c8",
+      "sha256": "18699bf3d0152b2ba29f6a875242a5dd4a7e44842750bd20251a4124c9e0d117",
       "size": 3803
     },
     {
       "path": "scripts/repoctl",
-      "sha256": "b882d60e0e29353b0a2a73ce7d1ea5c740e4ce1c6c1ccdbc2fbb8b6ef179a880",
-      "size": 371
+      "sha256": "4456f1783623845976aa16de2d612fe70f090808929c35f47e3d5a4b4f676fa3",
+      "size": 845
     },
     {
       "path": "tools/__init__.py",
@@ -147,8 +147,8 @@
     },
     {
       "path": "tools/repoctl/cli.py",
-      "sha256": "3975ed55dfc46bbb4b6b447e03eb5dcdf4adf086a63a8d4f06d9b41662623874",
-      "size": 333088
+      "sha256": "89eb4fba8120e8ea4adf0b6287c3a2593091796aec03b17fd27e5b8505ce1a02",
+      "size": 334095
     },
     {
       "path": "tools/repoctl/code_index.py",
@@ -362,8 +362,8 @@
     },
     {
       "path": "tools/repoctl/task_context_docs.py",
-      "sha256": "64daa292c1fd7583bad2265d80a960e3a66db04551388200c62ff07d532590af",
-      "size": 7664
+      "sha256": "6589884094ba780cd7663875b66ac416c553b38cd97bf08b71d656d4213aa57d",
+      "size": 13312
     },
     {
       "path": "tools/repoctl/task_history_migration.py",
@@ -377,8 +377,8 @@
     },
     {
       "path": "tools/repoctl/tasks.py",
-      "sha256": "e1f88f6efa5e6452c36cdb100c3c3af43899b03a72e9e25a7b671b3ebc4e5522",
-      "size": 236153
+      "sha256": "764a025f6e03f7d6a9fb3566e1eefa5560ca53f924a74b9932be778ac3f08b00",
+      "size": 236656
     },
     {
       "path": "tools/repoctl/template_contract.py",
@@ -387,18 +387,18 @@
     },
     {
       "path": "tools/repoctl/upgrade.py",
-      "sha256": "dcf7b652915922df879157405b851dd17175226d13e03b96898bb24bbfe04f97",
-      "size": 58327
+      "sha256": "191d21b2511a35933ca05469ada6de95990bfb70e9dcd131f6073b6911b414da",
+      "size": 60079
     },
     {
       "path": "uv.lock",
-      "sha256": "78e192203f99f36297c72475205347abcc4ca2e687fa07bc8b2d02fccbf62ab2",
+      "sha256": "63d045a837ca75b83ec215c17da48520004ac3cba5a0c099d0e9a43c49baba29",
       "size": 27453
     }
   ],
   "license_sha256": "0a5af618ecaee7a1eed1987c782fd9b8c8cb194b72c8ff839f612db91cf9e193",
   "package": "repoctl",
-  "package_version": "0.16.0",
+  "package_version": "0.16.1",
   "schema": "repoctl.separation.release-artifact",
   "schema_version": 1,
   "source_version": "0.15.3",

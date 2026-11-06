@@ -18,7 +18,7 @@ from .graph_model import digest_data
 from .markdown import append_section_entry, find_section, has_section, parse_frontmatter, parse_labeled_list_section, replace_frontmatter_line, replace_section
 from .repositories import REPO_REQUIRED_TASK_AREAS, TASK_AREAS, RepoLayout, RepoSelectorStatus, RepoTarget, RepositoryIdentitySource, default_repo_target, repo_layout, resolve_repo_selector_path, resolve_task_repo_target
 from .settings import document_language, validate_document_language
-from .task_context_docs import context_doc_changes, context_doc_paths, observe_context_docs, validate_context_doc_observation
+from .task_context_docs import context_doc_changes, context_doc_coverage, context_doc_paths, observe_context_docs, validate_context_doc_observation
 from .task_semantic_lint import semantic_log_repetition
 
 LIVE = {"todo", "doing", "blocked"}
@@ -1480,7 +1480,7 @@ def task_resume_input_digests(
         "discovery": digest_data({"section": _normalized_task_section_body(task, "Discovery")}),
         "repository": digest_data(_repository_resume_projection(root, task, layout=layout)),
         "direct_children": digest_data(_direct_child_lifecycle_projection(root, task)),
-        "context_docs": digest_data(context_docs_observation if context_docs_observation is not None else observe_context_docs(root, task.body)),
+        "context_docs": digest_data(context_docs_observation if context_docs_observation is not None else observe_context_docs(root, task.body, task_path=task.rel_path)),
     }
 
 
@@ -1562,7 +1562,7 @@ def bind_task_handoff(
     handoff = task_handoff_body(task)
     if handoff is None:
         raise RepoctlError("live task must contain a Handoff section", code="missing_handoff", path=task.rel_path)
-    observed_context_docs = observe_context_docs(root, task.body)
+    observed_context_docs = observe_context_docs(root, task.body, task_path=task.rel_path)
     data: dict[str, Any] = {
         "schema": "repoctl.task.resume_binding",
         "schema_version": RESUME_BINDING_SCHEMA_VERSION,
@@ -1602,6 +1602,8 @@ def task_handoff_observation(
             "current_revision": "",
             "changed_inputs": [],
         }
+    current_docs = observe_context_docs(root, task.body, task_path=task.rel_path)
+    coverage = context_doc_coverage(current_docs)
     handoff_problems = _live_handoff_problems(task, root)
     if handoff_problems:
         return {
@@ -1613,6 +1615,7 @@ def task_handoff_observation(
             "bound_revision": "",
             "current_revision": "",
             "changed_inputs": ["handoff"],
+            "context_docs_coverage": coverage,
         }
     if binding is None:
         current_revision = ""
@@ -1631,6 +1634,7 @@ def task_handoff_observation(
             "bound_revision": "",
             "current_revision": current_revision,
             "changed_inputs": [],
+            "context_docs_coverage": coverage,
         }
     bound_digests = binding["input_digests"]
     if not repository_observation_available:
@@ -1643,9 +1647,9 @@ def task_handoff_observation(
             "bound_revision": digest_data(bound_digests),
             "current_revision": "",
             "changed_inputs": [],
+            "context_docs_coverage": coverage,
         }
     try:
-        current_docs = observe_context_docs(root, task.body)
         current_digests = task_resume_input_digests(root, task, layout=layout, context_docs_observation=current_docs)
     except RepoctlError:
         return {
@@ -1657,6 +1661,7 @@ def task_handoff_observation(
             "bound_revision": digest_data(bound_digests),
             "current_revision": "",
             "changed_inputs": [],
+            "context_docs_coverage": coverage,
         }
     comparable_current_digests = {
         key: current_digests[key]
@@ -1668,6 +1673,8 @@ def task_handoff_observation(
         if str(bound_digests[key]) != str(comparable_current_digests[key])
     ]
     reason_codes = [f"{key}_changed" for key in changed_inputs]
+    if coverage["required_unobserved"]:
+        reason_codes.append("required_context_docs_unobserved")
     doc_changes = context_doc_changes(binding["context_docs"], current_docs)
     if str(binding.get("handoff_digest") or "") != digest_data({"handoff": handoff}):
         changed_inputs.insert(0, "handoff")
@@ -1682,6 +1689,7 @@ def task_handoff_observation(
         "bound_revision": digest_data(bound_digests),
         "current_revision": digest_data(comparable_current_digests),
         "changed_inputs": changed_inputs,
+        "context_docs_coverage": coverage,
         "context_doc_changes": doc_changes,
     }
 
@@ -4889,7 +4897,7 @@ def _live_handoff_problems(task: Task, root: Path) -> list[Problem]:
 
 
 def _context_doc_paths(task: Task) -> list[str]:
-    return context_doc_paths(task.body)
+    return context_doc_paths(task.body, task_path=task.rel_path)
 
 
 def _repo_head_from_state(root: Path, task: Task) -> str:

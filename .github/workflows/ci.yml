@@ -2,7 +2,7 @@ name: repoctl CI
 on:
   push:
     branches: [main]
-    tags: [v0.16.0]
+    tags: ['v0.16.*']
   pull_request:
   workflow_dispatch:
 permissions:
@@ -11,24 +11,34 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
-      - name: Validate version and structural extra
+      - name: Install pinned core and structural provider
+        run: uv sync --locked --extra structural
+      - name: Validate version, ownership and default launcher
         run: |
-          uv sync --locked --extra structural
           uv run --locked --extra structural python -m compileall -q tools/repoctl
-          test "$(uv run --locked --extra structural ./scripts/repoctl --version)" = "0.16.0"
-          uv run --locked --extra structural ./scripts/repoctl --help > /dev/null
+          expected="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$(./scripts/repoctl --version)" = "$expected"
+          ./scripts/repoctl --help > /dev/null
           python3 - <<'PY'
           import json, pathlib, tomllib
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
-          assert version == "0.16.0"
           assert json.loads(pathlib.Path("repoctl-upgrade-manifest.json").read_text())["version"] == version
-          for file in ("AGENTS.md", "docs/BOARD.md", "docs/PRD.md", "docs/tasks/TEMPLATE.md"):
-              assert not pathlib.Path(file).exists(), file
+          assert json.loads(pathlib.Path("ARTIFACT-MANIFEST.json").read_text())["package_version"] == version
+          for path in ("AGENTS.md", "docs/BOARD.md", "docs/PRD.md",
+                       "docs/tasks/TEMPLATE.md", "docs/tasks/PARENT_TEMPLATE.md"):
+              assert not pathlib.Path(path).exists(), path
           PY
-      - name: Rebuild byte-identical release asset
-        run: python3 .github/scripts/build_release_archive.py
+      - name: Full functionality regression and conformance
+        run: uv run --locked --extra structural pytest -q
+      - name: Rebuild byte-identical runtime asset
+        run: |
+          python3 .github/scripts/build_release_archive.py
+          first="$(sha256sum dist/repoctl-*.tar.gz | cut -d' ' -f1)"
+          python3 .github/scripts/build_release_archive.py
+          second="$(sha256sum dist/repoctl-*.tar.gz | cut -d' ' -f1)"
+          test "$first" = "$second"

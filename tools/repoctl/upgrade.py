@@ -32,6 +32,41 @@ ARCHIVE_LOCATOR_MIGRATION_VERSION = 1
 UPGRADE_PLAN_SCHEMA_VERSION = 2
 
 
+def require_upgrade_target(root: Path) -> None:
+    """Keep an embedded-runtime upgrade out of a split document workspace.
+
+    This legacy upgrade mechanism writes runtime-owned files into *root*.
+    External-runtime adopters instead install a new versioned runtime and
+    update their separate thin launcher.
+    """
+    target = root.resolve()
+    marker = target / "docs/template-contract.json"
+    if marker.exists() or marker.is_symlink():
+        raise RepoctlError(
+            "split document workspaces cannot receive embedded repoctl upgrades",
+            code="upgrade_split_workspace_forbidden",
+            path="docs/template-contract.json",
+        )
+    launcher = _assert_contained_path(target, "scripts/repoctl", code="upgrade_target_not_embedded")
+    embedded = _assert_contained_path(target, "tools/repoctl/cli.py", code="upgrade_target_not_embedded")
+    if not launcher.is_file() or not embedded.is_file():
+        raise RepoctlError(
+            "upgrade requires a legacy embedded-runtime target; use an external runtime release for split workspaces",
+            code="upgrade_target_not_embedded",
+        )
+    try:
+        with launcher.open("rb") as source:
+            launcher_head = source.read(16_384)
+    except OSError as error:
+        raise RepoctlError("cannot inspect upgrade target launcher", code="upgrade_target_unreadable") from error
+    if b"REPOCTL_WORKSPACE_ROOT" in launcher_head and b"REPOCTL_HOME" in launcher_head:
+        raise RepoctlError(
+            "external-runtime launcher must not be replaced by an embedded upgrade",
+            code="upgrade_split_workspace_forbidden",
+            path="scripts/repoctl",
+        )
+
+
 @dataclass(frozen=True)
 class UpgradeOperation:
     path: str
@@ -280,6 +315,7 @@ def _canonical_plan_hash(plan: dict[str, Any]) -> str:
 
 
 def plan_upgrade(root: Path, *, source: str | Path) -> dict[str, Any]:
+    require_upgrade_target(root)
     source_root = _source_root(source)
     manifest = _load_manifest(source_root)
     target_version = _reported_version(root)
@@ -774,6 +810,7 @@ def _verify_plan_fresh(root: Path, plan: dict[str, Any]) -> None:
 
 
 def apply_upgrade(root: Path, *, plan_file: str | Path) -> dict[str, Any]:
+    require_upgrade_target(root)
     plan_path = Path(plan_file).expanduser().resolve()
     plan = _load_plan(plan_path)
     if plan.get("conflicts"):

@@ -1,0 +1,34 @@
+{
+  "schema": "repoctl.task.takeover-benchmark",
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "billing-webhook-retry",
+      "task_id": "T-20260609184046Z",
+      "title": "Preserve idempotency during billing webhook retries",
+      "area": "ops",
+      "goal": "A retry must not create a second charge. Before implementation, verify the current idempotency rule against the latest incident analysis.",
+      "requirement_path": "docs/specs/billing-idempotency.md",
+      "requirement_original": "# Billing retries\nA duplicate event must reuse the original charge receipt.\n",
+      "requirement_changed": "# Billing retries\nA duplicate event must reuse the original charge receipt and retain the external event ID.\n",
+      "supporting_path": "docs/research/billing-incident.md",
+      "supporting_original": "# Incident\nOne retry occurred during provider recovery. No duplicate charge confirmed.\n",
+      "supporting_changed": "# Incident\nA second retry was discovered after the provider callback timed out. No duplicate charge confirmed.\n",
+      "unrelated_path": "docs/research/roadmap.md"
+    },
+    {
+      "id": "checkout-accessibility-korean",
+      "task_id": "T-20260609184047Z",
+      "title": "Restore accessible checkout failure message",
+      "area": "ops",
+      "goal": "결제 실패 안내를 화면 읽기 도구가 읽을 수 있게 수정한다. 실제 오류 조건이 바뀌면 이전 인수인계 지시를 재검토한다.",
+      "requirement_path": "docs/specs/checkout-accessibility.md",
+      "requirement_original": "# Checkout failure\nAnnounce the failed payment to screen readers without exposing card details.\n",
+      "requirement_changed": "# Checkout failure\nAnnounce the failed payment and retry instructions without exposing card details.\n",
+      "supporting_path": "docs/research/checkout-session.md",
+      "supporting_original": "# Session\nKeyboard users reached the payment error after a retry.\n",
+      "supporting_changed": "# Session\nScreen-reader users reported the retry hint was skipped after the second attempt.\n",
+      "unrelated_path": "docs/research/release-notes.md"
+    }
+  ]
+}

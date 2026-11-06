@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "natural-localization",
+      "adopter": "basic-ml-api",
+      "question": "Find the concrete implementation called by the HTTP prediction endpoint and a direct implementation behavior test. Explain wiring.",
+      "retrieval_pattern": "model_manager|\\.predict\\(",
+      "gold_paths": [
+        "src/core/model_manager.py",
+        "tests/test_model_manager_concurrency.py"
+      ]
+    },
+    {
+      "id": "takeover",
+      "adopter": "basic-ml-api",
+      "question": "You have inherited a running task: identify what to inspect before touching the inference response and how to verify it.",
+      "retrieval_pattern": "predict|handoff",
+      "gold_paths": [
+        "src/core/model_manager.py"
+      ]
+    },
+    {
+      "id": "opposite-area-distractor",
+      "adopter": "basic-ml-api",
+      "question": "A request handler returns a serialized model result. Which server-side implementation produces the data, rather than telemetry?",
+      "retrieval_pattern": "model_manager|metrics",
+      "gold_paths": [
+        "src/core/model_manager.py"
+      ]
+    },
+    {
+      "id": "requirement-drift",
+      "adopter": "basic-ml-api",
+      "question": "Investigate where prediction behavior must be checked after a response contract change, and name a direct test.",
+      "retrieval_pattern": "predict|concurrency",
+      "gold_paths": [
+        "tests/test_model_manager_concurrency.py"
+      ]
+    },
+    {
+      "id": "knowledge-reuse",
+      "adopter": "basic-ml-api",
+      "question": "Identify existing decision records to consult before changing prediction model loading behavior.",
+      "retrieval_pattern": "knowledge|model_manager",
+      "gold_paths": [
+        "src/core/model_manager.py"
+      ]
+    },
+    {
+      "id": "nonflask-localization",
+      "adopter": "playwright-multi-crawler",
+      "question": "Locate the crawler job execution implementation and a direct test of its behavior; avoid unrelated control-plane code.",
+      "retrieval_pattern": "job_runner|execute|crawl",
+      "gold_paths": [
+        "src/worker/job_runner.py",
+        "tests/test_job_runner.py"
+      ]
+    }
+  ]
+}
