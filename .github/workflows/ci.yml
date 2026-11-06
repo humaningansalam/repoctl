@@ -1,0 +1,34 @@
+name: repoctl CI
+on:
+  push:
+    branches: [main]
+    tags: [v0.16.0]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate version and structural extra
+        run: |
+          uv sync --locked --extra structural
+          uv run --locked --extra structural python -m compileall -q tools/repoctl
+          test "$(uv run --locked --extra structural ./scripts/repoctl --version)" = "0.16.0"
+          uv run --locked --extra structural ./scripts/repoctl --help > /dev/null
+          python3 - <<'PY'
+          import json, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          assert version == "0.16.0"
+          assert json.loads(pathlib.Path("repoctl-upgrade-manifest.json").read_text())["version"] == version
+          for file in ("AGENTS.md", "docs/BOARD.md", "docs/PRD.md", "docs/tasks/TEMPLATE.md"):
+              assert not pathlib.Path(file).exists(), file
+          PY
+      - name: Rebuild byte-identical release asset
+        run: python3 .github/scripts/build_release_archive.py

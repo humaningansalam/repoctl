@@ -1,0 +1,407 @@
+{
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "0a5af618ecaee7a1eed1987c782fd9b8c8cb194b72c8ff839f612db91cf9e193",
+      "size": 1068
+    },
+    {
+      "path": "README.md",
+      "sha256": "6b5fc44eb957afde0a18a3932a5472b20cb2881468cc3eca2d8e5b3e67214f71",
+      "size": 924
+    },
+    {
+      "path": "contracts/template-document-v1.json",
+      "sha256": "d6d8e3120769ec8479d326a8e25476fd0bdc8ae4a2239b8cf14bd6e1cd1cf32a",
+      "size": 402
+    },
+    {
+      "path": "docs/contracts/repoctl-debug-contract.md",
+      "sha256": "d04e617663fe0c1a20a4672a6a1c3dcf78f2ab218ecf5c07eb118e9e4a75328e",
+      "size": 2652
+    },
+    {
+      "path": "docs/contracts/repoctl-evidence-contract.md",
+      "sha256": "b34c8638cba311a8ad11c6c077f1ad5bdbb24e69437559b500f08765aaa27127",
+      "size": 7223
+    },
+    {
+      "path": "docs/contracts/repoctl-graph-contract.md",
+      "sha256": "84d16c1e3709064e7d30ed6127c1911554fbc62e99fcc90b70ff9430b55f77b5",
+      "size": 17115
+    },
+    {
+      "path": "docs/contracts/repoctl-json-contract.md",
+      "sha256": "65b5cac1f2b1438e67c8da66712ff39040dcdb3626bcba34ba36a9b058ff436f",
+      "size": 15623
+    },
+    {
+      "path": "docs/contracts/repoctl-module-boundaries.md",
+      "sha256": "26b98c67baf8dca5ea2d21da411bdd78213dfb18816a1b9d9925655af10e2cf8",
+      "size": 4612
+    },
+    {
+      "path": "docs/contracts/repoctl-task-scope-contract.md",
+      "sha256": "3f4f4e798359f5bd93e33f630d89e501c25fd2efa60138c3bac549b24a62773c",
+      "size": 4109
+    },
+    {
+      "path": "docs/contracts/template-repoctl-separation.md",
+      "sha256": "8598d7cc2d9ef26ac90fd938eaf06816826f2489f7b449adc959ea56c52d3179",
+      "size": 5984
+    },
+    {
+      "path": "docs/specs/graph/requirements.md",
+      "sha256": "147d062472a7c5af5f43deffca55143eec787f04bce3ccd9a124cb1108db66cb",
+      "size": 8008
+    },
+    {
+      "path": "docs/specs/knowledge/requirements.md",
+      "sha256": "a9029de9c2823b3617034665c96f9a1b649c14ae48f18798e3afc8c99006cb57",
+      "size": 4856
+    },
+    {
+      "path": "docs/specs/task/requirements.md",
+      "sha256": "26ee5dfd60939237a2556117e4f108762a06db5222103f14f9b5060a95ea36bc",
+      "size": 3386
+    },
+    {
+      "path": "fixtures/conformance/board.md",
+      "sha256": "e7fc015724323a67270f60b952ee63c1d065b4da6f60d3e2f3369fd78f43f3af",
+      "size": 78
+    },
+    {
+      "path": "fixtures/conformance/cases.json",
+      "sha256": "57fc2234c2dae04beac33cc5c1e89e7b675af74a1b313c9a77c2c328b1bda49e",
+      "size": 703
+    },
+    {
+      "path": "fixtures/conformance/context-doc.md",
+      "sha256": "a887bea48c9f4a5f9e5f3569a2cf18030fedf671a8d323ad7eb81adc89ff2e5a",
+      "size": 112
+    },
+    {
+      "path": "fixtures/conformance/duplicate-handoff-task.md",
+      "sha256": "6e7961f7510001f484188667b880bf76f3972ebe1e0a2cd34da8666518d06f7f",
+      "size": 1082
+    },
+    {
+      "path": "fixtures/conformance/malformed-first-file-task.md",
+      "sha256": "3c003ef7d7ff29fc8d82d467912f97bea954b3eddedffecac65dc3e13b8cf085",
+      "size": 1009
+    },
+    {
+      "path": "fixtures/conformance/missing-handoff-task.md",
+      "sha256": "a01b64e1e802c3a970983d99f3c23711a1f00834b45f0eac68f1d0fbc78c4f61",
+      "size": 730
+    },
+    {
+      "path": "fixtures/conformance/parent-task.md",
+      "sha256": "7c6f13541e0dceb97f96f380d1c01cd4f8784f4ebf545926169ff90de7d00570",
+      "size": 1001
+    },
+    {
+      "path": "fixtures/conformance/valid-task.md",
+      "sha256": "a8ce3c06c79b5005a88feef52878a3cd5623627c7dad89c8a5daf56d3fea9844",
+      "size": 1018
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "cd6a951e800217c6f2f4bb0864ba49f9579ec55f87df3d0cee1ca1da9fc395eb",
+      "size": 499
+    },
+    {
+      "path": "repoctl-upgrade-manifest.json",
+      "sha256": "e775e29e70b92b82e6838e405b391a89aae7cdf8d8fbc458b9f0eb60bc66b1c8",
+      "size": 3803
+    },
+    {
+      "path": "scripts/repoctl",
+      "sha256": "b882d60e0e29353b0a2a73ce7d1ea5c740e4ce1c6c1ccdbc2fbb8b6ef179a880",
+      "size": 371
+    },
+    {
+      "path": "tools/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "path": "tools/repoctl/__init__.py",
+      "sha256": "fda839e2b3fd81d18bef0519c7219a4f2aebd674650329e8c3fbc55907422957",
+      "size": 63
+    },
+    {
+      "path": "tools/repoctl/__main__.py",
+      "sha256": "7ce97021d5d7afd92726ccccef44081596cec70e35669545a6f09d199d55b310",
+      "size": 84
+    },
+    {
+      "path": "tools/repoctl/action_guidance.py",
+      "sha256": "a964d89827adde1171145e4be8a74a5e77e2742b5ee62295187b3cc9bdfa9311",
+      "size": 4017
+    },
+    {
+      "path": "tools/repoctl/board.py",
+      "sha256": "4293d71e03a218bf6939178bee8d6da136e59423ae8edfd5af93c59bf350cb17",
+      "size": 6016
+    },
+    {
+      "path": "tools/repoctl/cli.py",
+      "sha256": "3975ed55dfc46bbb4b6b447e03eb5dcdf4adf086a63a8d4f06d9b41662623874",
+      "size": 333088
+    },
+    {
+      "path": "tools/repoctl/code_index.py",
+      "sha256": "9cf20c8b9556d9e97c8b8488a5aeb9e2b22cd52b898c166e48f50f0edd3fe0ae",
+      "size": 17867
+    },
+    {
+      "path": "tools/repoctl/completion_catalogue.py",
+      "sha256": "0f14772cd7cfac3588f500e3c35c628541ee17f0efd9722ede97a542fd3c3bd0",
+      "size": 108370
+    },
+    {
+      "path": "tools/repoctl/component_projection.py",
+      "sha256": "8d7340d08e29db2de698678f530050b8b357c7fefc72374822ddbdc6623ac1b5",
+      "size": 35282
+    },
+    {
+      "path": "tools/repoctl/context.py",
+      "sha256": "f349d1ca8cf9dd59373051bce4b2025cda99fa4469363abd8ff4c68f3b9516ea",
+      "size": 276208
+    },
+    {
+      "path": "tools/repoctl/context_benchmark.py",
+      "sha256": "9cac33a6b5eaedfd2a4b8f93d6fbbf6d291969c3030a59cf1d0d1cd480ed05ba",
+      "size": 43002
+    },
+    {
+      "path": "tools/repoctl/context_chunks.py",
+      "sha256": "21445dce02408c4ca3c9909131b13632b5f796e6a349e19d8137eb36eb90cb87",
+      "size": 4218
+    },
+    {
+      "path": "tools/repoctl/context_model.py",
+      "sha256": "a146f64b45fe0b8d5c838542ec20900fe3edfe2f3ce51c73c34aff4096bcfb04",
+      "size": 13820
+    },
+    {
+      "path": "tools/repoctl/context_retrieval.py",
+      "sha256": "6ca4368521639ef22ecf766ca708ff6e7746ed2ecc8de4e605faa70727cb2f48",
+      "size": 35161
+    },
+    {
+      "path": "tools/repoctl/context_sources.py",
+      "sha256": "470864a5ef7ae386f2a3e0e12cf31e85cd4c1cb320236c0254555bf06ef731d0",
+      "size": 19040
+    },
+    {
+      "path": "tools/repoctl/debug.py",
+      "sha256": "defe72c4acf3bf1342f3a6f7b29becf820889db10cb5817f84df83ec2cceefc7",
+      "size": 22521
+    },
+    {
+      "path": "tools/repoctl/document_roles.py",
+      "sha256": "e584e3c09965c53553449a37e68e4043968bffa82731e3a5773acd7c8cd32f3c",
+      "size": 3820
+    },
+    {
+      "path": "tools/repoctl/evidence_store.py",
+      "sha256": "3a1c4a0748983b33c22daf5be7f569adee7e42d7d32458e17dd164def8983d6c",
+      "size": 36548
+    },
+    {
+      "path": "tools/repoctl/git.py",
+      "sha256": "c14acdf421407069c61a63e5d33bde8b5ab10b4996ac2c18489b048647109434",
+      "size": 46490
+    },
+    {
+      "path": "tools/repoctl/graph.py",
+      "sha256": "9a02f9be01b71dbfcff70872634d088ada4e070d43333eb513840a23d3abeca7",
+      "size": 137784
+    },
+    {
+      "path": "tools/repoctl/graph_code_provider.py",
+      "sha256": "4d0b75572091ccf88b22738edd5754b5a42c42e0d7555bd556ceabb9c57a093b",
+      "size": 49068
+    },
+    {
+      "path": "tools/repoctl/graph_csharp_provider.py",
+      "sha256": "382a58bb3155e6063a183a468746070070dd397ecb348275703638411ef35bc1",
+      "size": 9376
+    },
+    {
+      "path": "tools/repoctl/graph_dart_provider.py",
+      "sha256": "5577a4ef3184357afe1742c1a5efc8ddcef97a44d1925f42cfffc9e32b272a93",
+      "size": 15176
+    },
+    {
+      "path": "tools/repoctl/graph_import_resolver.py",
+      "sha256": "99b67c189c7a382101ea2572306419bafa12ac49e8923a035c222865999370a0",
+      "size": 15768
+    },
+    {
+      "path": "tools/repoctl/graph_model.py",
+      "sha256": "1032cd25a296ddff7102008704865784433129e4807ff64ccc1e1a2c591ab6c0",
+      "size": 11431
+    },
+    {
+      "path": "tools/repoctl/graph_semantic_model.py",
+      "sha256": "a2125937a1646443f91ec1e94841e0131796b85c5cd6434f9ec763717a3ab80d",
+      "size": 19712
+    },
+    {
+      "path": "tools/repoctl/graph_semantic_provider.py",
+      "sha256": "c82af3ef2c59425ec07a90063368c93572f75c3165512c075cc2891c82e507aa",
+      "size": 5679
+    },
+    {
+      "path": "tools/repoctl/graph_store.py",
+      "sha256": "f59e0488bc01cc5cf2ac6e299a8a956b044238f8c2ebb7f0752fc1e3c17acf86",
+      "size": 82378
+    },
+    {
+      "path": "tools/repoctl/graph_structured_relations.py",
+      "sha256": "19ba9900f4eace6178968b8698dbb64a19847a2a25d2e30c52e9823de5b285dc",
+      "size": 119569
+    },
+    {
+      "path": "tools/repoctl/graph_tree_sitter_provider.py",
+      "sha256": "4f76daca57e4590326ca54434793ef17c9b05eaaf1f01c9a05f8fa67fff5290d",
+      "size": 25369
+    },
+    {
+      "path": "tools/repoctl/graph_typescript_provider.py",
+      "sha256": "3661299de20872f2cef57e6a0c84f6980167ceb22e0469fdbee10ce517458038",
+      "size": 8628
+    },
+    {
+      "path": "tools/repoctl/graph_workflow.py",
+      "sha256": "c61aa3c286795f0b96857698b722d2917d14ee5f6a858119063d512a0be4c663",
+      "size": 58943
+    },
+    {
+      "path": "tools/repoctl/io.py",
+      "sha256": "89ce4a9f7cf109ee399c43e501e77d2b5effe34681f72358a434aaf980b0121a",
+      "size": 6098
+    },
+    {
+      "path": "tools/repoctl/knowledge_migration.py",
+      "sha256": "340131252ee15c418021a82b15dbb4954545a9f9c972060ff07bbdf4dd77bda7",
+      "size": 36721
+    },
+    {
+      "path": "tools/repoctl/knowledge_projection.py",
+      "sha256": "8b4664be31f3ffa3d4144450f45c1088b69f93ade9f473ac2702899767095139",
+      "size": 19770
+    },
+    {
+      "path": "tools/repoctl/knowledge_records.py",
+      "sha256": "79ae707c25fe6c62227976c3a65283d8c76350d9f9d3399fe8a893246ef51f59",
+      "size": 76220
+    },
+    {
+      "path": "tools/repoctl/language_profiles.py",
+      "sha256": "a2e62aea85a4e2b90315bdfce4ae80bff47c492b2d3345e2808a95c075ae8164",
+      "size": 17800
+    },
+    {
+      "path": "tools/repoctl/markdown.py",
+      "sha256": "f27e9e706ce56f59b0ae9d110cc17b9c627e87d57e882009580ef4c557093cd6",
+      "size": 5944
+    },
+    {
+      "path": "tools/repoctl/meta.py",
+      "sha256": "19b332933049d869d613ab2cfe74ad1330cc54e0ca3d5bd0db0b18e31338f543",
+      "size": 63051
+    },
+    {
+      "path": "tools/repoctl/path_roles.py",
+      "sha256": "95b29cb4a895c93e693431b2f6b66059325c7d24c8637dff1b95c76e564c5f79",
+      "size": 1391
+    },
+    {
+      "path": "tools/repoctl/providers/csharp_semantics.csx",
+      "sha256": "a5b1d19fdcee75b5e2e87e33174369062d7d787b9a8d889359342c19bc82b74e",
+      "size": 17844
+    },
+    {
+      "path": "tools/repoctl/providers/dart_semantics.dart",
+      "sha256": "e8070ab933442468e10b0f8d686ced846d9e6c7cfc183ff9aa12ba56685762ca",
+      "size": 25368
+    },
+    {
+      "path": "tools/repoctl/providers/typescript-5.9.3.js.gz",
+      "sha256": "267ba07bf6cc44424e250b4747d444a3d3a6c4ebe18d26c2c20e58e47e844095",
+      "size": 1633759
+    },
+    {
+      "path": "tools/repoctl/providers/typescript-LICENSE.txt",
+      "sha256": "527adf9d4c760f7367c2aeffed6a89afba8ba40ea1b0efbc8f56496ad30ea9cf",
+      "size": 9141
+    },
+    {
+      "path": "tools/repoctl/providers/typescript_semantics.js",
+      "sha256": "5d3a1b47799c2f8fea7fd5ba71594cd4c9522bc529d32b7312c141513b890950",
+      "size": 16957
+    },
+    {
+      "path": "tools/repoctl/release.py",
+      "sha256": "07a40988073283942751ee53af2af84e2cb189cb79337dc81286ff4ceab3dc2b",
+      "size": 4500
+    },
+    {
+      "path": "tools/repoctl/repositories.py",
+      "sha256": "2bdbbbe324ef97e831da4b3b101749fe78d46f21a088f4cb855c79485ee54b88",
+      "size": 32357
+    },
+    {
+      "path": "tools/repoctl/settings.py",
+      "sha256": "f1b5ade2c351ba697d8b6c268c144da3914cc2f77507d8614577611dee4be52c",
+      "size": 2005
+    },
+    {
+      "path": "tools/repoctl/task_context_docs.py",
+      "sha256": "64daa292c1fd7583bad2265d80a960e3a66db04551388200c62ff07d532590af",
+      "size": 7664
+    },
+    {
+      "path": "tools/repoctl/task_history_migration.py",
+      "sha256": "45b511be60bb79c4d174586b4fd9814ecb50683c4b3bb24c38cda22b20fa86c0",
+      "size": 41251
+    },
+    {
+      "path": "tools/repoctl/task_semantic_lint.py",
+      "sha256": "8d8296d0c3503927df9011b8222e8b0dd53382bcf26b1bf02a3f63be214eef0e",
+      "size": 2795
+    },
+    {
+      "path": "tools/repoctl/tasks.py",
+      "sha256": "e1f88f6efa5e6452c36cdb100c3c3af43899b03a72e9e25a7b671b3ebc4e5522",
+      "size": 236153
+    },
+    {
+      "path": "tools/repoctl/template_contract.py",
+      "sha256": "6bf8b9e21bdc41498949ad80ed7523a8b5375076c6a072219f36ce1941273606",
+      "size": 2354
+    },
+    {
+      "path": "tools/repoctl/upgrade.py",
+      "sha256": "dcf7b652915922df879157405b851dd17175226d13e03b96898bb24bbfe04f97",
+      "size": 58327
+    },
+    {
+      "path": "uv.lock",
+      "sha256": "78e192203f99f36297c72475205347abcc4ca2e687fa07bc8b2d02fccbf62ab2",
+      "size": 27453
+    }
+  ],
+  "license_sha256": "0a5af618ecaee7a1eed1987c782fd9b8c8cb194b72c8ff839f612db91cf9e193",
+  "package": "repoctl",
+  "package_version": "0.16.0",
+  "schema": "repoctl.separation.release-artifact",
+  "schema_version": 1,
+  "source_version": "0.15.3",
+  "status": "final",
+  "template_contract_version": "1.0.0"
+}
