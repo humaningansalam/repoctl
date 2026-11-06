@@ -18,6 +18,12 @@ jobs:
           python-version: "3.11"
       - name: Install pinned core and structural provider
         run: uv sync --locked --extra structural
+      - name: Install ripgrep for complete source-retrieval regression
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y ripgrep
+          fi
+          rg --version
       - name: Validate version, ownership and default launcher
         run: |
           uv run --locked --extra structural python -m compileall -q tools/repoctl
