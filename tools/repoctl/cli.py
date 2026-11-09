@@ -52,7 +52,7 @@ from .repositories import evidence_target, workspace_target, RepoLayout, RepoTar
 from .settings import debug_mode
 from .task_history_migration import prepare_history_witness, receipt_witness
 from .template_contract import require_compatible_template_contract
-from .tasks import LIVE, Problem, _completion_receipt_path, archive_locator_path, archive_locator_text, completion_receipt_artifact_for_task, REPO_REQUIRED_AREAS, TaskResumeSelectionStatus, _entry_mutation_paths, _require_no_integrity_problems, append_task_log, bind_task_handoff, block_task, cancel_task, collect_completion_receipt_collection, committed_range_baseline_conflicts, create_task_file, discovery_recorded, discovery_scope_delta, finish_task, load_task_resume_binding, load_tasks, live_tasks, repo_changes_since_task_start, resolve_task, resolve_task_baseline_ownerships, select_task_for_resume, start_task, task_content_audit, migrate_task_slop_text, task_baseline_ownership_evidence, task_chosen_matches_start, task_discovery_values, task_worktree_history_is_disjoint, task_handoff_is_generated_template, task_handoff_observation, task_repo_head_at_start, update_task_discovery, validate_live_task_states, validate_tasks, validate_workspace_write_path
+from .tasks import LIVE, Problem, _completion_receipt_path, archive_locator_path, archive_locator_text, attribute_acknowledged_committed_changes, completion_receipt_artifact_for_task, REPO_REQUIRED_AREAS, TaskResumeSelectionStatus, _entry_mutation_paths, _require_no_integrity_problems, append_task_log, bind_task_handoff, block_task, cancel_task, collect_completion_receipt_collection, committed_range_baseline_conflicts, create_task_file, discovery_recorded, discovery_scope_delta, finish_task, load_task_resume_binding, load_tasks, live_tasks, repo_changes_since_task_start, resolve_task, resolve_task_baseline_ownerships, select_task_for_resume, start_task, task_content_audit, migrate_task_slop_text, task_baseline_ownership_evidence, task_chosen_matches_start, task_discovery_values, task_worktree_history_is_disjoint, task_handoff_is_generated_template, task_handoff_observation, task_repo_head_at_start, update_task_discovery, validate_live_task_states, validate_tasks, validate_workspace_write_path
 from .upgrade import apply_upgrade, plan_upgrade, require_upgrade_target, upgrade_status, write_plan
 
 
@@ -3647,7 +3647,17 @@ def _task_finish_repo_delta(
     committed_changes, range_state = repo_commit_range_entries(root, base=start_head, target=target)
     if not range_state.available:
         raise RepoctlError(f"committed diff finish cannot read task commit range: {range_state.reason}", code="repo_commit_range_unavailable", path=range_state.repo_path or target.display_path)
-    observed_committed_changes = committed_changes
+    observed_committed_changes = list(committed_changes)
+    if acknowledge_completed:
+        committed_changes, attributed_commits = attribute_acknowledged_committed_changes(
+            root, task.id, entries=list(committed_changes),
+            acknowledge_completed=acknowledge_completed,
+            terminal_revision=current_head,
+        )
+        delta["child_attributed_changes"] = [
+            *delta.get("child_attributed_changes", []), *attributed_commits,
+        ]
+        delta["child_attributed_count"] = len(delta["child_attributed_changes"])
     pending_task_changes = list(delta.get("changes") or [])
     baseline_conflicts = list(delta.get("baseline_conflicts") or [])
     ownership = task_baseline_ownership_evidence(root, task.id)
@@ -6798,7 +6808,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_doctor = task_sub.add_parser("doctor", help="Inspect task finish readiness, content hygiene, and lifecycle problems.")
     task_doctor.add_argument("task_id")
     task_doctor.add_argument("--use-committed-diff", action="store_true", help="preflight the recorded task-start HEAD through current HEAD")
-    task_doctor.add_argument("--acknowledge-completed", action="append", default=[], metavar="TASK_ID", help="validate completed product work without taking ownership: an archived standalone task for root work, or a same-repository sibling for product work; repeat for multiple tasks")
+    task_doctor.add_argument("--acknowledge-completed", action="append", default=[], metavar="TASK_ID", help="validate completed product work without taking ownership: a whole completed Task ID, or TASK_ID:repo/relative/path for verified sibling-only path attribution; repeat for multiple paths")
     task_doctor.add_argument("--json", action="store_true")
     task_doctor.set_defaults(func=cmd_task_doctor)
     task_log = task_sub.add_parser("log", help="Manage task execution logs.")
@@ -6854,7 +6864,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_finish.add_argument("--knowledge-applies-to", action="append", default=[], help="current selected-repository file governed by the reusable claim; repeat as needed")
     task_finish.add_argument("--knowledge-replaces", action="append", default=[], help="prior Knowledge record explicitly corrected or replaced; repeat as needed")
     task_finish.add_argument("--knowledge-author", default="", help="known author; omit when unknown")
-    task_finish.add_argument("--acknowledge-completed", action="append", default=[], metavar="TASK_ID", help="validate completed product work without taking ownership: an archived standalone task for root work, or a same-repository sibling for product work; repeat for multiple tasks")
+    task_finish.add_argument("--acknowledge-completed", action="append", default=[], metavar="TASK_ID", help="validate completed product work without taking ownership: a whole completed Task ID, or TASK_ID:repo/relative/path for verified sibling-only path attribution; repeat for multiple paths")
     task_finish.add_argument("--json", action="store_true")
     task_finish.set_defaults(func=cmd_task_finish)
     task_block = task_sub.add_parser("block", help="Block a live task with explicit transition intent.")
