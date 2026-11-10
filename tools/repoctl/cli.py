@@ -52,7 +52,7 @@ from .repositories import evidence_target, workspace_target, RepoLayout, RepoTar
 from .settings import debug_mode
 from .task_history_migration import prepare_history_witness, receipt_witness
 from .template_contract import require_compatible_template_contract
-from .tasks import LIVE, Problem, _completion_receipt_path, archive_locator_path, archive_locator_text, attribute_acknowledged_committed_changes, completion_receipt_artifact_for_task, REPO_REQUIRED_AREAS, TaskResumeSelectionStatus, _entry_mutation_paths, _require_no_integrity_problems, append_task_log, bind_task_handoff, block_task, cancel_task, collect_completion_receipt_collection, committed_range_baseline_conflicts, create_task_file, discovery_recorded, discovery_scope_delta, finish_task, load_task_resume_binding, load_tasks, live_tasks, repo_changes_since_task_start, resolve_task, resolve_task_baseline_ownerships, select_task_for_resume, start_task, task_content_audit, migrate_task_slop_text, task_baseline_ownership_evidence, task_chosen_matches_start, task_discovery_values, task_worktree_history_is_disjoint, task_handoff_is_generated_template, task_handoff_observation, task_repo_head_at_start, update_task_discovery, validate_live_task_states, validate_tasks, validate_workspace_write_path
+from .tasks import LIVE, Problem, _completion_receipt_path, archive_locator_path, archive_locator_text, attribute_acknowledged_committed_changes, completion_receipt_artifact_for_task, REPO_REQUIRED_AREAS, TaskResumeSelectionStatus, _entry_mutation_paths, _require_no_integrity_problems, append_task_log, bind_task_handoff, block_task, cancel_task, collect_completion_receipt_collection, committed_range_baseline_conflicts, create_task_file, discovery_recorded, discovery_scope_delta, finish_task, load_task_resume_binding, load_tasks, live_chosen_overlaps, live_tasks, repo_changes_since_task_start, resolve_task, resolve_task_baseline_ownerships, select_task_for_resume, start_task, task_content_audit, migrate_task_slop_text, task_baseline_ownership_evidence, task_chosen_matches_start, task_discovery_values, task_worktree_history_is_disjoint, task_handoff_is_generated_template, task_handoff_observation, task_repo_head_at_start, update_task_discovery, validate_live_task_states, validate_tasks, validate_workspace_write_path
 from .upgrade import apply_upgrade, plan_upgrade, require_upgrade_target, upgrade_status, write_plan
 
 
@@ -2193,7 +2193,16 @@ def build_task_resume_projection(
         # Do not transmit a second full copy of the same instruction. A
         # stale/blocked Handoff is inspectable by the explicit source command.
         guidance["readable_handoff"] = None
-    data.update({"task": task.to_list_dict(), "resume_guidance": guidance})
+    chosen_overlaps, overlap_problems = _chosen_overlap_projection(
+        task,
+        live_chosen_overlaps(root, task, layout=layout) if target is not None and layout is not None else [],
+    )
+    warnings.extend(problem.to_dict() for problem in overlap_problems)
+    data.update({
+        "task": task.to_list_dict(),
+        "resume_guidance": guidance,
+        "chosen_overlaps": chosen_overlaps,
+    })
     payload = {
         "ok": not _has_errors(problems),
         "command": "task.resume",
@@ -2241,6 +2250,9 @@ def cmd_task_resume(args: argparse.Namespace) -> int:
             for candidate in payload["data"]["candidates"]:
                 command = f"./scripts/repoctl task resume {candidate['id']} --json"
                 print(f"{candidate['id']} [{candidate['area'] or 'unspecified'}] {candidate['title']} {candidate['status']} {candidate['path']} resume={command}")
+        for warning in payload["warnings"]:
+            if warning["code"] == "task_chosen_overlap":
+                print(f"- {warning['code']}: {warning['message']}")
     return 0 if payload["ok"] else 1
 
 
@@ -2612,6 +2624,7 @@ def cmd_task_discovery_add(args: argparse.Namespace) -> int:
             reason=args.reason or "",
             note=args.note or "",
         )
+        chosen_overlaps, overlap_problems = _chosen_overlap_projection(result["task"], result["chosen_overlaps"])
         atomic_write(result["task"].path, result["text"])
     next_actions: list[dict[str, str]] = []
     task_id = result["task"].id
@@ -2631,16 +2644,19 @@ def cmd_task_discovery_add(args: argparse.Namespace) -> int:
             "path": result["task"].rel_path,
             "update": result["update"],
             "totals": result["totals"],
+            "chosen_overlaps": chosen_overlaps,
             **({"discovery": result["discovery"]} if args.full else {}),
         },
         "problems": [],
-        "warnings": [],
+        "warnings": [problem.to_dict() for problem in overlap_problems],
         "next_actions": next_actions,
     }
     if args.json:
         _json(payload)
     else:
         print(f"Updated Discovery: {task_id}")
+        for warning in payload["warnings"]:
+            print(f"- {warning['code']}: {warning['message']}")
     return 0
 
 
@@ -3033,12 +3049,18 @@ def _task_doctor_payload(
         for finding in content_audit["findings"]
     ]
     doctor_problems: list[Problem] = []
+    chosen_overlaps: list[dict[str, Any]] = []
+    overlap_problems: list[Problem] = []
     target: RepoTarget | None = None
     repository: dict[str, Any] = {}
     delta_observation_error: RepoctlError | None = None
     try:
-        target = _repo_target_for_task_command(root, task)
+        layout = repo_layout(root)
+        target = _repo_target_for_task_command(root, task, layout=layout)
         repository = target.to_dict() if target is not None else {}
+        chosen_overlaps, overlap_problems = _chosen_overlap_projection(
+            task, live_chosen_overlaps(root, task, layout=layout),
+        )
         delta = (
             _task_finish_repo_delta(
                 root,
@@ -3108,7 +3130,7 @@ def _task_doctor_payload(
     )
     combined = _dedupe_problems(
         [*task_problems, *audit_problems, *doctor_problems, *health.problems]
-    )
+    ) + overlap_problems
     blockers = [
         problem.code for problem in combined if problem.severity == "error"
     ]
@@ -3118,6 +3140,7 @@ def _task_doctor_payload(
         "path": task.rel_path,
         "health": health.to_dict(),
         "content_audit": content_audit,
+        "chosen_overlaps": chosen_overlaps,
         "finish_ready": (
             task.status in {"doing", "todo", "blocked"}
             and not blockers
@@ -3167,6 +3190,34 @@ def _project_string_collection(values: Any, *, compact: bool) -> tuple[list[str]
     items = _string_list(values)
     visible = items[:COMPACT_PATH_LIMIT] if compact else items
     return visible, len(items), compact and len(items) > COMPACT_PATH_LIMIT
+
+
+def _chosen_overlap_projection(
+    task: Any,
+    overlaps: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[Problem]]:
+    """Keep advisory path inventories bounded on every command surface."""
+
+    projected: list[dict[str, Any]] = []
+    problems: list[Problem] = []
+    for overlap in overlaps:
+        paths, count, truncated = _project_string_collection(overlap["overlapping_paths"], compact=True)
+        projected.append({
+            **overlap,
+            "overlapping_paths": paths,
+            "overlapping_path_count": count,
+            "overlapping_paths_truncated": truncated,
+        })
+        suffix = f" (showing {len(paths)} of {count} paths)" if truncated else ""
+        problems.append(Problem(
+            "warning",
+            "task_chosen_overlap",
+            f"Chosen overlaps live task {overlap['other_task_id']} "
+            f"({overlap['other_task_status']}) in repository {overlap['repo_id']}: "
+            + ", ".join(paths) + suffix,
+            task.rel_path,
+        ))
+    return projected, problems
 
 
 def _scope_summary(scope: Any, *, compact: bool) -> dict[str, Any]:

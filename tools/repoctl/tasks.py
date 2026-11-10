@@ -820,7 +820,8 @@ def update_task_discovery(
         [*previous_notes, *([note] if note.strip() else [])]
     )
 
-    target = _target_for_task(root, task)
+    layout = repo_layout(root)
+    target = _target_for_task(root, task, layout=layout)
     _require_task_start_scope_alignment(root, task, target=target)
 
     invalid_paths: list[str] = []
@@ -894,6 +895,12 @@ def update_task_discovery(
         "task": task,
         "text": updated_text,
         "discovery": {"chosen_files": chosen_values, "notes": note_values},
+        "chosen_overlaps": live_chosen_overlaps(
+            root,
+            task,
+            chosen_paths={path[len(prefix):] for path in normalized_paths} if target is not None else set(),
+            layout=layout,
+        ),
         "update": {
             "chosen_files": {
                 "mode": (
@@ -1022,6 +1029,63 @@ def _task_chosen_path_projection(
             continue
         chosen.add(normalized)
     return chosen, sorted(set(invalid))
+
+
+def live_chosen_overlaps(
+    root: Path,
+    task: Task,
+    *,
+    chosen_paths: set[str] | None = None,
+    layout: RepoLayout | None = None,
+) -> list[dict[str, Any]]:
+    """Observe intersecting live scopes without changing Task or repository state.
+
+    An override is the validated, repo-relative result of a pending Discovery
+    edit. Invalid scopes remain the existing validators' responsibility and are
+    never used to infer a conflict or transfer ownership.
+    """
+
+    if task.archived or task.status not in LIVE:
+        return []
+    layout = layout or repo_layout(root)
+    target = _target_for_task(root, task, layout=layout)
+    if target is None:
+        return []
+    if chosen_paths is None:
+        chosen, invalid = _task_chosen_path_projection(task, target=target)
+    else:
+        chosen = set(chosen_paths)
+        invalid = [
+            path for path in chosen
+            if not path or normalize_repo_path(path) != path
+        ]
+    if invalid or not chosen or any((target.root_path / path).is_dir() for path in chosen):
+        return []
+
+    overlaps: list[dict[str, Any]] = []
+    for other in sorted(load_tasks(root, include_archived=False), key=lambda item: item.id):
+        if other.id == task.id or other.archived or other.status not in LIVE:
+            continue
+        try:
+            other_target = _target_for_task(root, other, layout=layout)
+        except RepoctlError:
+            # Unresolved repository identity cannot establish a shared target.
+            continue
+        if other_target != target:
+            continue
+        other_chosen, other_invalid = _task_chosen_path_projection(other, target=other_target)
+        if other_invalid or any((target.root_path / path).is_dir() for path in other_chosen):
+            continue
+        paths = sorted(chosen & other_chosen)
+        if paths:
+            overlaps.append({
+                "current_task_id": task.id,
+                "other_task_id": other.id,
+                "other_task_status": other.status,
+                "repo_id": target.id,
+                "overlapping_paths": paths,
+            })
+    return overlaps
 
 
 def _dirty_entry(dirty: list[str], *, copy: dict[str, Any], baseline_ref: str) -> str:
