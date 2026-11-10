@@ -157,8 +157,8 @@
     },
     {
       "path": "tools/repoctl/completion_catalogue.py",
-      "sha256": "0f14772cd7cfac3588f500e3c35c628541ee17f0efd9722ede97a542fd3c3bd0",
-      "size": 108370
+      "sha256": "6e4dbb85850a7b330955e165e29972a0b2c73712b51c0b022cbe2283b8418d41",
+      "size": 109899
     },
     {
       "path": "tools/repoctl/component_projection.py",
