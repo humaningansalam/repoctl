@@ -586,6 +586,67 @@ def append_task_log(root: Path, task_id: str, message: str) -> dict[str, Any]:
     return {"task": task, "text": text, "timestamp": timestamp}
 
 
+def _handoff_operational_history_count(handoff: str) -> int:
+    """Count explicit protocol records, not ordinary restart vocabulary."""
+    prose: list[str] = []
+    fence_char = ""
+    fence_len = 0
+    for line in handoff.splitlines():
+        fence = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if not fence_char:
+                fence_char, fence_len = marker[0], len(marker)
+            elif (marker[0] == fence_char and len(marker) >= fence_len
+                  and not line[fence.end():].strip()):
+                fence_char, fence_len = "", 0
+            prose.append("")
+            continue
+        prose.append("" if fence_char else line)
+
+    # Preserve newlines while excluding inline examples, including code spans
+    # with embedded backticks or spanning multiple lines.
+    authored = re.sub(
+        r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)",
+        lambda match: "\n" * match.group(0).count("\n"),
+        "\n".join(prose), flags=re.DOTALL,
+    )
+    label = r"(?:ACK|collector|request queue|role transition|external completion|deleted file hash)"
+    record = re.compile(rf"^{label}\s*[:=]", re.IGNORECASE)
+    stamp = (
+        r"(?:\d{8}T\d{6}Z|\d{4}-\d{2}-\d{2}"
+        r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?)"
+    )
+    timed_record = re.compile(
+        rf"^(?:\[{stamp}\]|{stamp})(?:\s*[:—-]\s*|\s+){label}\b",
+        re.IGNORECASE,
+    )
+    field = re.compile(
+        r"^(Next exact step|First file to open|First command to run|Done when):\s*",
+        re.IGNORECASE,
+    )
+    count = 0
+    command_indent: int | None = None
+    for line in authored.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if command_indent is not None and indent > command_indent:
+            continue
+        command_indent = None
+        value = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.lstrip())
+        restart_field = field.match(value)
+        if restart_field:
+            if restart_field.group(1).casefold() == "first command to run":
+                # A command and its indented continuation are inert source.
+                command_indent = indent
+                continue
+            value = value[restart_field.end():]
+        if record.match(value) or timed_record.match(value):
+            count += 1
+    return count
+
+
 def task_content_audit(task: Task) -> dict[str, Any]:
     """Report size and known machine-generated slop without blocking authored work."""
 
@@ -613,7 +674,7 @@ def task_content_audit(task: Task) -> dict[str, Any]:
         add("task_log_oversized_line", "Execution Log contains one or more oversized lines", count=oversized_line_count)
     for finding in semantic_log_repetition(execution_log):
         findings.append({"severity": "warning", "path": task.rel_path, **finding})
-    operational_handoff_count = len(re.findall(r"\b(?:ACK|collector|request queue|role transition|external completion|deleted file hash)\b", handoff, flags=re.IGNORECASE))
+    operational_handoff_count = _handoff_operational_history_count(handoff)
     if operational_handoff_count:
         add("task_handoff_operational_history", "Handoff appears to contain operational history instead of current restart instructions", count=operational_handoff_count)
     chosen_count = len(task_discovery_values(task).get("Chosen files", []))
