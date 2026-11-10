@@ -862,6 +862,30 @@ def _load_completion_history(
     return checkpoint, events
 
 
+def _catalogue_artifact_path_matches(
+    root: Path,
+    *,
+    receipt: Mapping[str, Any],
+    recorded_path: str,
+    resolved_path: str,
+) -> bool:
+    """Compare historical event identity without replacing its recorded path."""
+
+    if recorded_path == resolved_path:
+        # Explicit rebuilds may have recorded the current archive path.
+        return True
+    from .tasks import _task_archive_locator, completion_receipt_task_path
+
+    declared_path = completion_receipt_task_path(dict(receipt))
+    if recorded_path != declared_path or not declared_path.startswith("docs/tasks/"):
+        return False
+    # A completed child keeps its receipt and ingress event when its parent
+    # archives it. Only the validated exact-ID locator proves that relocation;
+    # a matching archive filename discovered by a history scan is insufficient.
+    archived = _task_archive_locator(root, str(receipt.get("task_id") or ""))
+    return archived is not None and archived.relative_to(root).as_posix() == resolved_path
+
+
 def lookup_completion_exact(
     root: Path,
     repo_id: str,
@@ -901,7 +925,12 @@ def lookup_completion_exact(
         _digest_data(artifact.receipt) != match["receipt_canonical_sha256"]
         or artifact.receipt_path != match["receipt_path"]
         or artifact.receipt_sha256 != match["receipt_sha256"]
-        or artifact.resolved_path != match["artifact_path"]
+        or not _catalogue_artifact_path_matches(
+            root,
+            receipt=artifact.receipt,
+            recorded_path=str(match["artifact_path"]),
+            resolved_path=artifact.resolved_path,
+        )
         or artifact.content_sha256 != match["artifact_sha256"]
     ):
         _unavailable(
@@ -1004,7 +1033,12 @@ def search_completion_history(
             _digest_data(artifact.receipt) != event["receipt_canonical_sha256"]
             or artifact.receipt_path != event["receipt_path"]
             or artifact.receipt_sha256 != event["receipt_sha256"]
-            or artifact.resolved_path != event["artifact_path"]
+            or not _catalogue_artifact_path_matches(
+                root,
+                receipt=artifact.receipt,
+                recorded_path=str(event["artifact_path"]),
+                resolved_path=artifact.resolved_path,
+            )
             or artifact.content_sha256 != event["artifact_sha256"]
         ):
             _unavailable(
@@ -1187,7 +1221,12 @@ def _validate_catalogue_sources(
             _digest_data(receipt) != event["receipt_canonical_sha256"]
             or _digest_text(receipt_text) != event["receipt_sha256"]
             or receipt_path != event["receipt_path"]
-            or artifact_path != event["artifact_path"]
+            or not _catalogue_artifact_path_matches(
+                root,
+                receipt=receipt,
+                recorded_path=str(event["artifact_path"]),
+                resolved_path=artifact_path,
+            )
             or str(receipt.get("content_sha256") or "") != event["artifact_sha256"]
         ):
             _unavailable(
