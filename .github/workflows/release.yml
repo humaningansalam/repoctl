@@ -1,7 +1,7 @@
 name: repoctl release
 on:
   push:
-    tags: [v0.16.1]
+    tags: [v0.16.2]
   workflow_dispatch:
 permissions:
   contents: write
@@ -17,7 +17,7 @@ jobs:
           python-version: "3.11"
       - name: Verify release tag
         run: |
-          test "$GITHUB_REF_NAME" = "v0.16.1"
+          test "$GITHUB_REF_NAME" = "v0.16.2"
           git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
       - name: Install pinned structural provider
@@ -32,11 +32,11 @@ jobs:
         run: uv run --locked --extra structural pytest -q
       - name: Verify workspace contracts
         run: |
-          test "$(./scripts/repoctl --version)" = "0.16.1"
+          test "$(./scripts/repoctl --version)" = "0.16.2"
           python3 - <<'PY'
           import json, pathlib, tomllib
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
-          assert version == "0.16.1"
+          assert version == "0.16.2"
           assert json.loads(pathlib.Path("repoctl-upgrade-manifest.json").read_text())["version"] == version
           assert json.loads(pathlib.Path("ARTIFACT-MANIFEST.json").read_text())["package_version"] == version
           for path in ("AGENTS.md", "docs/BOARD.md", "docs/PRD.md", "docs/tasks/TEMPLATE.md"):
@@ -45,9 +45,9 @@ jobs:
       - name: Verify reproducible asset
         run: |
           python3 .github/scripts/build_release_archive.py
-          first="$(sha256sum dist/repoctl-0.16.1.tar.gz | cut -d' ' -f1)"
+          first="$(sha256sum dist/repoctl-0.16.2.tar.gz | cut -d' ' -f1)"
           python3 .github/scripts/build_release_archive.py
-          test "$first" = "$(sha256sum dist/repoctl-0.16.1.tar.gz | cut -d' ' -f1)"
+          test "$first" = "$(sha256sum dist/repoctl-0.16.2.tar.gz | cut -d' ' -f1)"
   publish:
     needs: verify
     if: startsWith(github.ref, 'refs/tags/')
@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify release tag
         run: |
-          test "$GITHUB_REF_NAME" = "v0.16.1"
+          test "$GITHUB_REF_NAME" = "v0.16.2"
           git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
       - name: Rebuild immutable tagged release asset
@@ -64,7 +64,7 @@ jobs:
       - name: Publish immutable release and verify public bytes
         env:
           GH_TOKEN: ${{ github.token }}
-          ASSET: repoctl-0.16.1.tar.gz
+          ASSET: repoctl-0.16.2.tar.gz
         run: |
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" "dist/$ASSET" --verify-tag --title "repoctl $GITHUB_REF_NAME" --notes-file RELEASE-NOTES.md

@@ -7,7 +7,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "7217995088f873897259476b3861b23823aa5a71814b8b477d4757a165539e0c",
+      "sha256": "5aa05542cd454308f62d7357a6d40c5d8e78982969e642a336301adc7284ccd4",
       "size": 3613
     },
     {
@@ -107,12 +107,12 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "9be17793f0814f2a96fbe04402722962107602b6255c3f5aaa194fbcdb82c896",
+      "sha256": "8578502041003de1c404f2aa4b56960648f8b9a2ea1e39aafe872b8cd276acbc",
       "size": 499
     },
     {
       "path": "repoctl-upgrade-manifest.json",
-      "sha256": "18699bf3d0152b2ba29f6a875242a5dd4a7e44842750bd20251a4124c9e0d117",
+      "sha256": "2188fdd7cfacae1caa9046112565fc934556493da57a112b72001e5646e95311",
       "size": 3803
     },
     {
@@ -147,8 +147,8 @@
     },
     {
       "path": "tools/repoctl/cli.py",
-      "sha256": "89eb4fba8120e8ea4adf0b6287c3a2593091796aec03b17fd27e5b8505ce1a02",
-      "size": 334095
+      "sha256": "ad1377deb3e5196108917be9aa0b4cb5eac5d2dcfc30e74bd7d8efb34e85936c",
+      "size": 334670
     },
     {
       "path": "tools/repoctl/code_index.py",
@@ -377,8 +377,8 @@
     },
     {
       "path": "tools/repoctl/tasks.py",
-      "sha256": "764a025f6e03f7d6a9fb3566e1eefa5560ca53f924a74b9932be778ac3f08b00",
-      "size": 236656
+      "sha256": "546bb2c63f2d0d78d1fcea584d25618347e2d8a27e1af1872c8adb25a0d57171",
+      "size": 243781
     },
     {
       "path": "tools/repoctl/template_contract.py",
@@ -392,13 +392,13 @@
     },
     {
       "path": "uv.lock",
-      "sha256": "63d045a837ca75b83ec215c17da48520004ac3cba5a0c099d0e9a43c49baba29",
+      "sha256": "9e506a1cf6a9b91e8ea62d8ca21422128983fe86e5e2c0092363f11a4f723a50",
       "size": 27453
     }
   ],
   "license_sha256": "0a5af618ecaee7a1eed1987c782fd9b8c8cb194b72c8ff839f612db91cf9e193",
   "package": "repoctl",
-  "package_version": "0.16.1",
+  "package_version": "0.16.2",
   "schema": "repoctl.separation.release-artifact",
   "schema_version": 1,
   "source_version": "0.15.3",

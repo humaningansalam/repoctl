@@ -1,4 +1,15 @@
-# repoctl v0.16.1
+# repoctl v0.16.2 — completed sibling path attribution
+
+Prepared: 2026-11-10 (KST). Independent release candidate; public release and adopter upgrades require the tagged release verification gates.
+
+- Adds opt-in, receipt-validated acknowledgement of an exact path belonging to a completed sibling Task, without claiming its entire receipt when other files overlap the active Task's Chosen scope.
+- Checks the immutable completion receipt, selected Git start-to-HEAD transition, pending worktree state and path boundaries. Rejects overlapping, missing, traversal, partial-rename and uncommitted path selections.
+- Preserves existing completed Task receipts, source Git history, and the default strict Task finish behavior when no path acknowledgement is provided.
+- The prior v0.16.1 runtime remains available for rollback; split adopters install a separate versioned runtime and update only their thin launcher after verification.
+
+---
+
+## Previous release: repoctl v0.16.1
 
 Released: 2026-11-07 (KST)
 

@@ -1,4 +1,4 @@
-# repoctl 0.16.1 — independent runtime
+# repoctl 0.16.2 — independent runtime
 
 This release implements Task lifecycle and Handoff freshness, Context Docs observation, Graph/Knowledge evidence navigation, machine JSON contracts, and optional structural code providers. The separate [agent-handoff-template v1.0.0](https://github.com/humaningansalam/agent-handoff-template/releases/tag/v1.0.0) owns human authoring documents. No Task/Parent Task template, Board, PRD scaffold, model selection, agent hierarchy or agent orchestration is installed or selected by repoctl.
 
@@ -33,4 +33,4 @@ uv sync --locked --extra structural
 uv run --locked --extra structural pytest -q
 ~~~
 
-Development tests, benchmark fixture copies and source-only CI do not enter the published runtime archive. Source: https://github.com/humaningansalam/repoctl. Release identity: repoctl 0.16.1.
+Development tests, benchmark fixture copies and source-only CI do not enter the published runtime archive. Source: https://github.com/humaningansalam/repoctl. Release identity: repoctl 0.16.2.
