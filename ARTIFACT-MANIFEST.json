@@ -7,8 +7,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "5aa05542cd454308f62d7357a6d40c5d8e78982969e642a336301adc7284ccd4",
-      "size": 3613
+      "sha256": "9dcf37b9b4ac7b525f2f3b48ba423fe9e1913e414ce72fcee83b50c6c86c74de",
+      "size": 4403
     },
     {
       "path": "contracts/template-document-v1.json",
@@ -32,8 +32,8 @@
     },
     {
       "path": "docs/contracts/repoctl-json-contract.md",
-      "sha256": "65b5cac1f2b1438e67c8da66712ff39040dcdb3626bcba34ba36a9b058ff436f",
-      "size": 15623
+      "sha256": "24337f4d37e87710216031fa5914a606fceb3edadf9cffa2eb91846ebc54e0ec",
+      "size": 19463
     },
     {
       "path": "docs/contracts/repoctl-module-boundaries.md",
@@ -42,8 +42,8 @@
     },
     {
       "path": "docs/contracts/repoctl-task-scope-contract.md",
-      "sha256": "3f4f4e798359f5bd93e33f630d89e501c25fd2efa60138c3bac549b24a62773c",
-      "size": 4109
+      "sha256": "7c7592c459e73f21c9d27e9fd4f06aa29408e10bf59857b3d98d5e95b4942da3",
+      "size": 11055
     },
     {
       "path": "docs/contracts/template-repoctl-separation.md",
@@ -62,8 +62,8 @@
     },
     {
       "path": "docs/specs/task/requirements.md",
-      "sha256": "26ee5dfd60939237a2556117e4f108762a06db5222103f14f9b5060a95ea36bc",
-      "size": 3386
+      "sha256": "ca6580501aed8aaaf972c846846ce0f87069b745fbdf05806f3063079650de87",
+      "size": 8389
     },
     {
       "path": "fixtures/conformance/board.md",
@@ -147,8 +147,8 @@
     },
     {
       "path": "tools/repoctl/cli.py",
-      "sha256": "ad1377deb3e5196108917be9aa0b4cb5eac5d2dcfc30e74bd7d8efb34e85936c",
-      "size": 334670
+      "sha256": "389b7e3ba9ff839d2845dd74531a56eed443f62145de49c29b0b8b997e182211",
+      "size": 337044
     },
     {
       "path": "tools/repoctl/code_index.py",
@@ -212,8 +212,8 @@
     },
     {
       "path": "tools/repoctl/git.py",
-      "sha256": "c14acdf421407069c61a63e5d33bde8b5ab10b4996ac2c18489b048647109434",
-      "size": 46490
+      "sha256": "dce6ddb6d04ed506f8feba8e43512d80d4c2353a3f407923ac8b80ac7a5fec0f",
+      "size": 47871
     },
     {
       "path": "tools/repoctl/graph.py",
@@ -377,8 +377,8 @@
     },
     {
       "path": "tools/repoctl/tasks.py",
-      "sha256": "546bb2c63f2d0d78d1fcea584d25618347e2d8a27e1af1872c8adb25a0d57171",
-      "size": 243781
+      "sha256": "958ca89c390d01554ee88c8de387e920e3b5e087a2ed767654c13fb9e4f7a0e9",
+      "size": 259844
     },
     {
       "path": "tools/repoctl/template_contract.py",

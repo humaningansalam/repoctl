@@ -16,6 +16,21 @@ The ordinary launcher uses **the runtime's** .venv/bin/python when that environm
 
 An adopter may keep a thin user-owned scripts/repoctl wrapper that exports its exact workspace root and invokes the external versioned runtime. Runtime Python source is not copied into adopter workspaces. Protect existing authoring docs, Task/Knowledge/receipts, local policies, and product Git.
 
+## Review Task scope
+
+Discovery, resume, and doctor warn when live Tasks in the same repository overlap Chosen paths. This is advisory scope review: it neither locks work nor changes ownership or finish readiness.
+
+When a done sibling owns only one relevant committed path, acknowledge that exact path after reviewing its immutable receipt and lineage. Replace the example Task IDs with the current Task and its same-parent, same-repository sibling:
+
+~~~sh
+./scripts/repoctl task doctor T-current \
+  --use-committed-diff \
+  --acknowledge-completed T-sibling:docs/RELEASE.md \
+  --json
+~~~
+
+After a ready result, use the same options with `task finish`. See the [Task scope contract](docs/contracts/repoctl-task-scope-contract.md) for selection, rename, pending-edit, and history checks.
+
 ## Context Docs supported syntax and coverage
 
 In a Task's Context Docs section, repoctl observes explicit bullet entries using -, * or numbered list syntax, with optional Requirement:/Supporting: roles. Entries can name a workspace-relative docs/... or repos/... path, a backtick path, [name](path) Markdown link or [name][ref] with [ref]: path, including #fragments. /docs/... is workspace-rooted; ../specs/... is relative to the Task file's directory; legacy docs/... links remain workspace-relative unless a conflicting task-relative file makes the destination ambiguous. No basename guessing. Fences and HTML comments are examples, not references. The digest covers the whole file even when a fragment is named.
