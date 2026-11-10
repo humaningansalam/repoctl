@@ -214,6 +214,43 @@ def repo_is_ancestor(root: Path, *, ancestor: str, descendant: str = "HEAD", tar
     )
 
 
+def repo_paths_changed_in_commit_range(
+    root: Path,
+    *,
+    paths: list[str],
+    base: str,
+    head: str,
+    target: RepoTarget | None = None,
+) -> tuple[bool, RepoGitState]:
+    """Observe any path mutation in a range, including edits later reverted."""
+
+    selected = _target(root, target)
+    state = repo_git_state(root, selected)
+    if not state.available:
+        return False, state
+    assert selected is not None
+    if not paths or base == head:
+        return False, state
+    revision_range = head if base == "<unborn>" else f"{base}..{head}"
+    result = _git_bytes_result(selected.root_path, [
+        "log", "--format=", "--raw", "--no-abbrev", "--no-renames",
+        "--no-ext-diff", "--no-textconv", "-z", "--full-history", "-m", "--root",
+        "--end-of-options", revision_range, "--",
+        *(f":(literal){path}" for path in sorted(set(paths))),
+    ])
+    if result.problem is not None:
+        return False, RepoGitState(
+            False,
+            f"{selected.display_path}/ cannot inspect path history: {base}..{head}",
+            selected.id,
+            selected.display_path,
+            "git_commit_range_unavailable",
+        )
+    # Raw diff headers contain non-whitespace even when a filename itself is
+    # whitespace; --format= emits no commit prose that could mimic a mutation.
+    return bool(result.data.strip()), state
+
+
 def normalize_repo_path(path: str | Path) -> str:
     raw = str(path)
     while raw.startswith("./"):

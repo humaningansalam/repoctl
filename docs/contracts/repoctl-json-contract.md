@@ -127,6 +127,60 @@ A Chosen-scope decision action owns the complete path list at `data.action_input
 
 `task.finish` reports `closure_scope: "task"` and `product_readiness: "not_evaluated"`. Product correctness, release readiness, commit, push, PR, and deployment remain outside the command's claim.
 
+### Completed-Task acknowledgements
+
+When an acknowledgement is accepted, both `task doctor` and `task finish` return `data.acknowledged_completions`. Each entry identifies the original completion receipt:
+
+```json
+{
+  "task_id": "T-sibling",
+  "receipt_path": "docs/tasks/.repoctl-state/completions/T-sibling.json",
+  "receipt_sha256": "sha256:...",
+  "selected_paths": ["docs/RELEASE.md"]
+}
+```
+
+`selected_paths` appears only for path-scoped `--acknowledge-completed TASK_ID:PATH` selections. It is a canonical, sorted, unique array of repo-relative mutation paths; repeated options for the same Task are combined. `receipt_sha256` always hashes the complete original receipt bytes, never an in-memory selected projection. Whole-task entries omit `selected_paths`; whole-task and path-scoped selectors cannot be mixed in one invocation, even for different Task IDs.
+
+Product sibling selections require a done Task with the same non-empty parent and exact stable repository target. The full receipt, recorded baseline, current committed range, and each selected path transition must verify. Selected paths must be disjoint from current Chosen and have no pending worktree edits; rename old/new endpoints must be selected together. Missing evidence, history rewrite, and prior/later changes that break the sibling lineage fail closed.
+
+`completion_acknowledgement_invalid` is an error for invalid selection syntax, eligibility, scope, or selected-path evidence; receipt-integrity and repository-lineage failures may retain their existing more specific error codes. A rejected acknowledgement never becomes a warning or weakens closure checks.
+
+Finish records the selected paths and original receipt identity in the current Task's Execution Log, without rewriting sibling Task/receipt/catalogue history, current scope/baseline/ownership, or product Git. The current completion receipt excludes acknowledged sibling mutations from its `changed_entries`.
+
+### Live Chosen overlap warnings
+
+`task discovery add`, exact or selected single-live `task resume`, and `task doctor` expose advisory overlap through the conventional `warnings` problem shape:
+
+```json
+{
+  "severity": "warning",
+  "code": "task_chosen_overlap",
+  "message": "Chosen overlaps live task T-other in repository main: src/shared.py",
+  "path": "docs/tasks/T-current--work.md"
+}
+```
+
+The structured companion is `data.chosen_overlaps`, with one entry per conflicting live Task:
+
+```json
+{
+  "current_task_id": "T-current",
+  "other_task_id": "T-other",
+  "other_task_status": "doing",
+  "repo_id": "main",
+  "overlapping_paths": ["src/shared.py"],
+  "overlapping_path_count": 1,
+  "overlapping_paths_truncated": false
+}
+```
+
+Entries are sorted by `other_task_id`; `overlapping_paths` are sorted canonical repo-relative paths. The existing compact projection limits each displayed path list to 20, including with `--full`; `overlapping_path_count` retains the total and `overlapping_paths_truncated` reports omission. The standard problem object does not gain a `details` field or an unbounded path inventory.
+
+Both Tasks must be live (`todo | doing | blocked`) and resolve to the same stable repository target. Self, root-only, different-repository, done, canceled, and archived Tasks are excluded. Invalid Chosen projections do not create overlap claims; existing path-validation errors remain authoritative.
+
+Discovery evaluates the resulting appended or replaced scope. Resume also detects directly authored Chosen entries, but ambiguous bare resume retains its candidates without selecting one. These warnings do not alter `ok`, `finish_ready`, Handoff freshness, or lifecycle health by themselves; `actual_changes_outside_chosen` remains an independent error. Evaluating overlap writes no Task, Board, state, receipt, ownership, dependency, product file, or Git index.
+
 ## Completion receipt v5
 
 New completion receipts use schema v5. They retain stable Task/artifact identity, repository identity, changed entries, verified start/completion event timestamps, explicit path transitions (an empty list for no changes), and metadata-gate history. A missing or unverifiable start transition blocks finish rather than creating a partial v5 receipt. They omit `verification` and `discovery_outcome`.

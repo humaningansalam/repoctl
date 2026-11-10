@@ -1,4 +1,4 @@
-# repoctl 0.16.1 — independent runtime
+# repoctl 0.16.2 — independent runtime
 
 This release implements Task lifecycle and Handoff freshness, Context Docs observation, Graph/Knowledge evidence navigation, machine JSON contracts, and optional structural code providers. The separate [agent-handoff-template v1.0.0](https://github.com/humaningansalam/agent-handoff-template/releases/tag/v1.0.0) owns human authoring documents. No Task/Parent Task template, Board, PRD scaffold, model selection, agent hierarchy or agent orchestration is installed or selected by repoctl.
 
@@ -15,6 +15,21 @@ REPOCTL_WORKSPACE_ROOT=/absolute/path/to/adopter ./scripts/repoctl task resume -
 The ordinary launcher uses **the runtime's** .venv/bin/python when that environment exists, not the product workspace's Python or VIRTUAL_ENV. An explicit PYTHON override wins and an invalid override fails. Without an installed runtime environment, core-only execution falls back to system python3 and reports structural-provider limitations honestly. Read/query commands never auto-install packages.
 
 An adopter may keep a thin user-owned scripts/repoctl wrapper that exports its exact workspace root and invokes the external versioned runtime. Runtime Python source is not copied into adopter workspaces. Protect existing authoring docs, Task/Knowledge/receipts, local policies, and product Git.
+
+## Review Task scope
+
+Discovery, resume, and doctor warn when live Tasks in the same repository overlap Chosen paths. This is advisory scope review: it neither locks work nor changes ownership or finish readiness.
+
+When a done sibling owns only one relevant committed path, acknowledge that exact path after reviewing its immutable receipt and lineage. Replace the example Task IDs with the current Task and its same-parent, same-repository sibling:
+
+~~~sh
+./scripts/repoctl task doctor T-current \
+  --use-committed-diff \
+  --acknowledge-completed T-sibling:docs/RELEASE.md \
+  --json
+~~~
+
+After a ready result, use the same options with `task finish`. See the [Task scope contract](docs/contracts/repoctl-task-scope-contract.md) for selection, rename, pending-edit, and history checks.
 
 ## Context Docs supported syntax and coverage
 
@@ -33,4 +48,4 @@ uv sync --locked --extra structural
 uv run --locked --extra structural pytest -q
 ~~~
 
-Development tests, benchmark fixture copies and source-only CI do not enter the published runtime archive. Source: https://github.com/humaningansalam/repoctl. Release identity: repoctl 0.16.1.
+Development tests, benchmark fixture copies and source-only CI do not enter the published runtime archive. Source: https://github.com/humaningansalam/repoctl. Release identity: repoctl 0.16.2.

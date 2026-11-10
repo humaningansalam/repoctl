@@ -7,13 +7,14 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import cmp_to_key
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .completion_catalogue import prepare_completion_sidecar_writes
 from .io import LOCK_REL, RepoctlError, atomic_write, decode_schema_version
 from .task_history_migration import receipt_witness
-from .git import ChangedEntry, RepoGitState, StablePathState, normalize_repo_path, normalize_stable_path_state, repo_change_fingerprint_records, repo_changed_entries, repo_commit_range_entries, repo_git_head, repo_git_state, repo_git_status, repo_is_ancestor, repo_path_fingerprints, repo_path_stable_states, stable_path_state_digest
+from .git import ChangedEntry, RepoGitState, StablePathState, normalize_repo_path, normalize_stable_path_state, repo_change_fingerprint_records, repo_changed_entries, repo_commit_range_entries, repo_git_head, repo_git_state, repo_git_status, repo_is_ancestor, repo_path_fingerprints, repo_path_stable_states, repo_paths_changed_in_commit_range, stable_path_state_digest
 from .graph_model import digest_data
 from .markdown import append_section_entry, find_section, has_section, parse_frontmatter, parse_labeled_list_section, replace_frontmatter_line, replace_section
 from .repositories import REPO_REQUIRED_TASK_AREAS, TASK_AREAS, RepoLayout, RepoSelectorStatus, RepoTarget, RepositoryIdentitySource, default_repo_target, repo_layout, resolve_repo_selector_path, resolve_task_repo_target
@@ -585,6 +586,67 @@ def append_task_log(root: Path, task_id: str, message: str) -> dict[str, Any]:
     return {"task": task, "text": text, "timestamp": timestamp}
 
 
+def _handoff_operational_history_count(handoff: str) -> int:
+    """Count explicit protocol records, not ordinary restart vocabulary."""
+    prose: list[str] = []
+    fence_char = ""
+    fence_len = 0
+    for line in handoff.splitlines():
+        fence = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if not fence_char:
+                fence_char, fence_len = marker[0], len(marker)
+            elif (marker[0] == fence_char and len(marker) >= fence_len
+                  and not line[fence.end():].strip()):
+                fence_char, fence_len = "", 0
+            prose.append("")
+            continue
+        prose.append("" if fence_char else line)
+
+    # Preserve newlines while excluding inline examples, including code spans
+    # with embedded backticks or spanning multiple lines.
+    authored = re.sub(
+        r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)",
+        lambda match: "\n" * match.group(0).count("\n"),
+        "\n".join(prose), flags=re.DOTALL,
+    )
+    label = r"(?:ACK|collector|request queue|role transition|external completion|deleted file hash)"
+    record = re.compile(rf"^{label}\s*[:=]", re.IGNORECASE)
+    stamp = (
+        r"(?:\d{8}T\d{6}Z|\d{4}-\d{2}-\d{2}"
+        r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?)"
+    )
+    timed_record = re.compile(
+        rf"^(?:\[{stamp}\]|{stamp})(?:\s*[:—-]\s*|\s+){label}\b",
+        re.IGNORECASE,
+    )
+    field = re.compile(
+        r"^(Next exact step|First file to open|First command to run|Done when):\s*",
+        re.IGNORECASE,
+    )
+    count = 0
+    command_indent: int | None = None
+    for line in authored.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if command_indent is not None and indent > command_indent:
+            continue
+        command_indent = None
+        value = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.lstrip())
+        restart_field = field.match(value)
+        if restart_field:
+            if restart_field.group(1).casefold() == "first command to run":
+                # A command and its indented continuation are inert source.
+                command_indent = indent
+                continue
+            value = value[restart_field.end():]
+        if record.match(value) or timed_record.match(value):
+            count += 1
+    return count
+
+
 def task_content_audit(task: Task) -> dict[str, Any]:
     """Report size and known machine-generated slop without blocking authored work."""
 
@@ -612,7 +674,7 @@ def task_content_audit(task: Task) -> dict[str, Any]:
         add("task_log_oversized_line", "Execution Log contains one or more oversized lines", count=oversized_line_count)
     for finding in semantic_log_repetition(execution_log):
         findings.append({"severity": "warning", "path": task.rel_path, **finding})
-    operational_handoff_count = len(re.findall(r"\b(?:ACK|collector|request queue|role transition|external completion|deleted file hash)\b", handoff, flags=re.IGNORECASE))
+    operational_handoff_count = _handoff_operational_history_count(handoff)
     if operational_handoff_count:
         add("task_handoff_operational_history", "Handoff appears to contain operational history instead of current restart instructions", count=operational_handoff_count)
     chosen_count = len(task_discovery_values(task).get("Chosen files", []))
@@ -819,7 +881,8 @@ def update_task_discovery(
         [*previous_notes, *([note] if note.strip() else [])]
     )
 
-    target = _target_for_task(root, task)
+    layout = repo_layout(root)
+    target = _target_for_task(root, task, layout=layout)
     _require_task_start_scope_alignment(root, task, target=target)
 
     invalid_paths: list[str] = []
@@ -893,6 +956,12 @@ def update_task_discovery(
         "task": task,
         "text": updated_text,
         "discovery": {"chosen_files": chosen_values, "notes": note_values},
+        "chosen_overlaps": live_chosen_overlaps(
+            root,
+            task,
+            chosen_paths={path[len(prefix):] for path in normalized_paths} if target is not None else set(),
+            layout=layout,
+        ),
         "update": {
             "chosen_files": {
                 "mode": (
@@ -1021,6 +1090,63 @@ def _task_chosen_path_projection(
             continue
         chosen.add(normalized)
     return chosen, sorted(set(invalid))
+
+
+def live_chosen_overlaps(
+    root: Path,
+    task: Task,
+    *,
+    chosen_paths: set[str] | None = None,
+    layout: RepoLayout | None = None,
+) -> list[dict[str, Any]]:
+    """Observe intersecting live scopes without changing Task or repository state.
+
+    An override is the validated, repo-relative result of a pending Discovery
+    edit. Invalid scopes remain the existing validators' responsibility and are
+    never used to infer a conflict or transfer ownership.
+    """
+
+    if task.archived or task.status not in LIVE:
+        return []
+    layout = layout or repo_layout(root)
+    target = _target_for_task(root, task, layout=layout)
+    if target is None:
+        return []
+    if chosen_paths is None:
+        chosen, invalid = _task_chosen_path_projection(task, target=target)
+    else:
+        chosen = set(chosen_paths)
+        invalid = [
+            path for path in chosen
+            if not path or normalize_repo_path(path) != path
+        ]
+    if invalid or not chosen or any((target.root_path / path).is_dir() for path in chosen):
+        return []
+
+    overlaps: list[dict[str, Any]] = []
+    for other in sorted(load_tasks(root, include_archived=False), key=lambda item: item.id):
+        if other.id == task.id or other.archived or other.status not in LIVE:
+            continue
+        try:
+            other_target = _target_for_task(root, other, layout=layout)
+        except RepoctlError:
+            # Unresolved repository identity cannot establish a shared target.
+            continue
+        if other_target != target:
+            continue
+        other_chosen, other_invalid = _task_chosen_path_projection(other, target=other_target)
+        if other_invalid or any((target.root_path / path).is_dir() for path in other_chosen):
+            continue
+        paths = sorted(chosen & other_chosen)
+        if paths:
+            overlaps.append({
+                "current_task_id": task.id,
+                "other_task_id": other.id,
+                "other_task_status": other.status,
+                "repo_id": target.id,
+                "overlapping_paths": paths,
+            })
+    return overlaps
 
 
 def _dirty_entry(dirty: list[str], *, copy: dict[str, Any], baseline_ref: str) -> str:
@@ -3347,9 +3473,30 @@ def _done_descendant_completion_receipts(
         return [], []
     children = children_by_parent(load_tasks(root, include_archived=False))
     stack = list(children.get(task.id, [])) if target is None else []
-    for task_id in sorted(set(acknowledge_completed)):
+    # A product sibling may be acknowledged for individual verified paths.
+    # A bare Task ID retains the original whole-receipt contract.
+    if len({":" in selector for selector in acknowledge_completed}) > 1:
+        raise RepoctlError(
+            "cannot combine whole-task and path-scoped acknowledgement",
+            code="completion_acknowledgement_invalid",
+            path=task.rel_path,
+        )
+    selected_by_id: dict[str, set[str] | None] = {}
+    for selector in sorted(set(acknowledge_completed)):
+        task_id, separator, selected_path = selector.partition(":")
         if not ID_RE.fullmatch(task_id):
-            raise RepoctlError("acknowledgement requires an exact Task ID", code="completion_acknowledgement_invalid", path=task_id)
+            raise RepoctlError("acknowledgement requires an exact Task ID", code="completion_acknowledgement_invalid", path=selector)
+        if separator:
+            if target is None or not selected_path or normalize_repo_path(selected_path) != selected_path:
+                raise RepoctlError("path-scoped acknowledgement requires a canonical product-repository path", code="completion_acknowledgement_invalid", path=selector)
+            if task_id in selected_by_id and selected_by_id[task_id] is None:
+                raise RepoctlError("cannot combine whole-task and path-scoped acknowledgement", code="completion_acknowledgement_invalid", path=selector)
+            selected_by_id.setdefault(task_id, set()).add(selected_path)
+        else:
+            if task_id in selected_by_id and selected_by_id[task_id] is not None:
+                raise RepoctlError("cannot combine whole-task and path-scoped acknowledgement", code="completion_acknowledgement_invalid", path=selector)
+            selected_by_id[task_id] = None
+    for task_id in sorted(selected_by_id):
         completed = resolve_task(root, task_id)
         if target is None:
             eligible = completed.archived and not completed.parent and _repo_scoped_task(completed)
@@ -3436,11 +3583,40 @@ def _done_descendant_completion_receipts(
 
         if target is not None:
             chosen, _invalid = _task_chosen_path_projection(task, target=target)
-            completed_paths = set(_entry_mutation_paths([
-                _receipt_changed_entry(entry, rel=receipt_rel) for entry in receipt.get("changed_entries", [])
-            ]))
+            entries = [_receipt_changed_entry(entry, rel=receipt_rel) for entry in receipt.get("changed_entries", [])]
+            completed_paths = set(_entry_mutation_paths(entries))
+            selected = selected_by_id.get(child.id)
+            if selected is not None:
+                evidence = receipt.get("repo_evidence") or {}
+                transitions = list(evidence.get("path_transitions") or [])
+                transition_paths = {t["path"] for t in transitions}
+                if not selected <= completed_paths or not selected <= transition_paths:
+                    raise RepoctlError("requested sibling paths lack verified completion transitions", code="completion_acknowledgement_invalid", path=child.rel_path)
+                # An entry such as a rename cannot be split into one-sided ownership.
+                if any(
+                    set(_entry_mutation_paths([entry])) & selected
+                    and not set(_entry_mutation_paths([entry])) <= selected
+                    for entry in entries
+                ):
+                    raise RepoctlError("path-scoped acknowledgement cannot split a rename", code="completion_acknowledgement_invalid", path=child.rel_path)
+                completed_paths = selected
             if chosen & completed_paths:
                 raise RepoctlError("completed sibling paths overlap this task's Chosen scope", code="completion_acknowledgement_invalid", path=child.rel_path)
+            if selected is not None:
+                # Validate the complete immutable receipt first (above), then
+                # project claims in memory. Do not rewrite source receipts.
+                receipt = {
+                    **receipt,
+                    "changed_entries": [
+                        item for item, entry in zip(receipt["changed_entries"], entries)
+                        if set(_entry_mutation_paths([entry])) <= selected
+                    ],
+                    "repo_evidence": {
+                        **receipt["repo_evidence"],
+                        "path_transitions": [t for t in transitions if t["path"] in selected],
+                    },
+                    "_acknowledged_paths": sorted(selected),
+                }
 
         child_repo_scoped = _repo_scoped_task(child)
         try:
@@ -3870,6 +4046,138 @@ def _evaluate_path_lineage(
     return [claim.task_id for claim in ordered], None
 
 
+def _evaluate_committed_parent_lineage(
+    root: Path,
+    *,
+    target: RepoTarget,
+    path: str,
+    claims: list[_DescendantPathClaim],
+    receipts: dict[str, dict[str, Any]],
+    baseline: dict[str, Any] | None,
+    terminal_revision: str | None,
+    root_state: StablePathState,
+    terminal_state: StablePathState,
+    ancestry_cache: dict[tuple[str, str], bool],
+    path_state_cache: dict[tuple[str, str], StablePathState],
+) -> tuple[list[str], Problem | None]:
+    """Compose verified committed observations inside one root Task interval.
+
+    This projection neither edits receipts nor assigns product ownership. Git
+    anchors let a late-started parent inherit a prefix and let long observations
+    confirm nested child spans. Uncovered path mutations remain errors.
+    """
+
+    def ancestry(ancestor: str, descendant: str) -> bool:
+        key = (ancestor, descendant)
+        if key not in ancestry_cache:
+            included, state = repo_is_ancestor(
+                root, ancestor=ancestor, descendant=descendant, target=target,
+            )
+            if not state.available:
+                raise RepoctlError("cannot verify committed child ancestry", code="transition_evidence_incomplete", path=path)
+            ancestry_cache[key] = included
+        return ancestry_cache[key]
+
+    def git_state(revision: str) -> StablePathState:
+        key = (revision, path)
+        if key not in path_state_cache:
+            states, state = repo_path_stable_states(root, [path], target, revision=revision)
+            if not state.available or path not in states:
+                raise RepoctlError("cannot verify committed child path state", code="transition_evidence_incomplete", path=path)
+            path_state_cache[key] = states[path]
+        return path_state_cache[key]
+
+    def compare_revisions(left: str, right: str) -> int:
+        if left == right:
+            return 0
+        if ancestry(left, right):
+            return -1
+        if ancestry(right, left):
+            return 1
+        raise RepoctlError("child committed observations do not form one ordered history", code="transition_order_ambiguous", path=path)
+
+    def require_untouched(before: str, after: str, code: str) -> None:
+        touched, state = repo_paths_changed_in_commit_range(
+            root, paths=[path], base=before, head=after, target=target,
+        )
+        if not state.available:
+            raise RepoctlError("cannot verify a gap between committed child observations", code="transition_evidence_incomplete", path=path)
+        if touched:
+            raise RepoctlError("committed path changes are not covered by child observations", code=code, path=path)
+
+    try:
+        parent_head = str((baseline or {}).get("head") or (baseline or {}).get("start_head") or "")
+        if not parent_head or not terminal_revision:
+            raise RepoctlError("parent committed interval lacks a recorded Git anchor", code="root_evidence_incomplete", path=path)
+        if not ancestry(parent_head, terminal_revision):
+            raise RepoctlError("parent committed history is not descended from its baseline", code="repo_history_rewritten", path=path)
+        if stable_path_state_digest(root_state) != stable_path_state_digest(git_state(parent_head)):
+            raise RepoctlError("parent dirty path state differs from its committed Git anchor", code="transition_lineage_gap", path=path)
+        if stable_path_state_digest(terminal_state) != stable_path_state_digest(git_state(terminal_revision)):
+            raise RepoctlError("terminal path state differs from its committed Git anchor", code="terminal_evidence_drift", path=path)
+
+        spans: list[tuple[str, str, _DescendantPathClaim, bool]] = []
+        for claim in claims:
+            if (
+                not _valid_event_stamp(claim.started_at)
+                or not _valid_event_stamp(claim.completed_at)
+                or claim.started_at > claim.completed_at
+            ):
+                raise RepoctlError("child transition lacks a valid execution interval", code="transition_evidence_incomplete", path=path)
+            evidence = receipts[claim.task_id]["repo_evidence"]
+            start = str(evidence.get("start_head") or "")
+            observed = str(evidence.get("observed_head") or "")
+            if not start or not observed or not ancestry(start, observed) or not ancestry(observed, terminal_revision):
+                raise RepoctlError("child receipt is outside the current committed history", code="transition_lineage_gap", path=path)
+            if (
+                claim.before_digest != stable_path_state_digest(git_state(start))
+                or claim.after_digest != stable_path_state_digest(git_state(observed))
+            ):
+                raise RepoctlError("child receipt path endpoints do not match its immutable Git anchors", code="transition_evidence_incomplete", path=path)
+            historical = ancestry(observed, parent_head)
+            if historical:
+                # Preserve the parent's recorded starting state; the older
+                # receipt is verified history, not a new parent-range mutation.
+                spans.append((parent_head, parent_head, claim, True))
+                continue
+            if not ancestry(parent_head, observed):
+                raise RepoctlError("child receipt and parent start have incomparable histories", code="transition_order_ambiguous", path=path)
+            if ancestry(start, parent_head):
+                start = parent_head
+            elif not ancestry(parent_head, start):
+                raise RepoctlError("child start and parent start have incomparable histories", code="transition_order_ambiguous", path=path)
+            spans.append((start, observed, claim, False))
+
+        anchors = sorted(
+            {parent_head, terminal_revision, *(revision for start, end, _claim, _historical in spans for revision in (start, end))},
+            key=cmp_to_key(compare_revisions),
+        )
+        if any(not ancestry(left, right) for left, right in zip(anchors, anchors[1:])):
+            raise RepoctlError("child committed anchors do not form one ordered history", code="transition_order_ambiguous", path=path)
+        order = {revision: index for index, revision in enumerate(anchors)}
+        spans.sort(key=lambda span: (order[span[0]], order[span[1]], span[2].task_id))
+        # Distinct terminal observations cannot claim reversed completion order.
+        observed_spans = sorted((span for span in spans if not span[3]), key=lambda span: order[span[1]])
+        for index, previous in enumerate(observed_spans):
+            if any(
+                order[previous[1]] < order[later[1]]
+                and previous[2].completed_at > later[2].completed_at
+                for later in observed_spans[index + 1:]
+            ):
+                raise RepoctlError("child completion events contradict committed observation order", code="transition_order_ambiguous", path=path)
+
+        cursor = parent_head
+        for start, end, _claim, _historical in spans:
+            if order[start] > order[cursor]:
+                require_untouched(cursor, start, "transition_lineage_gap")
+            if order[end] > order[cursor]:
+                cursor = end
+        require_untouched(cursor, terminal_revision, "terminal_evidence_drift")
+        return sorted({claim.task_id for _start, _end, claim, historical in spans if not historical}), None
+    except RepoctlError as exc:
+        return [], Problem("error", exc.code or "transition_evidence_incomplete", str(exc), path)
+
+
 def _attribute_descendant_changes(
     root: Path,
     *,
@@ -3879,6 +4187,7 @@ def _attribute_descendant_changes(
     baseline: dict[str, Any] | None,
     claim_mode: _CompletionEvidenceMode = _CompletionEvidenceMode.WORKING_TREE_DIFF,
     terminal_revision: str | None = None,
+    allow_committed_parent_spans: bool = False,
 ) -> _DescendantAttributionResult:
     if not descendant_receipts:
         return _DescendantAttributionResult(tuple(entries), (), ())
@@ -3905,16 +4214,34 @@ def _attribute_descendant_changes(
     )
     problems.extend(observation_problems)
     valid_path_tasks: dict[str, list[str]] = {}
+    ancestry_cache: dict[tuple[str, str], bool] = {}
+    path_state_cache: dict[tuple[str, str], StablePathState] = {}
+    receipts_by_task = {child.id: receipt for child, receipt in descendant_receipts}
     problem_paths = {problem.path for problem in problems if problem.path}
     for path, claims in sorted(claims_by_path.items()):
         if path in problem_paths or path not in root_states or path not in terminal_states:
             continue
-        task_ids, problem = _evaluate_path_lineage(
-            path,
-            claims,
-            root_state=root_states[path],
-            terminal_state=terminal_states[path],
-        )
+        if allow_committed_parent_spans and claim_mode is _CompletionEvidenceMode.COMMITTED_RANGE:
+            task_ids, problem = _evaluate_committed_parent_lineage(
+                root,
+                target=target,
+                path=path,
+                claims=claims,
+                receipts=receipts_by_task,
+                baseline=baseline,
+                terminal_revision=terminal_revision,
+                root_state=root_states[path],
+                terminal_state=terminal_states[path],
+                ancestry_cache=ancestry_cache,
+                path_state_cache=path_state_cache,
+            )
+        else:
+            task_ids, problem = _evaluate_path_lineage(
+                path,
+                claims,
+                root_state=root_states[path],
+                terminal_state=terminal_states[path],
+            )
         if problem is not None:
             problems.append(problem)
             problem_paths.add(path)
@@ -3960,6 +4287,129 @@ def _attribute_descendant_changes(
         tuple(attributed),
         tuple(unique_problems[key] for key in sorted(unique_problems)),
     )
+
+
+def attribute_acknowledged_committed_changes(
+    root: Path,
+    task_id: str,
+    *,
+    entries: list[ChangedEntry],
+    acknowledge_completed: tuple[str, ...],
+    terminal_revision: str,
+) -> tuple[list[ChangedEntry], list[dict[str, Any]]]:
+    """Attribute only verified sibling commit-range paths, never dirty overlay work."""
+    if not acknowledge_completed:
+        return entries, []
+    task = resolve_task(root, task_id)
+    layout = repo_layout(root)
+    target = _target_for_task(root, task, layout=layout)
+    if target is None:
+        raise RepoctlError("path-scoped committed attribution requires a product task", code="completion_acknowledgement_invalid", path=task.rel_path)
+    receipts, problems = _done_descendant_completion_receipts(
+        root, task, layout=layout, acknowledge_completed=acknowledge_completed,
+    )
+    if problems:
+        problem = problems[0]
+        raise RepoctlError(problem.message, code=problem.code, path=problem.path or task.rel_path)
+    baseline = _read_repo_baseline(root, task.id)
+    if baseline is None:
+        raise RepoctlError("path-scoped attribution requires the recorded task baseline", code="completion_acknowledgement_invalid", path=task.rel_path)
+    selected_paths = {
+        path
+        for _sibling, receipt in receipts
+        for path in receipt.get("_acknowledged_paths", [])
+    }
+    if selected_paths:
+        start_head = str(baseline.get("head") or baseline.get("start_head") or "")
+        for _sibling, receipt in receipts:
+            selected = list(receipt.get("_acknowledged_paths", []))
+            if not selected:
+                continue
+            evidence = receipt["repo_evidence"]
+            sibling_start = str(evidence.get("start_head") or "")
+            sibling_head = str(evidence.get("observed_head") or "")
+            if (
+                not start_head or not sibling_start or not sibling_head
+                or sibling_head in {start_head, sibling_start}
+                or evidence.get("mode") != _CompletionEvidenceMode.COMMITTED_RANGE.value
+            ):
+                raise RepoctlError(
+                    "selected sibling path has no committed transition in the current task range",
+                    code="completion_acknowledgement_invalid", path=selected[0],
+                )
+            for ancestor, descendant in (
+                (start_head, sibling_head),
+                (sibling_start, sibling_head),
+                (sibling_head, terminal_revision),
+            ):
+                included, state = repo_is_ancestor(
+                    root, ancestor=ancestor, descendant=descendant, target=target,
+                )
+                if not state.available or not included:
+                    raise RepoctlError(
+                        "selected sibling commit is not in the current task's verified history",
+                        code="completion_acknowledgement_invalid", path=selected[0],
+                    )
+            # The two start points may differ, but none of their differing
+            # history may mutate the selected path. Later edits also remain
+            # outside the sibling claim, even if they restore identical bytes.
+            for before, after in (
+                (start_head, sibling_start),
+                (sibling_start, start_head),
+                (sibling_head, terminal_revision),
+            ):
+                touched, state = repo_paths_changed_in_commit_range(
+                    root, paths=selected, base=before, head=after, target=target,
+                )
+                if not state.available or touched:
+                    raise RepoctlError(
+                        "selected sibling path has another committed transition outside its receipt range",
+                        code="completion_acknowledgement_invalid", path=selected[0],
+                    )
+        # Only a committed transition may be excused. Live/uncommitted changes
+        # to that path remain unowned and must fail rather than being hidden.
+        pending, state = repo_changed_entries(root, target)
+        if not state.available:
+            raise RepoctlError("cannot verify sibling path worktree state", code="repo_git_unavailable", path=target.display_path)
+        for entry in pending:
+            overlap = selected_paths & set(_entry_mutation_paths([entry]))
+            if overlap:
+                raise RepoctlError("acknowledged committed path has pending worktree changes", code="completion_acknowledgement_invalid", path=sorted(overlap)[0])
+        # The committed range starts at Git HEAD, not at the task's dirty
+        # working-tree overlay. An inherited dirty file can be restored to
+        # the recorded start tree without becoming this task's committed edit.
+        baseline = {
+            **baseline,
+            "entries": [
+                entry for entry in baseline["entries"]
+                if not selected_paths.intersection(_entry_mutation_paths([entry]))
+            ],
+            **({
+                "path_states": {
+                    path: state for path, state in baseline["path_states"].items()
+                    if path not in selected_paths
+                },
+            } if isinstance(baseline.get("path_states"), dict) else {}),
+        }
+    result = _attribute_descendant_changes(
+        root, target=target, entries=entries, descendant_receipts=receipts,
+        baseline=baseline, claim_mode=_CompletionEvidenceMode.COMMITTED_RANGE,
+        terminal_revision=terminal_revision,
+    )
+    if result.problems:
+        problem = result.problems[0]
+        raise RepoctlError(problem.message, code=problem.code, path=problem.path or task.rel_path)
+    attributed_paths = set(_entry_mutation_paths([
+        (str(record["change"]), str(record["path"]), str(record.get("old_path") or ""))
+        for record in result.attributed
+    ]))
+    if not selected_paths <= attributed_paths:
+        raise RepoctlError(
+            "selected completed sibling path is not verified in the current committed range",
+            code="completion_acknowledgement_invalid",
+            path=sorted(selected_paths - attributed_paths)[0],
+        )
+    return list(result.remaining), list(result.attributed)
 
 
 def _baseline_conflicting_paths(
@@ -4057,18 +4507,21 @@ def repo_changes_since_task_start(
             baseline=selected_baseline,
             claim_mode=claim_mode,
             terminal_revision=terminal_revision,
+            allow_committed_parent_spans=target is None,
         )
         integrity_problems.extend(result.problems)
         return list(result.remaining), list(result.attributed)
 
     def complete(delta: dict[str, Any]) -> dict[str, Any]:
         if acknowledge_completed:
+            acknowledged_ids = {selector.partition(":")[0] for selector in acknowledge_completed}
             delta["acknowledged_completions"] = [
                 {"task_id": completed.id,
                  "receipt_path": _completion_receipt_path(root, completed.id).relative_to(root).as_posix(),
-                 "receipt_sha256": _sha256_bytes(_completion_receipt_path(root, completed.id).read_bytes())}
-                for completed, _receipt in descendant_receipts
-                if completed.id in acknowledge_completed
+                 "receipt_sha256": _sha256_bytes(_completion_receipt_path(root, completed.id).read_bytes()),
+                 **({"selected_paths": receipt["_acknowledged_paths"]} if "_acknowledged_paths" in receipt else {})}
+                for completed, receipt in descendant_receipts
+                if completed.id in acknowledged_ids
             ]
         return _complete_repo_delta(
             delta,
@@ -4560,7 +5013,8 @@ def finish_task(root: Path, task_id: str, *, meta_gate: dict[str, Any] | None = 
 
     text = task.path.read_text(encoding="utf-8")
     for acknowledged in (repo_delta or {}).get("acknowledged_completions", []):
-        text = append_section_entry(text, "Execution Log", f"- {finish_timestamp}: task closure acknowledged completed product task {acknowledged['task_id']}; receipt `{acknowledged['receipt_path']}` ({acknowledged['receipt_sha256']}); original ownership unchanged.")
+        selection = f"; selected paths {', '.join(acknowledged['selected_paths'])}" if "selected_paths" in acknowledged else ""
+        text = append_section_entry(text, "Execution Log", f"- {finish_timestamp}: task closure acknowledged completed product task {acknowledged['task_id']}{selection}; receipt `{acknowledged['receipt_path']}` ({acknowledged['receipt_sha256']}); original ownership unchanged.")
     text = append_section_entry(text, "Execution Log", f"- {finish_timestamp}: {copy['task_finished']}")
     text = replace_frontmatter_line(text, "status", "done")
 

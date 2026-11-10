@@ -15,7 +15,7 @@ manifest = json.loads((ROOT / "ARTIFACT-MANIFEST.json").read_text(encoding="utf-
 assert manifest["status"] == "final"
 package, version = manifest["package"], manifest["package_version"]
 assert package in {"agent-handoff-template", "repoctl"}
-assert version == ("1.0.0" if package == "agent-handoff-template" else "0.16.1")
+assert version == ("1.0.0" if package == "agent-handoff-template" else "0.16.2")
 prefix = f"{package}-{version}"
 archive_name = f"{prefix}.tar.gz"
 contents: dict[str, bytes] = {}
