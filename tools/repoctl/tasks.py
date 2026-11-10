@@ -7,13 +7,14 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import cmp_to_key
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .completion_catalogue import prepare_completion_sidecar_writes
 from .io import LOCK_REL, RepoctlError, atomic_write, decode_schema_version
 from .task_history_migration import receipt_witness
-from .git import ChangedEntry, RepoGitState, StablePathState, normalize_repo_path, normalize_stable_path_state, repo_change_fingerprint_records, repo_changed_entries, repo_commit_range_entries, repo_git_head, repo_git_state, repo_git_status, repo_is_ancestor, repo_path_fingerprints, repo_path_stable_states, stable_path_state_digest
+from .git import ChangedEntry, RepoGitState, StablePathState, normalize_repo_path, normalize_stable_path_state, repo_change_fingerprint_records, repo_changed_entries, repo_commit_range_entries, repo_git_head, repo_git_state, repo_git_status, repo_is_ancestor, repo_path_fingerprints, repo_path_stable_states, repo_paths_changed_in_commit_range, stable_path_state_digest
 from .graph_model import digest_data
 from .markdown import append_section_entry, find_section, has_section, parse_frontmatter, parse_labeled_list_section, replace_frontmatter_line, replace_section
 from .repositories import REPO_REQUIRED_TASK_AREAS, TASK_AREAS, RepoLayout, RepoSelectorStatus, RepoTarget, RepositoryIdentitySource, default_repo_target, repo_layout, resolve_repo_selector_path, resolve_task_repo_target
@@ -3349,6 +3350,12 @@ def _done_descendant_completion_receipts(
     stack = list(children.get(task.id, [])) if target is None else []
     # A product sibling may be acknowledged for individual verified paths.
     # A bare Task ID retains the original whole-receipt contract.
+    if len({":" in selector for selector in acknowledge_completed}) > 1:
+        raise RepoctlError(
+            "cannot combine whole-task and path-scoped acknowledgement",
+            code="completion_acknowledgement_invalid",
+            path=task.rel_path,
+        )
     selected_by_id: dict[str, set[str] | None] = {}
     for selector in sorted(set(acknowledge_completed)):
         task_id, separator, selected_path = selector.partition(":")
@@ -3914,6 +3921,138 @@ def _evaluate_path_lineage(
     return [claim.task_id for claim in ordered], None
 
 
+def _evaluate_committed_parent_lineage(
+    root: Path,
+    *,
+    target: RepoTarget,
+    path: str,
+    claims: list[_DescendantPathClaim],
+    receipts: dict[str, dict[str, Any]],
+    baseline: dict[str, Any] | None,
+    terminal_revision: str | None,
+    root_state: StablePathState,
+    terminal_state: StablePathState,
+    ancestry_cache: dict[tuple[str, str], bool],
+    path_state_cache: dict[tuple[str, str], StablePathState],
+) -> tuple[list[str], Problem | None]:
+    """Compose verified committed observations inside one root Task interval.
+
+    This projection neither edits receipts nor assigns product ownership. Git
+    anchors let a late-started parent inherit a prefix and let long observations
+    confirm nested child spans. Uncovered path mutations remain errors.
+    """
+
+    def ancestry(ancestor: str, descendant: str) -> bool:
+        key = (ancestor, descendant)
+        if key not in ancestry_cache:
+            included, state = repo_is_ancestor(
+                root, ancestor=ancestor, descendant=descendant, target=target,
+            )
+            if not state.available:
+                raise RepoctlError("cannot verify committed child ancestry", code="transition_evidence_incomplete", path=path)
+            ancestry_cache[key] = included
+        return ancestry_cache[key]
+
+    def git_state(revision: str) -> StablePathState:
+        key = (revision, path)
+        if key not in path_state_cache:
+            states, state = repo_path_stable_states(root, [path], target, revision=revision)
+            if not state.available or path not in states:
+                raise RepoctlError("cannot verify committed child path state", code="transition_evidence_incomplete", path=path)
+            path_state_cache[key] = states[path]
+        return path_state_cache[key]
+
+    def compare_revisions(left: str, right: str) -> int:
+        if left == right:
+            return 0
+        if ancestry(left, right):
+            return -1
+        if ancestry(right, left):
+            return 1
+        raise RepoctlError("child committed observations do not form one ordered history", code="transition_order_ambiguous", path=path)
+
+    def require_untouched(before: str, after: str, code: str) -> None:
+        touched, state = repo_paths_changed_in_commit_range(
+            root, paths=[path], base=before, head=after, target=target,
+        )
+        if not state.available:
+            raise RepoctlError("cannot verify a gap between committed child observations", code="transition_evidence_incomplete", path=path)
+        if touched:
+            raise RepoctlError("committed path changes are not covered by child observations", code=code, path=path)
+
+    try:
+        parent_head = str((baseline or {}).get("head") or (baseline or {}).get("start_head") or "")
+        if not parent_head or not terminal_revision:
+            raise RepoctlError("parent committed interval lacks a recorded Git anchor", code="root_evidence_incomplete", path=path)
+        if not ancestry(parent_head, terminal_revision):
+            raise RepoctlError("parent committed history is not descended from its baseline", code="repo_history_rewritten", path=path)
+        if stable_path_state_digest(root_state) != stable_path_state_digest(git_state(parent_head)):
+            raise RepoctlError("parent dirty path state differs from its committed Git anchor", code="transition_lineage_gap", path=path)
+        if stable_path_state_digest(terminal_state) != stable_path_state_digest(git_state(terminal_revision)):
+            raise RepoctlError("terminal path state differs from its committed Git anchor", code="terminal_evidence_drift", path=path)
+
+        spans: list[tuple[str, str, _DescendantPathClaim, bool]] = []
+        for claim in claims:
+            if (
+                not _valid_event_stamp(claim.started_at)
+                or not _valid_event_stamp(claim.completed_at)
+                or claim.started_at > claim.completed_at
+            ):
+                raise RepoctlError("child transition lacks a valid execution interval", code="transition_evidence_incomplete", path=path)
+            evidence = receipts[claim.task_id]["repo_evidence"]
+            start = str(evidence.get("start_head") or "")
+            observed = str(evidence.get("observed_head") or "")
+            if not start or not observed or not ancestry(start, observed) or not ancestry(observed, terminal_revision):
+                raise RepoctlError("child receipt is outside the current committed history", code="transition_lineage_gap", path=path)
+            if (
+                claim.before_digest != stable_path_state_digest(git_state(start))
+                or claim.after_digest != stable_path_state_digest(git_state(observed))
+            ):
+                raise RepoctlError("child receipt path endpoints do not match its immutable Git anchors", code="transition_evidence_incomplete", path=path)
+            historical = ancestry(observed, parent_head)
+            if historical:
+                # Preserve the parent's recorded starting state; the older
+                # receipt is verified history, not a new parent-range mutation.
+                spans.append((parent_head, parent_head, claim, True))
+                continue
+            if not ancestry(parent_head, observed):
+                raise RepoctlError("child receipt and parent start have incomparable histories", code="transition_order_ambiguous", path=path)
+            if ancestry(start, parent_head):
+                start = parent_head
+            elif not ancestry(parent_head, start):
+                raise RepoctlError("child start and parent start have incomparable histories", code="transition_order_ambiguous", path=path)
+            spans.append((start, observed, claim, False))
+
+        anchors = sorted(
+            {parent_head, terminal_revision, *(revision for start, end, _claim, _historical in spans for revision in (start, end))},
+            key=cmp_to_key(compare_revisions),
+        )
+        if any(not ancestry(left, right) for left, right in zip(anchors, anchors[1:])):
+            raise RepoctlError("child committed anchors do not form one ordered history", code="transition_order_ambiguous", path=path)
+        order = {revision: index for index, revision in enumerate(anchors)}
+        spans.sort(key=lambda span: (order[span[0]], order[span[1]], span[2].task_id))
+        # Distinct terminal observations cannot claim reversed completion order.
+        observed_spans = sorted((span for span in spans if not span[3]), key=lambda span: order[span[1]])
+        for index, previous in enumerate(observed_spans):
+            if any(
+                order[previous[1]] < order[later[1]]
+                and previous[2].completed_at > later[2].completed_at
+                for later in observed_spans[index + 1:]
+            ):
+                raise RepoctlError("child completion events contradict committed observation order", code="transition_order_ambiguous", path=path)
+
+        cursor = parent_head
+        for start, end, _claim, _historical in spans:
+            if order[start] > order[cursor]:
+                require_untouched(cursor, start, "transition_lineage_gap")
+            if order[end] > order[cursor]:
+                cursor = end
+        require_untouched(cursor, terminal_revision, "terminal_evidence_drift")
+        return sorted({claim.task_id for _start, _end, claim, historical in spans if not historical}), None
+    except RepoctlError as exc:
+        return [], Problem("error", exc.code or "transition_evidence_incomplete", str(exc), path)
+
+
 def _attribute_descendant_changes(
     root: Path,
     *,
@@ -3923,6 +4062,7 @@ def _attribute_descendant_changes(
     baseline: dict[str, Any] | None,
     claim_mode: _CompletionEvidenceMode = _CompletionEvidenceMode.WORKING_TREE_DIFF,
     terminal_revision: str | None = None,
+    allow_committed_parent_spans: bool = False,
 ) -> _DescendantAttributionResult:
     if not descendant_receipts:
         return _DescendantAttributionResult(tuple(entries), (), ())
@@ -3949,16 +4089,34 @@ def _attribute_descendant_changes(
     )
     problems.extend(observation_problems)
     valid_path_tasks: dict[str, list[str]] = {}
+    ancestry_cache: dict[tuple[str, str], bool] = {}
+    path_state_cache: dict[tuple[str, str], StablePathState] = {}
+    receipts_by_task = {child.id: receipt for child, receipt in descendant_receipts}
     problem_paths = {problem.path for problem in problems if problem.path}
     for path, claims in sorted(claims_by_path.items()):
         if path in problem_paths or path not in root_states or path not in terminal_states:
             continue
-        task_ids, problem = _evaluate_path_lineage(
-            path,
-            claims,
-            root_state=root_states[path],
-            terminal_state=terminal_states[path],
-        )
+        if allow_committed_parent_spans and claim_mode is _CompletionEvidenceMode.COMMITTED_RANGE:
+            task_ids, problem = _evaluate_committed_parent_lineage(
+                root,
+                target=target,
+                path=path,
+                claims=claims,
+                receipts=receipts_by_task,
+                baseline=baseline,
+                terminal_revision=terminal_revision,
+                root_state=root_states[path],
+                terminal_state=terminal_states[path],
+                ancestry_cache=ancestry_cache,
+                path_state_cache=path_state_cache,
+            )
+        else:
+            task_ids, problem = _evaluate_path_lineage(
+                path,
+                claims,
+                root_state=root_states[path],
+                terminal_state=terminal_states[path],
+            )
         if problem is not None:
             problems.append(problem)
             problem_paths.add(path)
@@ -4037,6 +4195,52 @@ def attribute_acknowledged_committed_changes(
         for path in receipt.get("_acknowledged_paths", [])
     }
     if selected_paths:
+        start_head = str(baseline.get("head") or baseline.get("start_head") or "")
+        for _sibling, receipt in receipts:
+            selected = list(receipt.get("_acknowledged_paths", []))
+            if not selected:
+                continue
+            evidence = receipt["repo_evidence"]
+            sibling_start = str(evidence.get("start_head") or "")
+            sibling_head = str(evidence.get("observed_head") or "")
+            if (
+                not start_head or not sibling_start or not sibling_head
+                or sibling_head in {start_head, sibling_start}
+                or evidence.get("mode") != _CompletionEvidenceMode.COMMITTED_RANGE.value
+            ):
+                raise RepoctlError(
+                    "selected sibling path has no committed transition in the current task range",
+                    code="completion_acknowledgement_invalid", path=selected[0],
+                )
+            for ancestor, descendant in (
+                (start_head, sibling_head),
+                (sibling_start, sibling_head),
+                (sibling_head, terminal_revision),
+            ):
+                included, state = repo_is_ancestor(
+                    root, ancestor=ancestor, descendant=descendant, target=target,
+                )
+                if not state.available or not included:
+                    raise RepoctlError(
+                        "selected sibling commit is not in the current task's verified history",
+                        code="completion_acknowledgement_invalid", path=selected[0],
+                    )
+            # The two start points may differ, but none of their differing
+            # history may mutate the selected path. Later edits also remain
+            # outside the sibling claim, even if they restore identical bytes.
+            for before, after in (
+                (start_head, sibling_start),
+                (sibling_start, start_head),
+                (sibling_head, terminal_revision),
+            ):
+                touched, state = repo_paths_changed_in_commit_range(
+                    root, paths=selected, base=before, head=after, target=target,
+                )
+                if not state.available or touched:
+                    raise RepoctlError(
+                        "selected sibling path has another committed transition outside its receipt range",
+                        code="completion_acknowledgement_invalid", path=selected[0],
+                    )
         # Only a committed transition may be excused. Live/uncommitted changes
         # to that path remain unowned and must fail rather than being hidden.
         pending, state = repo_changed_entries(root, target)
@@ -4178,6 +4382,7 @@ def repo_changes_since_task_start(
             baseline=selected_baseline,
             claim_mode=claim_mode,
             terminal_revision=terminal_revision,
+            allow_committed_parent_spans=target is None,
         )
         integrity_problems.extend(result.problems)
         return list(result.remaining), list(result.attributed)

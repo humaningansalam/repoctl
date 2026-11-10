@@ -4200,6 +4200,8 @@ def cmd_task_finish(args: argparse.Namespace) -> int:
         "finish_summary": finish_summary,
         "completion_receipt": result["receipt_path"].relative_to(root).as_posix(),
     }
+    if delta.get("acknowledged_completions"):
+        data["acknowledged_completions"] = delta["acknowledged_completions"]
     receipt = result.get("receipt") if isinstance(result.get("receipt"), dict) else {}
     repo_id = str(receipt.get("repo_id") or "")
     warnings: list[dict[str, Any]] = []
