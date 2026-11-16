@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Task·Board·Handoff 문서 작성 양식
+    url: https://github.com/humaningansalam/agent-handoff-template/issues/new/choose
+    about: 문서 양식이나 작성 안내 자체의 문제는 agent-handoff-template에 남겨 주세요.
