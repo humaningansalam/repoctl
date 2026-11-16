@@ -1,0 +1,49 @@
+name: 버그 신고
+description: repoctl 명령이나 결과가 기대와 다르게 동작합니다.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        관찰한 사실과 원인 추측을 구분해 주세요. 한국어 또는 영어로 작성할 수 있습니다.
+        토큰, 개인정보, 비공개 저장소 내용은 제거해 주세요.
+        전체 Task·receipt·저장소 덤프 대신 문제를 보여 주는 최소 발췌를 사용해 주세요.
+        문서 작성 양식 자체의 문제는 agent-handoff-template 저장소에서 다룹니다.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 문제와 기대 결과
+      placeholder: |
+        하려던 작업:
+        실제 결과:
+        기대한 결과:
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 재현 방법과 입력
+      description: 실행한 명령과 필요한 최소 입력을 적어 주세요. 불규칙한 문제는 발생 조건과 빈도를 적으면 됩니다.
+      placeholder: |
+        실행 위치: workspace / runtime / source checkout 중 해당 위치
+        1. 실행한 명령:
+        2. 필요한 최소 Task·문서·소스 입력:
+        3. 실제 출력 또는 오류 코드:
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 버전과 관련 환경
+      description: 확인 가능한 관련 정보만 적어 주세요. 모든 항목을 채울 필요는 없습니다.
+      placeholder: |
+        repoctl --version 또는 커밋:
+        template contract 버전(관련된 경우):
+        OS / Python / 관련 분석기:
+        외부 runtime 또는 legacy embedded 설치:
+        마지막 정상 버전(알고 있는 경우):
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 추가 증거
+      description: 정리한 오류 출력, 최소 예제 또는 관련 이슈를 적어 주세요. 원본 자료를 수정해 문제를 숨기지 마세요.
