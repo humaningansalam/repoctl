@@ -61,7 +61,7 @@ def test_backlog_add_show_remove_manage_raw_blocks(tmp_path: Path, monkeypatch, 
     assert shown == added
 
     assert main(["backlog", "remove", added["id"], "--json"]) == 0
-    removed = json.loads(capsys.readouterr().out)["data"]["removed"]
+    removed = json.loads(capsys.readouterr().out)["data"]["item"]
     assert removed == added
     board = (tmp_path / "docs/BOARD.md").read_text(encoding="utf-8")
     assert "Add discount support" not in board
@@ -109,7 +109,7 @@ def test_backlog_list_does_not_attach_unindented_comments_to_raw_block(tmp_path:
     assert payload["data"]["items"][0]["line_end"] == payload["data"]["items"][0]["line_start"]
 
 
-def test_backlog_duplicate_raw_blocks_warn_and_cannot_be_removed_by_id(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_backlog_duplicate_raw_blocks_cannot_be_removed_by_ambiguous_id(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     (tmp_path / "docs/BOARD.md").write_text("# BOARD\n\n## Board\n\n## Backlog\n\n- Duplicate item\n- Duplicate item\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
@@ -118,7 +118,6 @@ def test_backlog_duplicate_raw_blocks_warn_and_cannot_be_removed_by_id(tmp_path:
     payload = json.loads(capsys.readouterr().out)
     backlog_id = payload["data"]["items"][0]["id"]
     assert payload["data"]["items"][0]["line_start"] == payload["data"]["items"][0]["line_end"]
-    assert [warning["code"] for warning in payload["warnings"]] == ["duplicate_backlog_id"]
 
     assert main(["backlog", "remove", backlog_id, "--json"]) == 2
     error = json.loads(capsys.readouterr().out)

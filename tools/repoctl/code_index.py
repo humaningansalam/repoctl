@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .language_profiles import index_dart, language_for_path
-from .meta import FileClassification, meta_inventory
+from .inventory import InventoryFile, file_inventory
 from .repositories import RepoTarget
-from .tasks import Problem
+from .io import Problem
 
 
-CODE_INDEX_INPUT_VERSION = 9
+CODE_INDEX_INPUT_VERSION = 10
 
 
 @dataclass(frozen=True, order=True)
@@ -285,10 +285,10 @@ def _observed_effects_for(imports: list[str], calls: list[str]) -> list[str]:
     return _dedupe_sorted(effects)
 
 
-def _index_file(repo: Path, file: FileClassification) -> CodeIndexEntry:
+def _index_file(repo: Path, file: InventoryFile) -> CodeIndexEntry:
     language = language_for_path(file.path)
     if file.classification == "excluded":
-        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "skipped", "excluded by policy")
+        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "skipped", "excluded from source indexing")
     if language == "csharp":
         return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "ok", "")
     if language not in {"python", "javascript", "typescript", "dart"}:
@@ -348,7 +348,7 @@ def _index_file(repo: Path, file: FileClassification) -> CodeIndexEntry:
     )
 
 
-def _reused_index_entry(file: FileClassification, previous: CodeIndexEntry) -> CodeIndexEntry:
+def _reused_index_entry(file: InventoryFile, previous: CodeIndexEntry) -> CodeIndexEntry:
     return CodeIndexEntry(
         path=file.path,
         workspace_path=file.workspace_path,
@@ -371,7 +371,7 @@ def _reused_index_entry(file: FileClassification, previous: CodeIndexEntry) -> C
 def build_code_index_from_inventory(
     root: Path,
     *,
-    files: list[FileClassification],
+    files: list[InventoryFile],
     inventory_problems: list[Problem],
     inventory_meta: dict[str, Any],
     target: RepoTarget,
@@ -387,8 +387,6 @@ def build_code_index_from_inventory(
     reindexed = 0
     reused = 0
     for file in files:
-        if file.classification in {"orphan_annotation", "orphan_exclusion"}:
-            continue
         previous = previous_by_path.get(file.path)
         excluded_boundary_changed = previous is not None and ((previous.classification == "excluded") != (file.classification == "excluded"))
         can_reuse = (
@@ -427,12 +425,12 @@ def build_code_index_from_inventory(
 
 
 def build_code_index(root: Path, *, changed: bool = False, limit: int = 200, target: RepoTarget | None = None) -> tuple[list[CodeIndexEntry], list[Problem], dict[str, Any]]:
-    files, problems, meta = meta_inventory(root, changed=changed, target=target)
+    files, problems, meta = file_inventory(root, changed=changed, target=target)
     if problems:
         return [], problems, {**meta, "authoritative": False}
 
     repo = target.root_path if target is not None else root / str(meta.get("repository", {}).get("path") or "repos")
-    entries = [_index_file(repo, file) for file in files if file.classification not in {"orphan_annotation", "orphan_exclusion"}]
+    entries = [_index_file(repo, file) for file in files]
     entries.sort(key=lambda entry: entry.path)
     total_before_limit = len(entries)
     if limit >= 0:

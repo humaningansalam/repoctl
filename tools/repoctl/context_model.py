@@ -65,7 +65,6 @@ class ContextEvidenceKind(StrEnum):
     GRAPH_SEED = "graph_seed"
     GRAPH_RELATION = "graph_relation"
     KNOWLEDGE_RECORDS_PATH = "knowledge_records_path"
-    HISTORY_CORROBORATION = "history_corroboration"
 
 
 class ContextAnchorStrength(StrEnum):

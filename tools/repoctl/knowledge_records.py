@@ -1,42 +1,24 @@
 from __future__ import annotations
 
-import json
-import os
-import time
 import hashlib
+import json
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Mapping
+from uuid import uuid4
 
-from .graph_model import digest_data
-from .io import RepoctlError, atomic_write
-from .knowledge_projection import (
-    KNOWLEDGE_RECORD_SCHEMA_VERSION,
-    knowledge_projection_path,
-    load_knowledge_projection,
-    rebuild_knowledge_projection,
-    verify_current_knowledge_projection,
-    read_knowledge_record_sources,
+from .io import Problem, atomic_write
+from .repositories import (
+    require_repo_target,
+    resolve_repo_selector_path,
+    RepoSelectorStatus,
 )
-from .repositories import workspace_target, RepoSelectorStatus, require_repo_target, resolve_repo_selector_path
-from .tasks import Problem
 
 
 ALLOWED_KINDS = {"decision", "invariant", "failure_mode"}
-ALLOWED_SOURCE_PREFIXES = ("docs/adr/", "docs/architecture/", "docs/contracts/", "docs/specs/", "docs/workflows/")
-EXCLUDED_SOURCE_PARTS = {".repoctl-state", "generated", "plans"}
-MAX_KNOWLEDGE_CLAIM_LENGTH = 300
-MAX_DIRECT_KNOWLEDGE_FALLBACK_RECORDS = 2048
-MAX_SOURCE_RELOCATION_CANDIDATES = 5000
-MAX_SOURCE_RELOCATION_VISITED_ENTRIES = 20000
-MAX_SOURCE_RELOCATION_HASH_BYTES = 128 * 1024 * 1024
-MAX_SOURCE_RELOCATION_FILE_BYTES = 16 * 1024 * 1024
-MAX_SOURCE_RELOCATION_SECONDS = 10.0
-CLAIM_ORIGINS = {"explicit"}
 
 
 class KnowledgeExplicitPathKind(StrEnum):
@@ -52,17 +34,8 @@ class KnowledgeExplicitPathRole(StrEnum):
 class KnowledgeSourceRefKind(StrEnum):
     CURRENT_SOURCE = "current_source"
     AUTHORITY_DOCUMENT = "authority_document"
-    COMPLETION_RECEIPT = "completion_receipt"
     TASK_ARTIFACT = "task_artifact"
     WORKSPACE_FILE = "workspace_file"
-
-
-class KnowledgeSourceResolutionStatus(StrEnum):
-    CURRENT = "current"
-    RELOCATED = "relocated"
-    MISSING = "missing"
-    DIGEST_MISMATCH = "digest_mismatch"
-    INVALID_IDENTITY = "invalid_identity"
 
 
 class KnowledgeQueryMatchStrength(StrEnum):
@@ -72,12 +45,6 @@ class KnowledgeQueryMatchStrength(StrEnum):
     EXACT = "exact"
 
 
-class KnowledgeArtifactErrorCode(StrEnum):
-    RECORD_INVALID_JSON = "knowledge_record_invalid_json"
-    RECORD_NOT_OBJECT = "knowledge_record_not_object"
-    RECORD_UNREADABLE = "knowledge_record_unreadable"
-
-
 @dataclass(frozen=True)
 class PreparedKnowledgeRecord:
     data: dict[str, Any]
@@ -85,21 +52,98 @@ class PreparedKnowledgeRecord:
     text: str
 
 
-@dataclass(frozen=True)
-class KnowledgeArtifactRead:
-    data: dict[str, Any] | None
-    problem: Problem | None
+def _record_dir(root: Path) -> Path:
+    return root / "docs/knowledge/records"
 
 
-@dataclass(frozen=True)
-class KnowledgeSourceResolution:
-    status: KnowledgeSourceResolutionStatus
-    declared_path: str
-    resolved_path: str
-    expected_sha256: str
-    actual_sha256: str = ""
-    cause_code: str = ""
-    scan_stats: dict[str, int] | None = None
+def _workspace_path(root: Path, value: str) -> Path:
+    relative = PurePosixPath(value)
+    if not value or relative.is_absolute() or ".." in relative.parts or "\\" in value:
+        raise ValueError("source must be a workspace-relative path")
+    path = root / relative
+    path.resolve().relative_to(root.resolve())
+    return path
+
+
+def _read_records(
+    root: Path, *, repo_id: str
+) -> tuple[list[dict[str, Any]], list[Problem]]:
+    records: list[dict[str, Any]] = []
+    problems: list[Problem] = []
+    for path in sorted(_record_dir(root).glob("*.json")):
+        relative = path.relative_to(root).as_posix()
+        try:
+            path.resolve().relative_to(root.resolve())
+            content = path.read_bytes()
+            record = json.loads(content)
+            if not isinstance(record, dict):
+                raise ValueError("record must be an object")
+            if str(record.get("repo_id") or "") != repo_id:
+                continue
+            if record.get("id") != path.stem:
+                raise ValueError("record ID does not match its filename")
+            if not isinstance(record.get("claim"), str) or not record["claim"].strip():
+                raise ValueError("record has no claim")
+            refs = record.get("source_refs")
+            if (
+                not isinstance(refs, list)
+                or not refs
+                or any(
+                    not isinstance(ref, dict)
+                    or not isinstance(ref.get("path"), str)
+                    or not ref["path"]
+                    for ref in refs
+                )
+            ):
+                raise ValueError("record source_refs must contain source paths")
+            applies = record.get("applies_to", {})
+            if not isinstance(applies, dict) or not isinstance(
+                applies.get("paths", []), list
+            ):
+                raise ValueError("record applies_to.paths must be a list")
+            if not isinstance(record.get("replaces", []), list):
+                raise ValueError("record replaces must be a list")
+            record["_content_sha256"] = "sha256:" + hashlib.sha256(content).hexdigest()
+            records.append(record)
+        except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+            problems.append(
+                Problem("error", "knowledge_record_unreadable", str(exc), relative)
+            )
+    return records, problems
+
+
+def _superseded_ids(records: list[dict[str, Any]]) -> set[str]:
+    present = {str(record["id"]) for record in records}
+    return {
+        str(value)
+        for record in records
+        for value in record.get("replaces", [])
+        if str(value) in present
+    }
+
+
+def _source_kind(value: str, repository_path: str) -> str:
+    value = PurePosixPath(value).as_posix()
+    if value.startswith(("docs/tasks/", "docs/archive/tasks/")) and value.endswith(
+        ".md"
+    ):
+        return KnowledgeSourceRefKind.TASK_ARTIFACT.value
+    if value.startswith(
+        (
+            "docs/adr/",
+            "docs/architecture/",
+            "docs/contracts/",
+            "docs/specs/",
+            "docs/workflows/",
+        )
+    ):
+        return KnowledgeSourceRefKind.AUTHORITY_DOCUMENT.value
+    if repository_path == ".":
+        if not value.startswith("docs/") and value not in {"AGENTS.md", "README.md"}:
+            return KnowledgeSourceRefKind.CURRENT_SOURCE.value
+    elif repository_path and value.startswith(repository_path.rstrip("/") + "/"):
+        return KnowledgeSourceRefKind.CURRENT_SOURCE.value
+    return KnowledgeSourceRefKind.WORKSPACE_FILE.value
 
 
 def prepare_knowledge_record(
@@ -113,122 +157,114 @@ def prepare_knowledge_record(
     applies_to: list[str] | None = None,
     replaces: list[str] | None = None,
     author: str = "",
-    allow_pending_sources: bool = False,
+    source_bytes: Mapping[str, bytes] | None = None,
 ) -> tuple[PreparedKnowledgeRecord | None, list[Problem]]:
-    """Prepare one durable Knowledge record without a candidate lifecycle."""
-
+    """Prepare a record; supplied source bytes are the exact bytes its caller will save."""
+    problems: list[Problem] = []
     if kind not in ALLOWED_KINDS:
-        return None, [
+        problems.append(
             Problem(
-                "error",
-                "invalid_knowledge_kind",
-                f"knowledge kind must be one of {sorted(ALLOWED_KINDS)}",
+                "error", "invalid_knowledge_kind", f"unknown Knowledge kind: {kind}"
             )
-        ]
-    normalized_claim, claim_problem = _validated_claim(
-        claim=claim,
-        problem_path="",
-    )
-    if claim_problem is not None:
-        return None, [claim_problem]
-    normalized_reason = reason.strip()
-    if not normalized_reason:
-        return None, [
-            Problem(
-                "error",
-                "knowledge_reason_required",
-                "knowledge requires a concrete reason",
-            )
-        ]
-    normalized_applies_to, path_problems = _validated_applicability_paths(
-        root,
-        repo_id=repo_id,
-        values=list(applies_to or []),
-    )
-    if path_problems:
-        return None, path_problems
-    target = require_repo_target(root, repo_id=repo_id) if repo_id else workspace_target(root)
-    source_refs: list[dict[str, str]] = []
-    source_problems: list[Problem] = []
-    for raw_source in sources:
-        ref, problem = _direct_knowledge_source_ref(
-            root,
-            target=target,
-            raw_source=raw_source,
-            allow_pending=allow_pending_sources,
         )
-        if problem is not None:
-            source_problems.append(problem)
-        elif ref not in source_refs:
-            source_refs.append(ref)
+    if not claim.strip():
+        problems.append(
+            Problem("error", "knowledge_claim_required", "Knowledge requires a claim")
+        )
+    if not reason.strip():
+        problems.append(
+            Problem("error", "knowledge_reason_required", "Knowledge requires a reason")
+        )
     if not sources:
-        source_problems.append(
+        problems.append(
             Problem(
                 "error",
                 "knowledge_source_required",
-                "knowledge requires at least one workspace source",
+                "Knowledge requires at least one source",
             )
         )
-    if source_problems:
-        return None, source_problems
-
-    replacement_ids = sorted({str(value).strip() for value in (replaces or []) if str(value).strip()})
-    known_records = {
-        str(record.get("id") or ""): record
-        for record in _load_records(root)
-    }
-    replacement_problems: list[Problem] = []
-    for record_id in replacement_ids:
-        record = known_records.get(record_id)
-        if record is None:
-            replacement_problems.append(
+    target = require_repo_target(root, repo_id=repo_id) if repo_id else None
+    repository_path = target.display_path if target else ""
+    applicability: list[str] = []
+    for value in applies_to or []:
+        resolution = resolve_repo_selector_path(value, repository_path=repository_path)
+        if resolution.status != RepoSelectorStatus.RESOLVED:
+            problems.append(
                 Problem(
                     "error",
-                    "knowledge_replaces_missing",
-                    "replacement target does not exist",
-                    record_id,
+                    "knowledge_path_invalid",
+                    "invalid applicability path",
+                    value,
                 )
             )
-        elif str(record.get("repo_id") or "") != repo_id:
-            replacement_problems.append(
-                Problem(
-                    "error",
-                    "knowledge_replaces_repo_mismatch",
-                    "replacement target belongs to a different repository",
-                    record_id,
-                )
+        elif resolution.path not in applicability:
+            applicability.append(resolution.path)
+    refs: list[dict[str, str]] = []
+    for value in dict.fromkeys(sources):
+        try:
+            path = _workspace_path(root, value)
+            content = (
+                source_bytes[value]
+                if source_bytes is not None and value in source_bytes
+                else path.read_bytes()
             )
-    if replacement_problems:
-        return None, replacement_problems
-
-    recorded_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    record_id = _unique_direct_record_id(
-        root,
-        claim=normalized_claim,
-        reason=normalized_reason,
+            if not isinstance(content, bytes):
+                raise ValueError("source_bytes values must be bytes")
+            refs.append(
+                {
+                    "kind": _source_kind(value, repository_path),
+                    "path": value,
+                    "content_sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
+                }
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            problems.append(
+                Problem("error", "knowledge_source_unavailable", str(exc), value)
+            )
+    replacement_ids = sorted(set(replaces or []))
+    if replacement_ids:
+        existing, read_problems = _read_records(root, repo_id=repo_id)
+        problems.extend(read_problems)
+        known = {str(record["id"]) for record in existing}
+        for record_id in replacement_ids:
+            if record_id not in known:
+                problems.append(
+                    Problem(
+                        "error",
+                        "knowledge_replaces_missing",
+                        "replacement target is not in this repository",
+                        record_id,
+                    )
+                )
+    if problems:
+        return None, problems
+    stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%SZ")
+    slug = (
+        re.sub(r"[^a-z0-9]+", "-", claim.casefold()).strip("-")[:40].strip("-")
+        or "knowledge"
     )
+    record_id = f"K-{stamp}--{slug}-{uuid4().hex[:12]}"
     record: dict[str, Any] = {
         "schema": "repoctl.knowledge.record",
-        "schema_version": KNOWLEDGE_RECORD_SCHEMA_VERSION,
+        "schema_version": 2,
         "id": record_id,
         "repo_id": repo_id,
         "kind": kind,
-        "claim": normalized_claim,
-        "reason": normalized_reason,
-        "source_refs": source_refs,
-        "applies_to": {"paths": normalized_applies_to},
+        "claim": claim.strip(),
+        "reason": reason.strip(),
+        "source_refs": refs,
+        "applies_to": {"paths": sorted(applicability)},
         "replaces": replacement_ids,
-        "recorded_at": recorded_at,
+        "recorded_at": datetime.now(UTC)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
     }
-    normalized_author = author.strip()
-    if normalized_author:
-        record["author"] = normalized_author
-    record["record_digest"] = _knowledge_record_digest(record)
-    path = _record_dir(root) / f"{record_id}.json"
+    if author.strip():
+        record["author"] = author.strip()
     return PreparedKnowledgeRecord(
-        data=record,
-        path=path,
-        text=json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        record,
+        _record_dir(root) / f"{record_id}.json",
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     ), []
 
 
@@ -255,479 +291,204 @@ def add_knowledge_record(
         replaces=replaces,
         author=author,
     )
-    if prepared is None or problems:
+    if prepared is None:
         return {}, problems, []
-    if prepared.path.exists():
-        return {}, [
-            Problem(
-                "error",
-                "knowledge_record_exists",
-                "knowledge record already exists",
-                prepared.path.relative_to(root).as_posix(),
-            )
-        ], []
     atomic_write(prepared.path, prepared.text)
-    projection, projection_problems = rebuild_knowledge_projection(
-        root,
-        repo_id=repo_id,
+    return (
+        {
+            "record": prepared.data,
+            "record_path": prepared.path.relative_to(root).as_posix(),
+        },
+        [],
+        [],
     )
-    warnings = [
-        Problem(
-            "warning",
-            "knowledge_projection_sync_failed",
-            "knowledge was saved; refresh the derived Knowledge projection when needed",
-            problem.path,
-            cause_code=problem.code,
-        )
-        for problem in projection_problems
-    ]
-    return {
-        "record": prepared.data,
-        "record_path": prepared.path.relative_to(root).as_posix(),
-        "projection": (
-            {
-                "status": "synced",
-                "path": knowledge_projection_path(root, repo_id=repo_id)
-                .relative_to(root)
-                .as_posix(),
-                "generation": int(projection.get("generation") or 0),
-            }
-            if not projection_problems
-            else {"status": "stale"}
-        ),
-    }, [], warnings
 
 
-def _direct_knowledge_source_ref(
-    root: Path,
-    *,
-    target: Any,
-    raw_source: str,
-    allow_pending: bool,
-) -> tuple[dict[str, str], Problem | None]:
-    value = str(raw_source).strip().replace("\\", "/")
-    candidate = Path(value)
-    if (
-        not value
-        or not candidate.parts
-        or candidate.is_absolute()
-        or candidate.as_posix() != value
-        or any(part in {"", ".", ".."} for part in candidate.parts)
-    ):
-        return {}, Problem(
-            "error",
-            "knowledge_source_path_invalid",
-            "knowledge source must be a canonical workspace-relative path",
-            value,
-        )
-    path = root / candidate
-    try:
-        root_resolved = root.resolve()
-        resolved = path.resolve()
-    except (OSError, ValueError, RuntimeError):
-        return {}, Problem(
-            "error",
-            "knowledge_source_path_invalid",
-            "knowledge source path is unresolvable",
-            value,
-        )
-    if root_resolved not in (resolved, *resolved.parents):
-        return {}, Problem(
-            "error",
-            "knowledge_source_path_invalid",
-            "knowledge source escapes the workspace",
-            value,
-        )
-    if not allow_pending and not path.is_file():
-        return {}, Problem(
-            "error",
-            "knowledge_source_missing",
-            "knowledge source file is missing",
-            value,
-        )
-    if not target.id and (candidate.parts[0] == "repos" or resolved.relative_to(root_resolved).parts[0] == "repos"):
-        return {}, Problem("error", "knowledge_source_repo_required", "product sources require a selected repository", value)
-    prefix = target.display_path.rstrip("/") + "/"
-    if value.startswith(prefix):
-        kind = KnowledgeSourceRefKind.CURRENT_SOURCE.value
-    elif value.startswith("docs/archive/task-completions/"):
-        kind = KnowledgeSourceRefKind.COMPLETION_RECEIPT.value
-    elif value.startswith(("docs/tasks/", "docs/archive/tasks/")):
-        kind = KnowledgeSourceRefKind.TASK_ARTIFACT.value
-    elif value.startswith(ALLOWED_SOURCE_PREFIXES):
-        kind = KnowledgeSourceRefKind.AUTHORITY_DOCUMENT.value
-    else:
-        kind = KnowledgeSourceRefKind.WORKSPACE_FILE.value
-    ref = {"kind": kind, "path": value}
-    if path.is_file():
+def _observe_sources(
+    root: Path, record: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    resolutions: list[dict[str, Any]] = []
+    refs: list[dict[str, Any]] = []
+    for source in record.get("source_refs", []):
+        if not isinstance(source, dict):
+            continue
+        value = str(source.get("path") or "")
+        expected = str(source.get("content_sha256") or "")
+        actual = ""
         try:
-            ref["content_sha256"] = _sha256_text(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError):
-            pass
-    return ref, None
-
-
-def _unique_direct_record_id(root: Path, *, claim: str, reason: str) -> str:
-    stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%SZ")
-    slug = re.sub(r"[^a-z0-9]+", "-", claim.casefold()).strip("-") or "knowledge"
-    suffix = hashlib.sha256(f"{claim}\n{reason}".encode("utf-8")).hexdigest()[:8]
-    base = f"K-{stamp}--{slug[:40].strip('-')}-{suffix}"
-    directory = _record_dir(root)
-    if not (directory / f"{base}.json").exists():
-        return base
-    for index in range(2, 100):
-        candidate = f"{base}-{index}"
-        if not (directory / f"{candidate}.json").exists():
-            return candidate
-    raise RepoctlError("could not allocate unique knowledge record id")
-
-
-def _legacy_source_identity(record: dict[str, Any]) -> tuple[tuple[str, str], ...]:
-    refs = record.get("source_refs") if isinstance(record.get("source_refs"), list) else []
-    values: list[tuple[str, str]] = []
-    for ref in refs:
-        if isinstance(ref, dict) and str(ref.get("path") or "").strip():
-            values.append((str(ref.get("path") or "").strip(), str(ref.get("content_sha256") or "")))
-    raw_sources = record.get("sources")
-    if isinstance(raw_sources, list):
-        values.extend((str(value).strip(), "") for value in raw_sources if str(value).strip())
-    elif isinstance(record.get("source"), str) and str(record.get("source") or "").strip():
-        values.append((str(record["source"]).strip(), ""))
-    return tuple(sorted(set(values)))
-
-
-def _legacy_records_requiring_migration(
-    artifacts: list[dict[str, Any]], *, root: Path, repo_id: str,
-) -> list[dict[str, Any]]:
-    """Report v1 still in the active directory until one-time finalization.
-
-    Normal Knowledge query consumes v2 only. A preservation witness is not a
-    substitute for removing a converted duplicate from active records.
-    """
-    return [
-        record for record in artifacts
-        if record.get("schema") == "repoctl.knowledge.record"
-        and record.get("schema_version") == 1
-        and str(record.get("repo_id") or "") == repo_id
-    ]
-
-
-def _direct_knowledge_view(
-    root: Path,
-    *,
-    repo_id: str,
-) -> tuple[dict[str, Any], list[Problem]]:
-    sources, read_problems = read_knowledge_record_sources(
-        root, limit=MAX_DIRECT_KNOWLEDGE_FALLBACK_RECORDS,
-    )
-    if read_problems:
-        return {}, read_problems
-    artifacts = [record for _, record in sources]
-    records = [
-        record for record in artifacts
-        if record.get("schema_version") == KNOWLEDGE_RECORD_SCHEMA_VERSION
-        and str(record.get("repo_id") or "") == repo_id
-    ]
-    problems: list[Problem] = []
-    for record in records:
-        problems.extend(
-            _knowledge_record_contract_problems(
-                record,
-                record_id=str(record.get("id") or ""),
-                repo_id=repo_id,
+            content = _workspace_path(root, value).read_bytes()
+            actual = "sha256:" + hashlib.sha256(content).hexdigest()
+            status = (
+                "current"
+                if expected.removeprefix("sha256:") == actual.removeprefix("sha256:")
+                else "digest_mismatch"
+                if expected
+                else "unobserved"
             )
+        except (OSError, ValueError, RuntimeError):
+            status = "missing"
+        resolution = {
+            "path": value,
+            "declared_path": value,
+            "resolved_path": value,
+            "kind": str(source.get("kind") or "workspace_file"),
+            "status": status,
+            "expected_sha256": expected,
+            "actual_sha256": actual,
+            "exists": bool(actual),
+            "digest_matches": bool(expected)
+            and expected.removeprefix("sha256:") == actual.removeprefix("sha256:"),
+        }
+        resolutions.append(resolution)
+        refs.append(
+            {
+                **source,
+                "declared_path": value,
+                "resolved_path": value,
+                "resolution_status": status,
+            }
         )
-    problems.extend(_supersession_problems(records, root=root))
-    if problems:
-        return {}, problems
-    superseded_ids = _superseded_ids(records)
-    heads = [record for record in records if str(record.get("id") or "") not in superseded_ids]
+    return resolutions, refs
+
+
+def explicit_knowledge_path_refs(record: dict[str, Any]) -> list[dict[str, Any]]:
+    applies = (
+        record.get("applies_to") if isinstance(record.get("applies_to"), dict) else {}
+    )
+    refs = [
+        {
+            "kind": KnowledgeExplicitPathKind.APPLIES_TO_PATH.value,
+            "role": KnowledgeExplicitPathRole.CODE_ANCHOR.value,
+            "path": path,
+        }
+        for path in applies.get("paths", [])
+        if isinstance(path, str)
+    ]
+    for source in record.get("source_refs", []):
+        if isinstance(source, dict) and source.get("path"):
+            refs.append(
+                {
+                    "kind": KnowledgeExplicitPathKind.SOURCE_REF.value,
+                    "role": (
+                        KnowledgeExplicitPathRole.CODE_ANCHOR.value
+                        if source.get("kind")
+                        == KnowledgeSourceRefKind.CURRENT_SOURCE.value
+                        else KnowledgeExplicitPathRole.PROVENANCE_ONLY.value
+                    ),
+                    "path": str(source["path"]),
+                    "source_kind": str(source.get("kind") or "workspace_file"),
+                }
+            )
+    return refs
+
+
+def _public_record(
+    root: Path, record: dict[str, Any], *, status: str, observe: bool
+) -> dict[str, Any]:
+    resolutions, refs = (
+        _observe_sources(root, record)
+        if observe
+        else (
+            [],
+            [
+                {
+                    **source,
+                    "declared_path": source.get("path", ""),
+                    "resolved_path": source.get("path", ""),
+                    "resolution_status": "unobserved",
+                }
+                for source in record.get("source_refs", [])
+                if isinstance(source, dict)
+            ],
+        )
+    )
     return {
-        "heads": heads,
-        "records": records,
-        "lifecycle_counts": {"current": len(heads), "superseded": len(records) - len(heads)},
-        "record_count": len(records),
-    }, []
+        **{key: value for key, value in record.items() if not key.startswith("_")},
+        "content_sha256": record.get("_content_sha256", ""),
+        "status": status,
+        "title": record.get("title") or record["claim"],
+        "summary": record.get("summary") or record.get("reason", ""),
+        "explicit_path_refs": explicit_knowledge_path_refs(record),
+        "resolved_source_refs": refs,
+        "source_resolutions": resolutions,
+    }
 
 
 def knowledge_status(root: Path, *, repo_id: str) -> dict[str, Any]:
-    artifacts = _load_record_artifacts(root)
-    records = [
-        record
-        for record in artifacts
-        if record.get("schema_version") == KNOWLEDGE_RECORD_SCHEMA_VERSION
-        and str(record.get("repo_id") or "") == repo_id
-    ]
-    legacy_records = _legacy_records_requiring_migration(artifacts, root=root, repo_id=repo_id)
-    legacy_record_count = len(legacy_records)
-    superseded_ids = _superseded_ids(records)
-    statuses: dict[str, int] = {}
-    source_changed = 0
-    for record in records:
-        status = _derived_status(record, superseded_ids=superseded_ids)
-        statuses[status] = statuses.get(status, 0) + 1
-        if _source_digest_problems(root, record, record_id=str(record.get("id") or "")):
-            source_changed += 1
-    projection, projection_problems = load_knowledge_projection(root, repo_id=repo_id)
+    records, problems = _read_records(root, repo_id=repo_id)
+    superseded = _superseded_ids(records)
     return {
         "schema": "repoctl.knowledge.status",
         "schema_version": 2,
         "repo_id": repo_id,
         "record_count": len(records),
-        "migration_required_count": legacy_record_count,
-        "record_statuses": dict(sorted(statuses.items())),
-        "source_changed_count": source_changed,
-        "projection": {
-            "status": "stale" if projection_problems else "current",
-            "head_count": len(projection.get("heads", [])) if not projection_problems else 0,
+        "record_statuses": {
+            "current": len(records) - len(superseded),
+            "superseded": len(superseded),
         },
+        "problems": [problem.to_dict() for problem in problems],
     }
 
 
-def show_knowledge_record(root: Path, *, record_id: str, repo_id: str) -> tuple[dict[str, Any], list[Problem]]:
-    if not re.fullmatch(r"K-[0-9]{14}Z--[a-z0-9]+(?:-[a-z0-9]+)*", record_id):
-        return {}, [Problem("error", "invalid_knowledge_record_id", "record id must look like K-YYYYMMDDHHMMSSZ--slug")]
-    path = _record_dir(root) / f"{record_id}.json"
-    if path.is_symlink():
-        return {}, [Problem("error", "knowledge_record_symlink_invalid", "knowledge record file must not be a symlink", path.relative_to(root).as_posix())]
-    if not path.is_file():
-        sources, source_problems = read_knowledge_record_sources(
-            root, limit=MAX_DIRECT_KNOWLEDGE_FALLBACK_RECORDS,
-        )
-        if source_problems:
-            return {}, source_problems
-        if any(str(record.get("id") or "") == record_id for _, record in sources):
-            return {}, [Problem("error", "knowledge_record_id_mismatch", "knowledge record ID does not match its source filename", path.relative_to(root).as_posix())]
-        return {}, [Problem("error", "knowledge_record_not_found", f"knowledge record not found: {record_id}", path.relative_to(root).as_posix())]
-    read = _read_knowledge_artifact(root, path)
-    if read.problem is not None:
-        return {}, [read.problem]
-    record = read.data or {}
-    if (
-        record.get("schema") != "repoctl.knowledge.record"
-        or record.get("schema_version") != KNOWLEDGE_RECORD_SCHEMA_VERSION
-    ):
-        return {}, [
-            Problem(
-                "error",
-                "knowledge_record_schema_invalid",
-                "knowledge record is not in the current format; recreate it with knowledge add",
-                path.relative_to(root).as_posix(),
-            )
-        ]
-    if str(record.get("repo_id") or "") != repo_id:
-        return {}, [Problem("error", "knowledge_record_repo_mismatch", "knowledge record belongs to a different repo", record_id)]
-    problems = _knowledge_record_contract_problems(
-        record,
-        record_id=record_id,
-        repo_id=repo_id,
-    )
-    return {"record": record, "path": path.relative_to(root).as_posix()}, problems
-
-
-def _problem_code_counts(problems: list[Problem]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for problem in problems:
-        counts[problem.code] = counts.get(problem.code, 0) + 1
-    return dict(sorted(counts.items()))
-
-
-def check_knowledge_records(root: Path, *, repo_id: str) -> tuple[dict[str, Any], list[Problem]]:
-    sources, record_read_problems = read_knowledge_record_sources(root)
-    records = [record for _, record in sources]
-    problems: list[Problem] = list(record_read_problems)
-    legacy = _legacy_records_requiring_migration(records, root=root, repo_id=repo_id)
-    problems.extend(
+def show_knowledge_record(
+    root: Path, *, record_id: str, repo_id: str
+) -> tuple[dict[str, Any], list[Problem]]:
+    records, problems = _read_records(root, repo_id=repo_id)
+    superseded = _superseded_ids(records)
+    for record in records:
+        if record["id"] == record_id:
+            return {
+                "record": _public_record(
+                    root,
+                    record,
+                    status="superseded" if record_id in superseded else "current",
+                    observe=True,
+                ),
+                "path": (_record_dir(root) / f"{record_id}.json")
+                .relative_to(root)
+                .as_posix(),
+            }, problems
+    return {}, [
+        *problems,
         Problem(
-            "warning",
-            "knowledge_record_migration_required",
-            "unfinalized v1 remains in active storage; convert it and explicitly finalize the historical source relocation",
-            f"docs/knowledge/records/{record.get('id', '')}.json",
-        )
-        for record in legacy
-    )
-    selected = [
-        record
-        for record in records
-        if record.get("schema_version") == KNOWLEDGE_RECORD_SCHEMA_VERSION
-        and str(record.get("repo_id") or "") == repo_id
+            "error",
+            "knowledge_record_not_found",
+            "Knowledge record not found",
+            record_id,
+        ),
     ]
-    superseded_ids = _superseded_ids(selected)
-    record_results: list[dict[str, Any]] = []
-    for record in selected:
-        record_id = str(record.get("id") or "")
-        status = _derived_status(record, superseded_ids=superseded_ids)
-        contract_problems = _knowledge_record_contract_problems(record, record_id=record_id, repo_id=repo_id)
-        source_warnings = [
+
+
+def check_knowledge_records(
+    root: Path, *, repo_id: str
+) -> tuple[dict[str, Any], list[Problem]]:
+    records, problems = _read_records(root, repo_id=repo_id)
+    superseded = _superseded_ids(records)
+    results: list[dict[str, Any]] = []
+    for record in records:
+        item = _public_record(
+            root,
+            record,
+            status="superseded" if record["id"] in superseded else "current",
+            observe=True,
+        )
+        results.append(item)
+        problems.extend(
             Problem(
                 "warning",
                 "knowledge_source_changed",
-                "a Knowledge source changed or is unavailable; the saved record remains usable",
-                problem.path,
-                cause_code=problem.code,
+                "saved source bytes differ or are unavailable",
+                str(ref["path"]),
+                cause_code=str(ref["status"]),
             )
-            for problem in (
-                []
-                if status == "superseded"
-                else _source_digest_problems(root, record, record_id=record_id)
-            )
-        ]
-        record_problems = [
-            *contract_problems,
-            *source_warnings,
-        ]
-        problems.extend(record_problems)
-        record_results.append(
-            {
-                "id": record_id,
-                "kind": record.get("kind", ""),
-                "status": status,
-                "title": record.get("title", ""),
-                "source_statuses": _source_ref_statuses(root, record),
-                "error_count": len([problem for problem in record_problems if problem.severity == "error"]),
-                "warning_count": len([problem for problem in record_problems if problem.severity == "warning"]),
-                "problem_codes": _problem_code_counts(record_problems),
-            }
+            for ref in item["source_resolutions"]
+            if ref["status"] != "current"
         )
-    supersession_problems = _supersession_problems(selected, root=root)
-    problems.extend(supersession_problems)
     return {
-        "schema": "repoctl.knowledge.check",
-        "schema_version": 1,
         "repo_id": repo_id,
-        "record_count": len(selected),
-        "legacy_record_count": len(legacy),
-        "records": record_results,
-        "record_checks": {
-            "error_count": len([problem for problem in problems if problem.severity == "error"]),
-            "warning_count": len([problem for problem in problems if problem.severity == "warning"]),
-            "problem_codes": _problem_code_counts(problems),
-        },
+        "record_count": len(records),
+        "records": results,
     }, problems
-
-
-def _empty_public_knowledge_query(*, repo_id: str, query: str) -> dict[str, Any]:
-    return {
-        "schema": "repoctl.knowledge.query",
-        "schema_version": 2,
-        "repo_id": repo_id,
-        "query": {"text": query},
-        "lifecycle": {
-            "available_statuses": {},
-            "excluded_statuses": {},
-            "returned_statuses": {},
-            "default_excludes": ["superseded"],
-            "status_semantics": {"current": "not superseded; no human approval is implied"},
-            "projection_status": "unavailable",
-            "source_changed_count": 0,
-        },
-        "results": [],
-        "result_count": 0,
-        "available_record_count": 0,
-    }
-
-
-def _knowledge_query_source_views(
-    root: Path,
-    records: list[dict[str, Any]],
-) -> dict[str, tuple[list[KnowledgeSourceResolution], list[dict[str, Any]]]]:
-    views: dict[str, tuple[list[KnowledgeSourceResolution], list[dict[str, Any]]]] = {}
-    for record in records:
-        record_id = str(record.get("id") or "")
-        resolutions = knowledge_source_ref_resolutions(root, record)
-        views[record_id] = (
-            resolutions,
-            resolved_knowledge_source_refs(
-                root,
-                record,
-                resolutions=resolutions,
-            ),
-        )
-    return views
-
-
-def _knowledge_query_result(
-    root: Path,
-    *,
-    record: dict[str, Any],
-    status: str,
-    records: list[dict[str, Any]],
-    query: str,
-    fts_score: float,
-    source_resolutions: list[KnowledgeSourceResolution],
-    resolved_source_refs: list[dict[str, Any]],
-    wanted_paths: set[str],
-    require_related: bool,
-    explain: bool,
-) -> dict[str, Any] | None:
-    matched_paths = sorted(
-        wanted_paths
-        & _record_related_paths(
-            record,
-            resolved_source_refs=resolved_source_refs,
-        )
-    )
-    if require_related and not matched_paths:
-        return None
-    score, breakdown, selection_reasons = _record_score(
-        query,
-        record,
-        fts=fts_score,
-        resolved_source_refs=resolved_source_refs,
-    )
-    query_matched = any(
-        float(breakdown.get(key) or 0.0) > 0
-        for key in (
-            "exact_identity",
-            "exact_title",
-            "exact_claim",
-            "exact_summary",
-            "exact_source",
-            "fts",
-        )
-    )
-    if matched_paths:
-        breakdown["path_relation"] = 1.0
-        score += 1.0
-        selection_reasons.append("explicit source/path relation")
-    if not query_matched and not matched_paths:
-        return None
-    result = {
-        "record": _public_record(
-            root,
-            record,
-            status=status,
-            lifecycle_relations=_record_lifecycle_relations(
-                record,
-                records,
-            ),
-            source_resolutions=source_resolutions,
-            resolved_source_refs=resolved_source_refs,
-        ),
-        "score": round(score, 6),
-        "score_breakdown": {
-            key: round(value, 6)
-            for key, value in sorted(breakdown.items())
-        },
-        "selection_reasons": selection_reasons,
-        "query_match_strength": _knowledge_query_match_strength(
-            breakdown,
-            query_matched=query_matched,
-        ).value,
-    }
-    if matched_paths:
-        result["matched_paths"] = matched_paths
-    if explain:
-        result["explain"] = {
-            "status": status,
-            "source_ref_statuses": _source_ref_statuses(
-                root,
-                record,
-                resolutions=source_resolutions,
-            ),
-            "superseded": status == "superseded",
-        }
-    return result
 
 
 def query_knowledge_records(
@@ -741,1263 +502,117 @@ def query_knowledge_records(
     related_paths: set[str] | None = None,
     require_related: bool = False,
 ) -> tuple[dict[str, Any], list[Problem], list[Problem]]:
-    wanted_paths = {
-        str(path).strip()
-        for path in (related_paths or set())
-        if str(path).strip()
-    }
-    problems: list[Problem] = []
-    warnings: list[Problem] = []
-    projection_status = "history" if include_history else "current"
-    lifecycle_counts: dict[str, int] = {}
-
-    if include_history:
-        sources, source_problems = read_knowledge_record_sources(root)
-        problems.extend(source_problems)
-        records = [
-            record
-            for _, record in sources
-            if record.get("schema_version") == KNOWLEDGE_RECORD_SCHEMA_VERSION
-            and str(record.get("repo_id") or "") == repo_id
-        ]
-        for record in records:
-            problems.extend(
-                _knowledge_record_contract_problems(
-                    record,
-                    record_id=str(record.get("id") or ""),
-                    repo_id=repo_id,
-                )
-            )
-        problems.extend(_supersession_problems(records, root=root))
-        if problems:
-            unavailable = _empty_public_knowledge_query(repo_id=repo_id, query=query)
-            unavailable["query"]["include_history"] = True
-            return unavailable, problems, []
-        available_record_count = len(records)
-        superseded_ids = _superseded_ids(records)
-        lifecycle_counts = {
-            "current": len(records) - len(superseded_ids),
-            "superseded": len(superseded_ids),
-        }
-    else:
-        projection, projection_problems = load_knowledge_projection(
-            root,
-            repo_id=repo_id,
-        )
-        projection_missing = bool(projection_problems) and all(
-            problem.code == "knowledge_projection_unavailable"
-            and problem.cause_code == "missing"
-            for problem in projection_problems
-        )
-        if not projection_problems:
-            projection, projection_problems = verify_current_knowledge_projection(
-                root,
-                repo_id=repo_id,
-                projection=projection,
-            )
-        if projection_problems:
-            direct, direct_problems = _direct_knowledge_view(root, repo_id=repo_id)
-            if direct_problems:
-                return (
-                    _empty_public_knowledge_query(repo_id=repo_id, query=query),
-                    direct_problems,
-                    [],
-                )
-            if not direct.get("records"):
-                if projection_missing:
-                    return _empty_public_knowledge_query(repo_id=repo_id, query=query), [], []
-                # A corrupt projection with no authoritative v2 source is not
-                # a successful direct-record recovery; report the damage.
-                return _empty_public_knowledge_query(repo_id=repo_id, query=query), projection_problems, []
-            records = list(direct.get("heads") or [])
-            lifecycle_counts = dict(direct.get("lifecycle_counts") or {})
-            available_record_count = int(direct.get("record_count") or 0)
-            superseded_ids = set()
-            projection_status = "degraded_direct"
-            warnings.extend(
-                Problem(
-                    "warning",
-                    "knowledge_projection_degraded",
-                    "Knowledge projection is unavailable or invalid; query used validated direct v2 records",
-                    problem.path or repo_id,
-                    cause_code=problem.code,
-                )
-                for problem in projection_problems
-            )
-        else:
-            records = list(projection["heads"])
-            lifecycle_counts = dict(projection["lifecycle_counts"])
-            available_record_count = int(projection["checkpoint"]["record_count"])
-            superseded_ids = set()
-        superseded_count = int(lifecycle_counts.get("superseded") or 0)
-        if superseded_count:
-            warnings.append(
-                Problem(
-                    "warning",
-                    "knowledge_superseded_record_excluded",
-                    "superseded knowledge records excluded from default query",
-                    repo_id,
-                )
-            )
-
-    source_views = _knowledge_query_source_views(root, records)
-    fts_scores = _record_fts_scores(
-        query,
-        records,
-        resolved_source_refs_by_id={
-            record_id: view[1]
-            for record_id, view in source_views.items()
-        },
-    )
-    available_statuses: dict[str, int] = {}
-    scored: list[dict[str, Any]] = []
-    source_changed_count = 0
+    records, problems = _read_records(root, repo_id=repo_id)
+    superseded = _superseded_ids(records)
+    terms = tuple(dict.fromkeys(re.findall(r"[\w./-]+", query.casefold())))
+    wanted = related_paths or set()
+    ranked: list[tuple[float, dict[str, Any], list[str], str, list[str]]] = []
     for record in records:
-        record_id = str(record.get("id") or "")
-        status = _derived_status(record, superseded_ids=superseded_ids)
-        available_statuses[status] = available_statuses.get(status, 0) + 1
-        source_resolutions, resolved_source_refs = source_views[record_id]
-        if _source_digest_problems(
+        if not include_history and record["id"] in superseded:
+            continue
+        paths = {str(ref["path"]) for ref in explicit_knowledge_path_refs(record)}
+        matched_paths = sorted(wanted & paths)
+        if require_related and not matched_paths:
+            continue
+        fields = [
+            str(record.get(key) or "").casefold()
+            for key in ("id", "title", "claim", "reason", "summary")
+        ]
+        body = "\n".join([*fields, *sorted(paths)]).casefold()
+        matched_terms = [term for term in terms if term in body]
+        exact = bool(query.strip()) and any(
+            query.strip().casefold() == field for field in fields[:3]
+        )
+        claim_text = "\n".join(fields[1:3])
+        if terms and not matched_terms and not matched_paths:
+            continue
+        score = (
+            (10.0 if exact else 0.0)
+            + len(matched_terms)
+            + (2.0 if matched_paths else 0.0)
+        )
+        strength = (
+            "exact"
+            if exact
+            else "strong"
+            if terms and all(term in claim_text for term in terms)
+            else "weak"
+            if matched_terms
+            else "none"
+        )
+        ranked.append((score, record, matched_paths, strength, matched_terms))
+    ranked.sort(key=lambda item: (-item[0], str(item[1]["id"])))
+    results: list[dict[str, Any]] = []
+    warnings: list[Problem] = []
+    for score, record, paths, strength, matched in ranked[: max(0, limit)]:
+        public = _public_record(
             root,
             record,
-            record_id=record_id,
-            resolutions=source_resolutions,
-        ):
-            source_changed_count += 1
-            warnings.append(
-                Problem(
-                    "warning",
-                    "knowledge_source_changed",
-                    "a Knowledge source changed or is unavailable; the saved record remains searchable",
-                    record_id,
+            status="superseded" if record["id"] in superseded else "current",
+            observe=True,
+        )
+        for ref in public["source_resolutions"]:
+            if ref["status"] != "current":
+                warnings.append(
+                    Problem(
+                        "warning",
+                        "knowledge_source_changed",
+                        "saved source bytes differ or are unavailable",
+                        str(ref["path"]),
+                        cause_code=str(ref["status"]),
+                    )
                 )
-            )
-        item = _knowledge_query_result(
-            root,
-            record=record,
-            status=status,
-            records=records,
-            query=query,
-            fts_score=fts_scores.get(record_id, 0.0),
-            source_resolutions=source_resolutions,
-            resolved_source_refs=resolved_source_refs,
-            wanted_paths=wanted_paths,
-            require_related=require_related,
-            explain=explain,
-        )
-        if item is not None:
-            scored.append(item)
-
-    if not include_history:
-        current_count = int(lifecycle_counts.get("current") or 0)
-        superseded_count = int(lifecycle_counts.get("superseded") or 0)
-        available_statuses = {}
-        if current_count:
-            available_statuses["current"] = current_count
-        if superseded_count:
-            available_statuses["superseded"] = superseded_count
-
-    scored.sort(
-        key=lambda item: (
-            -float(item.get("score") or 0.0),
-            str(item.get("record", {}).get("id") or ""),
-        )
-    )
-    returned = scored[: max(0, int(limit))]
-    returned_ids = {str(item["record"]["id"]) for item in returned}
-    warnings = [
-        warning
-        for warning in warnings
-        if warning.code != "knowledge_source_changed" or warning.path in returned_ids
-    ]
-    returned_statuses: dict[str, int] = {}
-    for item in returned:
-        record = item.get("record") if isinstance(item.get("record"), dict) else {}
-        status = str(record.get("status") or "")
-        if status:
-            returned_statuses[status] = returned_statuses.get(status, 0) + 1
-    excluded_statuses = (
-        {"superseded": int(available_statuses["superseded"])}
-        if not include_history and available_statuses.get("superseded")
-        else {}
-    )
-    return {
-        "schema": "repoctl.knowledge.query",
-        "schema_version": 2,
-        "repo_id": repo_id,
-        "query": {
-            "text": query,
-            "include_history": include_history,
-            "explain": explain,
-            "require_related": require_related,
+        item = {
+            "record": public,
+            "score": score,
+            "score_breakdown": {
+                "exact_identity": 10.0 if strength == "exact" else 0.0,
+                "lexical": float(len(matched)),
+                "path_relation": 2.0 if paths else 0.0,
+            },
+            "selection_reasons": [
+                *(f"matched term: {term}" for term in matched),
+                *(f"explicit path: {path}" for path in paths),
+            ],
+            "query_match_strength": strength,
+            "matched_paths": paths,
+        }
+        if explain:
+            item["explain"] = {"source_ref_statuses": public["source_resolutions"]}
+        results.append(item)
+    return (
+        {
+            "schema": "repoctl.knowledge.query",
+            "schema_version": 2,
+            "repo_id": repo_id,
+            "query": {"text": query, "include_history": include_history},
+            "results": results,
+            "available_record_count": len(records),
+            "result_count": len(results),
+            "lifecycle": {
+                "current": len(records) - len(superseded),
+                "superseded": len(superseded),
+            },
+            "summary": {
+                "record_count": len(records),
+                "matched_count": len(ranked),
+                "returned_count": len(results),
+                "source_observed_count": len(results),
+                "truncated": len(ranked) > len(results),
+            },
         },
-        "lifecycle": {
-            "available_statuses": dict(sorted(available_statuses.items())),
-            "excluded_statuses": excluded_statuses,
-            "returned_statuses": dict(sorted(returned_statuses.items())),
-            "default_excludes": ["superseded"],
-            "source_changed_count": source_changed_count,
-            "projection_status": projection_status,
-            "status_semantics": {"current": "not superseded; no human approval is implied"},
-        },
-        "results": returned,
-        "result_count": len(returned),
-        "available_record_count": available_record_count,
-    }, [], warnings
-
-def _knowledge_query_match_strength(
-    breakdown: dict[str, float],
-    *,
-    query_matched: bool,
-) -> KnowledgeQueryMatchStrength:
-    if float(breakdown.get("exact_identity") or 0.0) >= 1.0:
-        return KnowledgeQueryMatchStrength.EXACT
-    if any(
-        float(breakdown.get(key) or 0.0) >= 1.0
-        for key in ("exact_title", "exact_claim", "exact_summary", "exact_source")
-    ):
-        return KnowledgeQueryMatchStrength.STRONG
-    return KnowledgeQueryMatchStrength.WEAK if query_matched else KnowledgeQueryMatchStrength.NONE
+        problems,
+        warnings,
+    )
 
 
 def knowledge_records_for_graph(
-    root: Path,
-    *,
-    repo_id: str,
+    root: Path, *, repo_id: str
 ) -> tuple[list[dict[str, Any]], list[Problem]]:
-    projection, projection_problems = load_knowledge_projection(root, repo_id=repo_id)
-    if not projection_problems:
-        graph_record_ids = [
-            str(record.get("id") or "")
-            for record in projection.get("heads", [])
-            if isinstance(record, dict)
-        ]
-        projection, projection_problems = verify_current_knowledge_projection(
-            root,
-            repo_id=repo_id,
-            projection=projection,
-            record_ids=graph_record_ids,
-        )
-    if projection_problems:
-        direct, direct_problems = _direct_knowledge_view(root, repo_id=repo_id)
-        if direct_problems:
-            return [], direct_problems
-        records = list(direct.get("heads") or [])
-        advisory = [
-            Problem(
-                "warning",
-                "knowledge_projection_degraded",
-                "Knowledge projection is unavailable or invalid; Graph used validated direct v2 records",
-                problem.path or repo_id,
-                cause_code=problem.code,
-            )
-            for problem in projection_problems
-        ]
-    else:
-        records = list(projection["heads"])
-        advisory = []
-    projected_current: list[dict[str, Any]] = []
-    for record in records:
-        source_resolutions = knowledge_source_ref_resolutions(root, record)
-        projected_current.append(
-            _public_record(
-                root,
-                record,
-                status="current",
-                lifecycle_relations=_record_lifecycle_relations(record, records),
-                source_resolutions=source_resolutions,
-                resolved_source_refs=resolved_knowledge_source_refs(root, record, resolutions=source_resolutions),
-            )
-        )
-    return sorted(projected_current, key=lambda item: str(item.get("id") or "")), advisory
-
-
-def _validate_document_source(root: Path, rel: str) -> Problem | None:
-    if (
-        not rel
-        or rel != rel.strip().replace("\\", "/")
-        or Path(rel).is_absolute()
-        or ".." in Path(rel).parts
-    ):
-        return Problem(
-            "error",
-            "knowledge_source_path_invalid",
-            "knowledge source path is invalid",
-            rel,
-            cause_code="source_path_invalid",
-        )
-    parts = set(Path(rel).parts)
-    if parts & EXCLUDED_SOURCE_PARTS:
-        return Problem("error", "knowledge_source_excluded", "knowledge source is excluded", rel)
-    if not rel.startswith(ALLOWED_SOURCE_PREFIXES):
-        return Problem(
-            "error",
-            "knowledge_source_not_allowed",
-            f"knowledge source must be under one of: {', '.join(ALLOWED_SOURCE_PREFIXES)}",
-            rel,
-        )
-    path = root / rel
-    try:
-        root_resolved = root.resolve()
-        path_resolved = path.resolve()
-    except (OSError, ValueError, RuntimeError):
-        return Problem(
-            "error",
-            "knowledge_source_path_invalid",
-            "knowledge source path is unresolvable",
-            rel,
-            cause_code="source_path_unresolvable",
-        )
-    if root_resolved not in (path_resolved, *path_resolved.parents):
-        return Problem(
-            "error",
-            "knowledge_source_path_invalid",
-            "knowledge source escapes the workspace",
-            rel,
-            cause_code="source_path_invalid",
-        )
-    resolved_rel = path_resolved.relative_to(root_resolved).as_posix()
-    if not resolved_rel.startswith(ALLOWED_SOURCE_PREFIXES) or set(Path(resolved_rel).parts) & EXCLUDED_SOURCE_PARTS:
-        return Problem(
-            "error",
-            "knowledge_source_path_invalid",
-            "knowledge source resolves outside the allowed authority document boundary",
-            rel,
-            cause_code="source_authority_boundary_invalid",
-        )
-    if not path.is_file():
-        return Problem("error", "knowledge_source_missing", "knowledge source file is missing", rel)
-    return None
-
-
-def _knowledge_source_ref_boundary_problem(
-    root: Path,
-    *,
-    repo_id: str,
-    ref: dict[str, Any],
-) -> Problem | None:
-    rel = str(ref.get("path") or "")
-    try:
-        ref_kind = KnowledgeSourceRefKind(str(ref.get("kind") or ""))
-    except ValueError:
-        return Problem("error", "knowledge_source_kind_invalid", "knowledge source ref kind is invalid", rel)
-    if not repo_id:
-        _, problem = _direct_knowledge_source_ref(root, target=workspace_target(root), raw_source=rel, allow_pending=True)
-        if problem is not None:
-            return problem
-    if ref_kind is KnowledgeSourceRefKind.AUTHORITY_DOCUMENT:
-        return _validate_document_source(root, rel)
-    if ref_kind is KnowledgeSourceRefKind.WORKSPACE_FILE:
-        path = root / rel
-        try:
-            contained = root.resolve() in (path.resolve(), *path.resolve().parents)
-        except (OSError, ValueError, RuntimeError):
-            contained = False
-        if not rel or Path(rel).is_absolute() or ".." in Path(rel).parts or not contained:
-            return Problem(
-                "error",
-                "knowledge_source_path_invalid",
-                "knowledge source must remain inside the workspace",
-                rel,
-            )
-        return None
-    if ref_kind is KnowledgeSourceRefKind.CURRENT_SOURCE:
-        try:
-            target = require_repo_target(root, repo_id=repo_id)
-        except RepoctlError:
-            return Problem(
-                "error",
-                "knowledge_source_current_invalid",
-                "current_source must belong to the selected repository",
-                rel,
-            )
-        resolution = resolve_repo_selector_path(rel, repository_path=target.display_path)
-        expected = f"{target.display_path}/{resolution.path}" if resolution.path else ""
-        source_path = target.root_path / resolution.path
-        try:
-            target_root = target.root_path.resolve()
-            resolved_source = source_path.resolve()
-            source_contained = target_root in (resolved_source, *resolved_source.parents)
-        except (OSError, ValueError, RuntimeError):
-            source_contained = False
-        if (
-            resolution.status != RepoSelectorStatus.RESOLVED
-            or rel != expected
-            or not source_contained
-            or not source_path.is_file()
-        ):
-            return Problem(
-                "error",
-                "knowledge_source_current_invalid",
-                "current_source must be a current workspace-qualified file in the selected repository",
-                rel,
-            )
-    return None
-
-
-def _validated_applicability_paths(
-    root: Path,
-    *,
-    repo_id: str,
-    values: list[str],
-) -> tuple[list[str], list[Problem]]:
-    if not values:
-        return [], []
-    if not repo_id:
-        return [], [Problem("error", "knowledge_applies_to_invalid", "product applicability requires a selected repository")]
-    target = require_repo_target(root, repo_id=repo_id)
-    target_root = target.root_path.resolve()
-    paths: list[str] = []
-    problems: list[Problem] = []
-    for value in values:
-        resolution = resolve_repo_selector_path(value, repository_path=target.display_path)
-        if resolution.status != RepoSelectorStatus.RESOLVED or not resolution.path:
-            problems.append(
-                Problem(
-                    "error",
-                    "knowledge_applies_to_invalid",
-                    "knowledge applicability path must be a normalized path inside the selected repository",
-                    value,
-                )
-            )
-            continue
-        path = target.root_path / resolution.path
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path.absolute()
-        if target_root not in (resolved, *resolved.parents) or not path.is_file():
-            problems.append(
-                Problem(
-                    "error",
-                    "knowledge_applies_to_missing",
-                    "knowledge applicability path must resolve to a current file in the selected repository",
-                    value,
-                )
-            )
-            continue
-        if resolution.path not in paths:
-            paths.append(resolution.path)
-    return sorted(paths), problems
-
-
-def _validated_claim(*, claim: str, problem_path: str) -> tuple[str, Problem | None]:
-    claim = claim.strip()
-    if not claim:
-        return "", Problem(
-            "error",
-            "knowledge_claim_required",
-            "knowledge requires an explicit reusable claim; pass --claim or --claim-file",
-            problem_path,
-        )
-    if len(claim) > MAX_KNOWLEDGE_CLAIM_LENGTH:
-        return "", Problem(
-            "error",
-            "knowledge_claim_too_long",
-            f"knowledge claim exceeds {MAX_KNOWLEDGE_CLAIM_LENGTH} characters; provide a concise complete claim with --claim or --claim-file",
-            problem_path,
-        )
-    return claim, None
-
-
-def _sha256_text(text: str) -> str:
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _record_dir(root: Path) -> Path:
-    return root / "docs/knowledge/records"
-
-
-def _artifact_error_code(
-    *,
-    invalid_json: bool = False,
-    not_object: bool = False,
-) -> KnowledgeArtifactErrorCode:
-    if invalid_json:
-        return KnowledgeArtifactErrorCode.RECORD_INVALID_JSON
-    if not_object:
-        return KnowledgeArtifactErrorCode.RECORD_NOT_OBJECT
-    return KnowledgeArtifactErrorCode.RECORD_UNREADABLE
-
-
-def _read_knowledge_artifact(root: Path, path: Path) -> KnowledgeArtifactRead:
-    rel = path.relative_to(root).as_posix()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return KnowledgeArtifactRead(
-            None,
-            Problem("error", _artifact_error_code(), "knowledge record is unreadable", rel),
-        )
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return KnowledgeArtifactRead(
-            None,
-            Problem("error", _artifact_error_code(invalid_json=True), "knowledge record JSON is invalid", rel),
-        )
-    if not isinstance(data, dict):
-        return KnowledgeArtifactRead(
-            None,
-            Problem("error", _artifact_error_code(not_object=True), "knowledge record must be a JSON object", rel),
-        )
-    return KnowledgeArtifactRead(data, None)
-
-
-def _require_knowledge_artifact(root: Path, path: Path) -> dict[str, Any]:
-    result = _read_knowledge_artifact(root, path)
-    if result.problem is not None:
-        raise RepoctlError(
-            result.problem.message,
-            code=result.problem.code,
-            path=result.problem.path,
-        )
-    return result.data or {}
-
-
-def _read_knowledge_artifacts(
-    root: Path,
-    paths: list[Path],
-) -> tuple[list[dict[str, Any]], list[Problem]]:
-    items: list[dict[str, Any]] = []
-    problems: list[Problem] = []
-    for path in paths:
-        result = _read_knowledge_artifact(root, path)
-        if result.problem is not None:
-            problems.append(result.problem)
-        elif result.data is not None:
-            items.append(result.data)
-    return items, problems
-
-
-def _load_record_artifacts(root: Path) -> list[dict[str, Any]]:
-    directory = _record_dir(root)
-    if not directory.exists():
-        return []
+    records, problems = _read_records(root, repo_id=repo_id)
+    superseded = _superseded_ids(records)
     return [
-        _require_knowledge_artifact(root, path)
-        for path in sorted(directory.glob("K-*.json"))
-    ]
-
-
-def _load_records(root: Path) -> list[dict[str, Any]]:
-    return [
-        record
-        for record in _load_record_artifacts(root)
-        if not (
-            record.get("schema") == "repoctl.knowledge.record"
-            and record.get("schema_version") == 1
-        )
-    ]
-
-
-def _superseded_ids(records: list[dict[str, Any]]) -> set[str]:
-    values: set[str] = set()
-    for record in records:
-        values.update(_record_replacements(record))
-    return values
-
-
-def _supersession_problems(records: list[dict[str, Any]], *, root: Path) -> list[Problem]:
-    problems: list[Problem] = []
-    known = {str(record.get("id") or "") for record in records}
-    for record in records:
-        record_id = str(record.get("id") or "")
-        raw_replacements = record.get("replaces")
-        if not isinstance(raw_replacements, list):
-            problems.append(Problem("error", "knowledge_replaces_invalid", "knowledge replacement references must be a list", record_id))
-            continue
-        for superseded_id in _record_replacements(record):
-            superseded = str(superseded_id)
-            if superseded == record_id:
-                problems.append(Problem("error", "knowledge_replaces_self", "knowledge record cannot replace itself", record_id))
-            if superseded and superseded not in known:
-                problems.append(Problem("error", "knowledge_replaces_missing", "replaced record does not exist", superseded))
-    return problems
-
-
-def _record_replacements(record: dict[str, Any]) -> list[str]:
-    values = record.get("replaces")
-    if not isinstance(values, list):
-        return []
-    return sorted({str(value).strip() for value in values if isinstance(value, str) and value.strip()})
-
-
-def _knowledge_record_digest(record: dict[str, Any]) -> str:
-    return digest_data({key: value for key, value in record.items() if key != "record_digest"})
-
-
-def _knowledge_record_contract_problems(
-    record: dict[str, Any],
-    *,
-    record_id: str,
-    repo_id: str,
-) -> list[Problem]:
-    problems: list[Problem] = []
-    schema_version = record.get("schema_version")
-    if record.get("schema") != "repoctl.knowledge.record" or schema_version != KNOWLEDGE_RECORD_SCHEMA_VERSION:
-        problems.append(Problem("error", "knowledge_record_schema_invalid", "knowledge record schema is invalid", record_id))
-    if str(record.get("id") or "") != record_id:
-        problems.append(Problem("error", "knowledge_record_id_mismatch", "knowledge record id does not match its path", record_id))
-    if str(record.get("repo_id") or "") != repo_id:
-        problems.append(Problem("error", "knowledge_record_repo_mismatch", "knowledge record belongs to a different repo", record_id))
-    if str(record.get("kind") or "") not in ALLOWED_KINDS:
-        problems.append(Problem("error", "knowledge_record_kind_invalid", "knowledge record kind is invalid", record_id))
-    if not str(record.get("claim") or "").strip():
-        problems.append(Problem("error", "knowledge_record_claim_missing", "knowledge record claim is missing", record_id))
-    if schema_version == KNOWLEDGE_RECORD_SCHEMA_VERSION:
-        if not str(record.get("reason") or "").strip():
-            problems.append(Problem("error", "knowledge_record_reason_missing", "knowledge record reason is missing", record_id))
-        if not isinstance(record.get("source_refs"), list) or not record.get("source_refs"):
-            problems.append(Problem("error", "knowledge_record_provenance_invalid", "knowledge record sources are missing", record_id))
-        if not isinstance(record.get("applies_to"), dict) or not isinstance(record.get("applies_to", {}).get("paths"), list):
-            problems.append(Problem("error", "knowledge_record_paths_invalid", "knowledge record paths are invalid", record_id))
-        if not isinstance(record.get("replaces"), list):
-            problems.append(Problem("error", "knowledge_replaces_invalid", "knowledge replacement references are invalid", record_id))
-        if not str(record.get("recorded_at") or "").strip():
-            problems.append(Problem("error", "knowledge_record_provenance_invalid", "knowledge record recorded_at is missing", record_id))
-        if "author" in record and not str(record.get("author") or "").strip():
-            problems.append(Problem("error", "knowledge_record_author_invalid", "knowledge author must be omitted or non-empty", record_id))
-    if str(record.get("record_digest") or "") != _knowledge_record_digest(record):
-        problems.append(Problem("error", "knowledge_record_digest_mismatch", "knowledge record digest does not match its content", record_id))
-    return problems
-
-
-def _derived_status(
-    record: dict[str, Any],
-    *,
-    superseded_ids: set[str],
-) -> str:
-    return (
-        "superseded"
-        if str(record.get("id") or "") in superseded_ids
-        else "current"
-    )
-
-
-def _source_resolution(
-    ref: dict[str, Any],
-    status: KnowledgeSourceResolutionStatus,
-    *,
-    resolved_path: str = "",
-    actual_sha256: str = "",
-    cause_code: str = "",
-    scan_stats: dict[str, int] | None = None,
-) -> KnowledgeSourceResolution:
-    declared_path = str(ref.get("path") or "")
-    return KnowledgeSourceResolution(
-        status=status,
-        declared_path=declared_path,
-        resolved_path=resolved_path or declared_path,
-        expected_sha256=str(ref.get("content_sha256") or ""),
-        actual_sha256=actual_sha256,
-        cause_code=cause_code,
-        scan_stats=scan_stats,
-    )
-
-
-def _literal_source_resolution(root: Path, ref: dict[str, Any]) -> KnowledgeSourceResolution:
-    declared_path = str(ref.get("path") or "")
-    expected = str(ref.get("content_sha256") or "")
-    if (
-        not declared_path
-        or declared_path != declared_path.strip().replace("\\", "/")
-        or Path(declared_path).is_absolute()
-        or ".." in Path(declared_path).parts
-    ):
-        return _source_resolution(ref, KnowledgeSourceResolutionStatus.INVALID_IDENTITY, cause_code="source_path_invalid")
-    path = root / declared_path
-    try:
-        root_resolved = root.resolve()
-        path_resolved = path.resolve()
-    except (OSError, ValueError, RuntimeError):
-        return _source_resolution(ref, KnowledgeSourceResolutionStatus.INVALID_IDENTITY, cause_code="source_path_unresolvable")
-    if root_resolved not in (path_resolved, *path_resolved.parents):
-        return _source_resolution(ref, KnowledgeSourceResolutionStatus.INVALID_IDENTITY, cause_code="source_path_invalid")
-    if not path.is_file():
-        return _source_resolution(ref, KnowledgeSourceResolutionStatus.MISSING)
-    try:
-        if str(ref.get("kind") or "") == KnowledgeSourceRefKind.COMPLETION_RECEIPT.value:
-            actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-        else:
-            actual = _sha256_text(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError):
-        return _source_resolution(ref, KnowledgeSourceResolutionStatus.MISSING, cause_code="source_unreadable")
-    return _source_resolution(
-        ref,
-        (
-            KnowledgeSourceResolutionStatus.CURRENT
-            if not expected or expected == actual
-            else KnowledgeSourceResolutionStatus.DIGEST_MISMATCH
-        ),
-        actual_sha256=actual,
-    )
-
-
-def _source_relocation_roots(
-    root: Path,
-    *,
-    repo_id: str,
-    ref_kind: KnowledgeSourceRefKind,
-) -> list[Path]:
-    if ref_kind is KnowledgeSourceRefKind.CURRENT_SOURCE and repo_id:
-        try:
-            return [require_repo_target(root, repo_id=repo_id).root_path]
-        except RepoctlError:
-            return []
-    if ref_kind is KnowledgeSourceRefKind.AUTHORITY_DOCUMENT:
-        return [root / prefix.rstrip("/") for prefix in ALLOWED_SOURCE_PREFIXES]
-    if ref_kind is KnowledgeSourceRefKind.COMPLETION_RECEIPT:
-        return [root / "docs/archive/task-completions"]
-    if ref_kind is KnowledgeSourceRefKind.TASK_ARTIFACT:
-        return [root / "docs/tasks", root / "docs/archive/tasks"]
-    return [root]
-
-
-def _relocated_source_resolution(
-    root: Path,
-    *,
-    repo_id: str,
-    ref: dict[str, Any],
-) -> KnowledgeSourceResolution | None:
-    expected = str(ref.get("content_sha256") or "")
-    if not expected:
-        return None
-    try:
-        ref_kind = KnowledgeSourceRefKind(str(ref.get("kind") or ""))
-    except ValueError:
-        return None
-
-    # One discovered match is not proof of uniqueness until the full bounded scan ends.
-    root_resolved = root.resolve()
-    candidates: list[str] = []
-    visited_entries = candidate_files = hashed_files = hashed_bytes = 0
-    started = time.monotonic()
-
-    def scan_stats() -> dict[str, int]:
-        return {
-            "visited_entries": visited_entries,
-            "candidate_files": candidate_files,
-            "hashed_files": hashed_files,
-            "hashed_bytes": hashed_bytes,
-        }
-
-    def incomplete(cause_code: str) -> KnowledgeSourceResolution:
-        return _source_resolution(
-            ref,
-            KnowledgeSourceResolutionStatus.INVALID_IDENTITY,
-            cause_code=cause_code,
-            scan_stats=scan_stats(),
-        )
-
-    excluded = {
-        ".git", ".repoctl-state", "node_modules", "target", "build",
-        "dist", ".venv", "venv", "__pycache__", ".next", ".cache",
-    }
-    for search_root in _source_relocation_roots(root, repo_id=repo_id, ref_kind=ref_kind):
-        if not search_root.exists():
-            continue
-        if search_root.is_symlink() or not search_root.is_dir():
-            return incomplete("source_relocation_scan_incomplete")
-        pending = [search_root]
-        while pending:
-            if time.monotonic() - started > MAX_SOURCE_RELOCATION_SECONDS:
-                return incomplete("source_relocation_time_limit")
-            directory = pending.pop()
-            try:
-                with os.scandir(directory) as entries:
-                    for entry in entries:
-                        visited_entries += 1
-                        if visited_entries > MAX_SOURCE_RELOCATION_VISITED_ENTRIES:
-                            return incomplete("source_relocation_entry_limit")
-                        if time.monotonic() - started > MAX_SOURCE_RELOCATION_SECONDS:
-                            return incomplete("source_relocation_time_limit")
-                        if entry.is_symlink():
-                            continue
-                        if entry.is_dir(follow_symlinks=False):
-                            # Prune before opening or enumerating descendants.
-                            if entry.name not in excluded:
-                                pending.append(Path(entry.path))
-                            continue
-                        if not entry.is_file(follow_symlinks=False):
-                            continue
-                        candidate_files += 1
-                        if candidate_files > MAX_SOURCE_RELOCATION_CANDIDATES:
-                            return incomplete("source_relocation_scan_limit")
-                        path = Path(entry.path)
-                        resolved = path.resolve()
-                        try:
-                            rel = resolved.relative_to(root_resolved).as_posix()
-                        except ValueError:
-                            return incomplete("source_relocation_scan_incomplete")
-                        if set(Path(rel).parts) & excluded:
-                            continue
-                        size = entry.stat(follow_symlinks=False).st_size
-                        remaining = MAX_SOURCE_RELOCATION_HASH_BYTES - hashed_bytes
-                        if size > MAX_SOURCE_RELOCATION_FILE_BYTES or size > remaining:
-                            return incomplete("source_relocation_byte_limit")
-                        with path.open("rb") as handle:
-                            content = handle.read(min(remaining, MAX_SOURCE_RELOCATION_FILE_BYTES) + 1)
-                        hashed_bytes += len(content)
-                        if len(content) > size or hashed_bytes > MAX_SOURCE_RELOCATION_HASH_BYTES or len(content) > MAX_SOURCE_RELOCATION_FILE_BYTES:
-                            return incomplete("source_relocation_byte_limit")
-                        if time.monotonic() - started > MAX_SOURCE_RELOCATION_SECONDS:
-                            return incomplete("source_relocation_time_limit")
-                        hashed_files += 1
-                        try:
-                            digest_bytes = (
-                                content if ref_kind is KnowledgeSourceRefKind.COMPLETION_RECEIPT
-                                else content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
-                            )
-                        except UnicodeDecodeError:
-                            continue
-                        actual = "sha256:" + hashlib.sha256(digest_bytes).hexdigest()
-                        if actual == expected:
-                            candidates.append(rel)
-                            if len(candidates) > 1:
-                                return incomplete("source_relocation_ambiguous")
-            except (OSError, ValueError, RuntimeError):
-                return incomplete("source_relocation_scan_incomplete")
-    if len(candidates) == 1:
-        return _source_resolution(
-            ref,
-            KnowledgeSourceResolutionStatus.RELOCATED,
-            resolved_path=candidates[0],
-            actual_sha256=expected,
-            scan_stats=scan_stats(),
-        )
-    return None
-
-
-def knowledge_source_ref_resolutions(
-    root: Path,
-    data: dict[str, Any],
-) -> list[KnowledgeSourceResolution]:
-    refs = data.get("source_refs", [])
-    if not isinstance(refs, list):
-        return []
-    resolutions: list[KnowledgeSourceResolution] = []
-    for ref in refs:
-        if not isinstance(ref, dict):
-            continue
-        boundary_problem = _knowledge_source_ref_boundary_problem(
-            root,
-            repo_id=str(data.get("repo_id") or ""),
-            ref=ref,
-        )
-        if boundary_problem is None:
-            literal = _literal_source_resolution(root, ref)
-            if literal.status is KnowledgeSourceResolutionStatus.MISSING:
-                relocated = _relocated_source_resolution(
-                    root,
-                    repo_id=str(data.get("repo_id") or ""),
-                    ref=ref,
-                )
-                resolutions.append(relocated or literal)
-            else:
-                resolutions.append(literal)
-            continue
-        if boundary_problem.code == "knowledge_source_missing":
-            relocated = _relocated_source_resolution(
-                root,
-                repo_id=str(data.get("repo_id") or ""),
-                ref=ref,
-            )
-            if relocated is not None:
-                resolutions.append(relocated)
-                continue
-        resolutions.append(
-            _source_resolution(
-                ref,
-                (
-                    KnowledgeSourceResolutionStatus.MISSING
-                    if boundary_problem.code == "knowledge_source_missing"
-                    else KnowledgeSourceResolutionStatus.INVALID_IDENTITY
-                ),
-                cause_code=boundary_problem.cause_code or boundary_problem.code,
-            )
-        )
-    return resolutions
-
-
-def resolved_knowledge_source_refs(
-    root: Path,
-    data: dict[str, Any],
-    *,
-    resolutions: list[KnowledgeSourceResolution] | None = None,
-) -> list[dict[str, Any]]:
-    refs = data.get("source_refs", [])
-    if not isinstance(refs, list):
-        return []
-    resolutions = resolutions if resolutions is not None else knowledge_source_ref_resolutions(root, data)
-    resolved_refs: list[dict[str, Any]] = []
-    resolution_index = 0
-    for ref in refs:
-        if not isinstance(ref, dict):
-            continue
-        resolution = resolutions[resolution_index]
-        resolution_index += 1
-        projected = dict(ref)
-        projected["declared_path"] = resolution.declared_path
-        projected["resolved_path"] = resolution.resolved_path
-        projected["resolution_status"] = resolution.status.value
-        if resolution.cause_code:
-            projected["resolution_cause_code"] = resolution.cause_code
-        if resolution.scan_stats:
-            projected["relocation_scan"] = resolution.scan_stats
-        if resolution.status in {
-            KnowledgeSourceResolutionStatus.CURRENT,
-            KnowledgeSourceResolutionStatus.RELOCATED,
-        }:
-            projected["path"] = resolution.resolved_path
-        resolved_refs.append(projected)
-    return resolved_refs
-
-
-def _source_digest_problems(
-    root: Path,
-    data: dict[str, Any],
-    *,
-    record_id: str = "",
-    resolutions: list[KnowledgeSourceResolution] | None = None,
-) -> list[Problem]:
-    refs = data.get("source_refs", [])
-    if not isinstance(refs, list) or not refs:
-        return [
-            Problem(
-                "error",
-                "knowledge_source_refs_missing",
-                "knowledge item has no source refs",
-                str(record_id),
-            )
-        ]
-    problems: list[Problem] = []
-    source_resolutions = resolutions if resolutions is not None else knowledge_source_ref_resolutions(root, data)
-    for resolution in source_resolutions:
-        if resolution.status in {
-            KnowledgeSourceResolutionStatus.CURRENT,
-            KnowledgeSourceResolutionStatus.RELOCATED,
-        }:
-            continue
-        if resolution.status is KnowledgeSourceResolutionStatus.MISSING:
-            problems.append(
-                Problem(
-                    "error",
-                    "knowledge_source_missing",
-                    "knowledge source file is missing",
-                    resolution.declared_path,
-                    cause_code=resolution.cause_code or None,
-                )
-            )
-        elif resolution.status is KnowledgeSourceResolutionStatus.DIGEST_MISMATCH:
-            problems.append(
-                Problem(
-                    "error",
-                    "knowledge_source_digest_drift",
-                    "knowledge source digest changed",
-                    resolution.resolved_path or resolution.declared_path,
-                )
-            )
-        else:
-            problems.append(
-                Problem(
-                    "error",
-                    "knowledge_source_identity_invalid",
-                    "receipt-derived knowledge source identity could not be verified",
-                    resolution.declared_path,
-                    cause_code=resolution.cause_code or None,
-                )
-            )
-    return problems
-
-
-def _source_ref_statuses(
-    root: Path,
-    data: dict[str, Any],
-    *,
-    resolutions: list[KnowledgeSourceResolution] | None = None,
-) -> list[dict[str, Any]]:
-    statuses: list[dict[str, Any]] = []
-    refs = data.get("source_refs", [])
-    if not isinstance(refs, list):
-        return statuses
-    resolutions = resolutions if resolutions is not None else knowledge_source_ref_resolutions(root, data)
-    resolution_index = 0
-    for ref in refs:
-        if not isinstance(ref, dict):
-            continue
-        resolution = resolutions[resolution_index]
-        resolution_index += 1
-        declared_exists = resolution.status in {
-            KnowledgeSourceResolutionStatus.CURRENT,
-            KnowledgeSourceResolutionStatus.DIGEST_MISMATCH,
-        }
-        resolved_exists = resolution.status in {
-            KnowledgeSourceResolutionStatus.CURRENT,
-            KnowledgeSourceResolutionStatus.RELOCATED,
-            KnowledgeSourceResolutionStatus.DIGEST_MISMATCH,
-        }
-        statuses.append(
-            {
-                "path": resolution.declared_path,
-                "declared_path": resolution.declared_path,
-                "resolved_path": resolution.resolved_path,
-                "kind": str(ref.get("kind") or ""),
-                "section": str(ref.get("section") or ""),
-                "status": resolution.status.value,
-                "exists": declared_exists,
-                "declared_exists": declared_exists,
-                "resolved_exists": resolved_exists,
-                "expected_sha256": resolution.expected_sha256,
-                "actual_sha256": resolution.actual_sha256,
-                "digest_matches": bool(resolution.expected_sha256) and resolution.expected_sha256 == resolution.actual_sha256,
-                **({"cause_code": resolution.cause_code} if resolution.cause_code else {}),
-                **({"relocation_scan": resolution.scan_stats} if resolution.scan_stats else {}),
-            }
-        )
-    return statuses
-
-
-def _public_record(
-    root: Path,
-    record: dict[str, Any],
-    *,
-    status: str,
-    lifecycle_relations: dict[str, Any] | None = None,
-    source_resolutions: list[KnowledgeSourceResolution] | None = None,
-    resolved_source_refs: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    resolutions = source_resolutions if source_resolutions is not None else knowledge_source_ref_resolutions(root, record)
-    public_source_refs = (
-        resolved_source_refs
-        if resolved_source_refs is not None
-        else resolved_knowledge_source_refs(root, record, resolutions=resolutions)
-    )
-    public = {
-        "id": record.get("id", ""),
-        "repo_id": record.get("repo_id", ""),
-        "kind": record.get("kind", ""),
-        "status": status,
-        "title": record.get("title") or record.get("claim", ""),
-        "claim": record.get("claim", ""),
-        "summary": record.get("summary") or record.get("reason", ""),
-        "reason": record.get("reason", ""),
-        "source_refs": record.get("source_refs", []),
-        "resolved_source_refs": public_source_refs,
-        "source_resolutions": _source_ref_statuses(root, record, resolutions=resolutions),
-        "explicit_path_refs": explicit_knowledge_path_refs(record),
-        "record_digest": record.get("record_digest", ""),
-        "applies_to": {"paths": sorted(_record_applicability_paths(record))},
-    }
-    if lifecycle_relations:
-        public["lifecycle_relations"] = lifecycle_relations
-    if str(record.get("author") or ""):
-        public["author"] = str(record["author"])
-    if str(record.get("recorded_at") or ""):
-        public["recorded_at"] = str(record["recorded_at"])
-    return public
-
-
-def explicit_knowledge_path_refs(record: dict[str, Any]) -> list[dict[str, Any]]:
-    refs: list[dict[str, Any]] = []
-    for path in sorted(_record_applicability_paths(record)):
-        refs.append(
-            {
-                "kind": KnowledgeExplicitPathKind.APPLIES_TO_PATH.value,
-                "path": path,
-                "role": KnowledgeExplicitPathRole.CODE_ANCHOR.value,
-            }
-        )
-    source_refs = record.get("source_refs") if isinstance(record.get("source_refs"), list) else []
-    for source_ref in source_refs:
-        if not isinstance(source_ref, dict):
-            continue
-        path = str(source_ref.get("path") or "").strip()
-        if not path:
-            continue
-        source_kind = str(source_ref.get("kind") or "")
-        ref = {
-            "kind": KnowledgeExplicitPathKind.SOURCE_REF.value,
-            "path": path,
-            "source_kind": source_kind,
-            "role": (
-                KnowledgeExplicitPathRole.CODE_ANCHOR.value
-                if source_kind == KnowledgeSourceRefKind.CURRENT_SOURCE.value
-                else KnowledgeExplicitPathRole.PROVENANCE_ONLY.value
-            ),
-        }
-        if source_ref.get("content_sha256"):
-            ref["content_sha256"] = str(source_ref["content_sha256"])
-        refs.append(ref)
-    return [
-        value
-        for _key, value in sorted(
-            {
-                (
-                    str(ref.get("kind") or ""),
-                    str(ref.get("path") or ""),
-                    str(ref.get("source_kind") or ""),
-                    str(ref.get("role") or ""),
-                ): ref
-                for ref in refs
-            }.items()
-        )
-    ]
-
-
-def _record_related_paths(
-    record: dict[str, Any],
-    *,
-    resolved_source_refs: list[dict[str, Any]] | None = None,
-) -> set[str]:
-    paths = _record_applicability_paths(record)
-    source_refs = record.get("source_refs") if isinstance(record.get("source_refs"), list) else []
-    projected_refs = resolved_source_refs if resolved_source_refs is not None else []
-    for ref in [*source_refs, *projected_refs]:
-        if isinstance(ref, dict) and str(ref.get("path") or "").strip():
-            paths.add(str(ref.get("path") or "").strip())
-    return paths
-
-
-def _record_applicability_paths(record: dict[str, Any]) -> set[str]:
-    applies_to = record.get("applies_to") if isinstance(record.get("applies_to"), dict) else {}
-    values = applies_to.get("paths") if isinstance(applies_to.get("paths"), list) else []
-    return {str(value).strip() for value in values if str(value).strip()}
-
-
-def _record_lifecycle_relations(record: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
-    record_id = str(record.get("id") or "")
-    relations = {
-        "replaces": _record_replacements(record),
-        "superseded_by": sorted(
-            str(item.get("id") or "")
-            for item in records
-            if record_id in _record_replacements(item)
-        ),
-    }
-    return {key: value for key, value in relations.items() if value}
-
-
-def _source_search_text(record: dict[str, Any], resolved_source_refs: list[dict[str, Any]] | None) -> str:
-    refs = record.get("source_refs", [])
-    return "\n".join(
-        str(ref[key])
-        for ref in [*(refs if isinstance(refs, list) else []), *(resolved_source_refs or [])]
-        if isinstance(ref, dict)
-        for key in ("kind", "path", "declared_path", "resolved_path", "section", "task_id", "content_sha256")
-        if ref.get(key)
-    )
-
-
-def _record_search_body(record: dict[str, Any], *, resolved_source_refs: list[dict[str, Any]] | None = None) -> str:
-    return "\n".join(
-        [
-            str(record.get("id") or ""),
-            str(record.get("kind") or ""),
-            str(record.get("title") or ""),
-            str(record.get("claim") or ""),
-            str(record.get("summary") or record.get("reason") or ""),
-            _source_search_text(record, resolved_source_refs),
-        ]
-    )
-
-
-def _record_score(
-    query: str,
-    record: dict[str, Any],
-    *,
-    fts: float = 0.0,
-    resolved_source_refs: list[dict[str, Any]] | None = None,
-) -> tuple[float, dict[str, float], list[str]]:
-    identity_text = "\n".join([str(record.get("id") or ""), str(record.get("kind") or "")])
-    title_text = str(record.get("title") or record.get("claim") or "")
-    claim_text = str(record.get("claim") or "")
-    summary_text = str(record.get("summary") or record.get("reason") or "")
-    source_text = _source_search_text(record, resolved_source_refs)
-    exact_identity = _exact_score(query, identity_text)
-    exact_title = _exact_score(query, title_text)
-    exact_claim = _exact_score(query, claim_text)
-    exact_summary = _exact_score(query, summary_text)
-    exact_source = _exact_score(query, source_text)
-    authority = 0.5
-    score = exact_identity * 1.0 + exact_title * 2.4 + exact_claim * 2.0 + exact_summary * 1.2 + exact_source * 0.8 + fts * 1.2 + authority
-    reasons: list[str] = []
-    if exact_identity:
-        reasons.append("exact record identity match")
-    if exact_title:
-        reasons.append("exact title match")
-    if exact_claim:
-        reasons.append("exact claim match")
-    if exact_summary:
-        reasons.append("exact summary match")
-    if exact_source:
-        reasons.append("exact source reference match")
-    if fts:
-        reasons.append("SQLite FTS record match")
-    if authority:
-        reasons.append("current knowledge record")
-    return score, {
-        "exact_identity": exact_identity,
-        "exact_title": exact_title,
-        "exact_claim": exact_claim,
-        "exact_summary": exact_summary,
-        "exact_source": exact_source,
-        "fts": fts,
-        "authority": authority,
-    }, reasons
-
-
-def _exact_score(query: str, body: str) -> float:
-    terms = _query_terms(query)
-    if not terms:
-        return 0.0
-    haystack = body.lower()
-    hits = sum(1 for term in terms if term.lower() in haystack)
-    return min(1.0, hits / len(terms))
-
-
-def _record_fts_scores(
-    query: str,
-    records: list[dict[str, Any]],
-    *,
-    resolved_source_refs_by_id: dict[str, list[dict[str, Any]]] | None = None,
-) -> dict[str, float]:
-    terms = _query_terms(query)
-    if not terms or not records:
-        return {}
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.execute("CREATE VIRTUAL TABLE records USING fts5(record_id UNINDEXED, body)")
-        conn.executemany(
-            "INSERT INTO records(record_id, body) VALUES (?, ?)",
-            [
-                (
-                    str(record.get("id") or ""),
-                    _record_search_body(
-                        record,
-                        resolved_source_refs=(resolved_source_refs_by_id or {}).get(str(record.get("id") or "")),
-                    ),
-                )
-                for record in records
-                if str(record.get("id") or "")
-            ],
-        )
-        phrase = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
-        rows = conn.execute(
-            "SELECT record_id, bm25(records) AS rank FROM records WHERE records MATCH ? ORDER BY rank, record_id",
-            (phrase,),
-        ).fetchall()
-        return {
-            str(record_id): 1.0 / position
-            for position, (record_id, _rank) in enumerate(rows, start=1)
-        }
-    except sqlite3.Error:
-        return {}
-    finally:
-        conn.close()
-
-
-def _query_terms(query: str) -> list[str]:
-    stopwords = {"a", "an", "and", "are", "for", "from", "how", "is", "of", "the", "to", "what", "why"}
-    tokens = re.findall(r"[A-Za-z0-9_./:-]+|[가-힣]+", query)
-    return sorted({token for token in tokens if len(token) >= 2 and token.lower() not in stopwords})
+        _public_record(root, record, status="current", observe=False)
+        for record in records
+        if record["id"] not in superseded
+    ], problems

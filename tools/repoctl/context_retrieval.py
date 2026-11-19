@@ -196,7 +196,7 @@ def context_retrieval_lane(
     repository_path: str,
     document_role: DocumentRole = DocumentRole.UNSPECIFIED,
 ) -> ContextRetrievalLane:
-    if kind in {"completion_receipt", "task_artifact"}:
+    if kind == "task_artifact":
         return ContextRetrievalLane.TASK_HISTORY
 
     normalized_repository = repository_path.replace("\\", "/").strip("/")
@@ -874,8 +874,6 @@ def _authority_score(
         return 0.35
     if role in ORDINARY_RECALL_EXCLUDED_DOCUMENT_ROLES | SOURCE_EXCLUDED_DOCUMENT_ROLES:
         return 0.0
-    if kind == "completion_receipt":
-        return 0.35
     if kind == "task_artifact":
         return 0.3
     if kind in CONTEXT_SOURCE_KIND_VALUES:

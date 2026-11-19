@@ -15,8 +15,8 @@ _RELATION_KINDS = {"IMPORTS_FILE", "CALLS", "TESTS_FILE", "USES_FILE"}
 def is_current_file_node(node: GraphNode | None) -> bool:
     if node is None or node.kind != "file":
         return False
-    receipt = node.facts.get("receipt") if isinstance(node.facts.get("receipt"), dict) else {}
-    return receipt.get("present_in_current_inventory") is not False
+    inventory = node.facts.get("inventory") if isinstance(node.facts.get("inventory"), dict) else {}
+    return inventory.get("present_in_current_inventory") is not False
 
 
 @dataclass(frozen=True)

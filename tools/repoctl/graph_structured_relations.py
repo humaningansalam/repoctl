@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 from .code_index import CodeIndexEntry
 from .graph_semantic_model import RpcInvocationFact, RpcInvocationStatus, RpcParamsStatus, RpcRoutineStatus, RpcSchemaStatus
-from .tasks import Problem
+from .io import Problem
 
 
 STRUCTURED_RELATION_INPUT_VERSION = 6

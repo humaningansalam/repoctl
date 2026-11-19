@@ -8,9 +8,10 @@ from .context_model import ContextSectionKind, ContextSourceKind
 from .git import normalize_repo_path
 from .graph_model import GraphSnapshot, digest_data
 from .language_profiles import collect_verification_hints, is_context_source_language, language_for_path, product_manifest_patterns
-from .meta import meta_inventory, without_absent_repometa
+from .inventory import file_inventory
 from .repositories import RepoTarget
-from .tasks import Problem, collect_completion_receipt_artifacts
+from .io import Problem
+from .task_history import read_task_history
 
 
 DOCUMENT_PATTERNS = (
@@ -150,68 +151,19 @@ def collect_context_sources(
             )
         )
 
-    receipts: list[dict[str, Any]] = []
-    receipt_warnings: list[Problem] = []
+    history = []
+    history_problems: list[Problem] = []
     if include_history:
-        receipt_artifacts, receipt_problems = collect_completion_receipt_artifacts(root, repo_id=target.id)
-        receipts = [artifact.receipt for artifact in receipt_artifacts]
-        receipt_warnings = [
-            Problem(
-                "warning",
-                "graph_source_completion_receipt_invalid",
-                f"{problem.message}; receipt excluded from Graph source evidence",
-                problem.path,
-            )
-            for problem in receipt_problems
-        ]
-        for receipt_artifact in receipt_artifacts:
-            receipt = receipt_artifact.receipt
-            chunks.append(
-                chunk_text_source(
-                    root,
-                    receipt_artifact.receipt_path,
-                    receipt_artifact.receipt_text,
-                    kind="completion_receipt",
-                    section=str(receipt.get("task_id") or "completion receipt"),
-                    section_kind=ContextSectionKind.TASK,
-                )
-            )
-            chunks.extend(
-                chunk_markdown_text(
-                    root,
-                    receipt_artifact.resolved_path,
-                    receipt_artifact.artifact_text,
-                    kind="task_artifact",
-                )
-            )
-
-    invalid_receipt_problems = [problem for problem in graph_problems if problem.code == "invalid_completion_receipt"]
-    if snapshot is not None:
-        invalid_receipt_problems.extend(
-            Problem(
-                str(raw.get("severity") or "warning"),
-                str(raw.get("code") or "invalid_completion_receipt"),
-                str(raw.get("message") or "completion receipt is invalid"),
-                str(raw.get("path") or ""),
-            )
-            for raw in snapshot.completeness.get("receipt_problems", [])
-            if isinstance(raw, dict)
-        )
-    reported_receipt_problems = invalid_receipt_problems or receipt_warnings
-    receipt_problem_paths = sorted(problem.path or "" for problem in reported_receipt_problems if problem.path)
-
-    graph_context_problems = context_graph_problems(
-        [problem for problem in graph_problems if problem.code != "invalid_completion_receipt"]
-        + invalid_receipt_problems,
-        graph_available=snapshot is not None,
-    )
-    problems.extend(graph_context_problems)
-    inventory, inventory_problems, _inventory_meta = meta_inventory(
+        history, history_problems = read_task_history(root, repo_id=target.id)
+        for task in history:
+            chunks.extend(chunk_markdown_text(root, task.path, task.text, kind="task_artifact"))
+    problems.extend(history_problems)
+    problems.extend(context_graph_problems(graph_problems, graph_available=snapshot is not None))
+    inventory, inventory_problems, _inventory_meta = file_inventory(
         root,
         changed=False,
         target=target,
     )
-    inventory_problems, metadata_absent = without_absent_repometa(inventory_problems, repo=target.root_path)
     current_source_chunks, current_source_problems = _current_source_chunks_from_records(
         root,
         records=[
@@ -222,26 +174,23 @@ def collect_context_sources(
     )
     chunks.extend(current_source_chunks)
     problems.extend(inventory_problems)
-    if metadata_absent:
-        problems.append(Problem("warning", "context_metadata_unavailable", "repository metadata is not initialized; current source remains searchable without metadata enrichment", f"{target.display_path}/.repometa/policy.json", "missing_repometa_policy"))
     problems.extend(current_source_problems)
     completeness = {
         "documents_checked": len(document_paths),
         "manifests_checked": len(manifest_paths),
-        "receipts_checked": len(receipts),
+        "tasks_checked": len(history),
         "current_sources_checked": len(current_source_chunks),
         "history_loaded": include_history,
-        "receipt_problem_count": len(reported_receipt_problems),
-        "receipt_problem_paths": receipt_problem_paths,
+        "history_problem_count": len(history_problems),
+        "history_problem_paths": [problem.path for problem in history_problems],
         "graph_available": snapshot is not None,
-        "metadata": "unavailable" if metadata_absent else "available",
         "graph_meta": graph_meta,
     }
     if snapshot is not None:
         completeness["graph_completeness"] = snapshot.completeness
     source_snapshots = {
         "document_manifest_digest": _manifest_digest([chunk for chunk in chunks if chunk.source_ref.kind in {"document", "product_manifest", "verification_hint"}]),
-        "receipt_manifest_digest": digest_data(receipts),
+        "task_manifest_digest": digest_data([task.to_dict() for task in history]),
         "current_source_manifest_digest": _manifest_digest(current_source_chunks),
     }
     if snapshot is not None:
@@ -393,41 +342,12 @@ def context_overlay_chunks(
                 section_kind=ContextSectionKind.VERIFICATION,
             )
         )
-    history_changed = any(
-        path.startswith(("docs/tasks/.repoctl-state/completions/", "docs/tasks/", "docs/archive/tasks/"))
-        for path in selected
-    )
-    if include_history and history_changed:
-        receipt_artifacts, receipt_problems = collect_completion_receipt_artifacts(root, repo_id=target.id)
-        problems.extend(Problem("warning", problem.code, problem.message, problem.path) for problem in receipt_problems)
-        for receipt_artifact in receipt_artifacts:
-            receipt = receipt_artifact.receipt
-            task_id = str(receipt.get("task_id") or "")
-            receipt_rel = receipt_artifact.receipt_path
-            artifact = receipt_artifact.resolved_path
-            artifacts = [artifact] if artifact else []
-            if receipt_rel in selected:
-                chunks.append(
-                    chunk_text_source(
-                        root,
-                        receipt_rel,
-                        receipt_artifact.receipt_text,
-                        kind="completion_receipt",
-                        section=task_id or "completion receipt",
-                        section_kind=ContextSectionKind.TASK,
-                    )
-                )
-            for artifact in artifacts:
-                if receipt_rel not in selected and artifact not in selected:
-                    continue
-                chunks.extend(
-                    chunk_markdown_text(
-                        root,
-                        artifact,
-                        receipt_artifact.artifact_text,
-                        kind="task_artifact",
-                    )
-                )
+    if include_history and any(path.startswith(("docs/tasks/", "docs/archive/tasks/")) for path in selected):
+        history, history_problems = read_task_history(root, repo_id=target.id)
+        problems.extend(history_problems)
+        for task in history:
+            if task.path in selected:
+                chunks.extend(chunk_markdown_text(root, task.path, task.text, kind="task_artifact"))
     return chunks, problems
 
 
@@ -457,17 +377,7 @@ def context_graph_problems(
 ) -> list[Problem]:
     mapped: list[Problem] = []
     for problem in graph_problems:
-        if problem.code == "invalid_completion_receipt":
-            mapped.append(
-                Problem(
-                    "warning",
-                    "graph_source_receipt_incomplete",
-                    f"{problem.message}; task receipt evidence is incomplete for Graph source search",
-                    problem.path,
-                    problem.code,
-                )
-            )
-        elif graph_available or problem.code != "graph_snapshot_missing":
+        if graph_available or problem.code != "graph_snapshot_missing":
             mapped.append(problem)
         else:
             mapped.append(

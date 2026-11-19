@@ -6,7 +6,6 @@ from urllib.parse import unquote
 
 from tests.repoctl.graph.test_graph_build import _materialize
 from tools.repoctl.cli import main
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 from tests.repoctl.workspace.test_check import write_workspace
 
@@ -14,7 +13,6 @@ def test_graph_resolves_structured_file_relations_from_explicit_syntax(tmp_path:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
 
     (repo / "scripts").mkdir()
     (repo / "scripts/start.sh").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -144,7 +142,6 @@ def test_structured_rpc_analysis_skips_sources_without_supported_client_imports(
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
 
     (repo / "src").mkdir()
     (repo / "src/App.tsx").write_text(
@@ -170,7 +167,6 @@ def test_graph_structured_relations_fail_closed_when_ownership_is_ambiguous_or_d
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
 
     (repo / "common.sh").write_text("#!/bin/sh\n", encoding="utf-8")
     (repo / "scripts").mkdir()
@@ -231,7 +227,6 @@ def test_client_rpc_runtime_name_matches_sql_catalog_name_exactly(tmp_path: Path
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     migrations = repo / "supabase/migrations"
     migrations.mkdir(parents=True)
     (migrations / "20240101000000_lower.sql").write_text(
@@ -270,7 +265,6 @@ def test_structured_rpc_relations_require_proven_receiver_and_complete_literal(t
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
 
     (repo / "sql").mkdir()
     (repo / "sql/functions.sql").write_text(
@@ -329,7 +323,6 @@ def test_structured_sql_relations_preserve_identity_scope_and_unique_ownership(t
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     sql = repo / "sql"
     sql.mkdir()
 
@@ -366,7 +359,6 @@ def test_structured_yaml_relations_require_schema_locations_and_working_director
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / ".env").write_text("A=1\n", encoding="utf-8")
     (repo / "compose.yml").write_text(
         "services:\n"
@@ -405,7 +397,6 @@ def test_structured_docker_and_shell_relations_use_typed_file_resolution(tmp_pat
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "package.json").write_text("{}\n", encoding="utf-8")
     docker = repo / "docker"
     docker.mkdir()
@@ -434,7 +425,6 @@ def test_structured_parse_failures_are_reported_as_failed_coverage(tmp_path: Pat
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "bad.py").write_text("client.rpc(\n", encoding="utf-8")
     (repo / "bad.sh").write_text('source "unterminated\n', encoding="utf-8")
 

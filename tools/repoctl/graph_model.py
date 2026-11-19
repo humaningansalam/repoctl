@@ -36,16 +36,8 @@ def import_ref_id(
     return "repo:" + encode_component(parts[0]) + ":import-ref:" + ":".join(encode_component(part) for part in parts[1:])
 
 
-def topic_id(repo_id: str, topic: str) -> str:
-    return f"repo:{encode_component(repo_id)}:topic:{encode_component(topic)}"
-
-
 def task_id(value: str) -> str:
     return f"task:{encode_component(value)}"
-
-
-def change_event_id(value: str, index: int) -> str:
-    return f"task:{encode_component(value)}:change:{index}"
 
 
 def artifact_id(value: str, artifact_path: str) -> str:
@@ -84,7 +76,6 @@ class GraphContextAnchorKind(StrEnum):
 
 class GraphQuerySelectorKind(StrEnum):
     FILE = "file"
-    TOPIC = "topic"
     IMPORT = "import"
     SYMBOL = "symbol"
     CALLERS_OF = "callers_of"
@@ -104,7 +95,6 @@ class GraphQuerySelectorSchema:
 
 GRAPH_QUERY_SELECTOR_SCHEMAS: dict[GraphQuerySelectorKind, GraphQuerySelectorSchema] = {
     GraphQuerySelectorKind.FILE: GraphQuerySelectorSchema("path"),
-    GraphQuerySelectorKind.TOPIC: GraphQuerySelectorSchema("topic"),
     GraphQuerySelectorKind.IMPORT: GraphQuerySelectorSchema("raw_import"),
     GraphQuerySelectorKind.SYMBOL: GraphQuerySelectorSchema("symbol", optional_fields=frozenset({"in_file"})),
     GraphQuerySelectorKind.CALLERS_OF: GraphQuerySelectorSchema("symbol", optional_fields=frozenset({"in_file"})),
@@ -292,7 +282,7 @@ class GraphSnapshot:
     schema: str = "repoctl.graph.snapshot"
     schema_version: int = 1
     authoritative: bool = False
-    capabilities: list[str] = field(default_factory=lambda: ["repository", "file", "import_ref", "topic"])
+    capabilities: list[str] = field(default_factory=lambda: ["repository", "file", "import_ref"])
     snapshot_digest: str = ""
 
     def to_dict(self, *, include_digest: bool = True) -> dict[str, Any]:

@@ -11,7 +11,6 @@ from tools.repoctl.graph_typescript_provider import build_typescript_semantics
 from tools.repoctl.repositories import RepoTarget
 from tests.repoctl.graph.test_graph_build import _materialize, _snapshot
 from tests.repoctl.workspace.test_check import write_workspace
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 
 def test_typescript_provider_rejects_malformed_success_payload(
@@ -106,7 +105,6 @@ def test_graph_resolves_same_file_python_calls(tmp_path: Path, monkeypatch, caps
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "auth").mkdir()
     (repo / "auth/flow.py").write_text(
         'def validate_token(token: str) -> bool:\n    return token == "ok"\n\n\ncheck_token = validate_token\n\n\ndef login(token: str) -> str:\n    if check_token(token):\n        return "ok"\n    return "denied"\n',
@@ -128,7 +126,6 @@ def test_graph_resolves_same_class_python_method_calls(tmp_path: Path, monkeypat
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "auth").mkdir()
     (repo / "auth/method_flow.py").write_text(
         'class TokenFlow:\n    def validate(self, token: str) -> bool:\n        return token == "ok"\n\n    def login(self, token: str) -> str:\n        if self.validate(token):\n            return "ok"\n        return "denied"\n',
@@ -148,7 +145,6 @@ def test_graph_resolves_cross_file_python_imported_function_calls(tmp_path: Path
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "p_audit").mkdir()
@@ -271,7 +267,6 @@ def test_graph_resolves_python_module_qualified_calls_without_overstating_comple
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "services/token_service.py").write_text(
@@ -300,7 +295,6 @@ def test_graph_resolves_python_callable_reexports(tmp_path: Path, monkeypatch, c
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "origin.py").write_text("def target():\n    return 1\n", encoding="utf-8")
     (repo / "reexport.py").write_text("from origin import target\n", encoding="utf-8")
     (repo / "aliased.py").write_text("from origin import target as public_target\n", encoding="utf-8")
@@ -338,7 +332,6 @@ def test_graph_skips_shadowed_cross_file_python_imported_function_calls(tmp_path
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "services/token_service.py").write_text(
@@ -363,7 +356,6 @@ def test_graph_python_calls_follow_lexical_scopes(tmp_path: Path, monkeypatch, c
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "scope.py").write_text(
         "def target():\n"
         "    return 1\n\n"
@@ -654,7 +646,6 @@ def test_graph_query_symbol_callers_and_callees(tmp_path: Path, monkeypatch, cap
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "auth").mkdir()
     callers = "\n\n".join(
         f"def caller_{index:02d}(token: str) -> bool:\n    return validate_token(token)"
@@ -718,7 +709,6 @@ def test_graph_query_symbol_ambiguity_fails_closed(tmp_path: Path, monkeypatch, 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "web").mkdir()
     (repo / "api").mkdir()
     (repo / "web/auth.py").write_text("def login():\n    return 'web'\n", encoding="utf-8")
@@ -742,7 +732,6 @@ def test_graph_query_impact_file_uses_import_and_call_edges(tmp_path: Path, monk
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "services/token_service.py").write_text("def issue_token(user_id: str) -> str:\n    return f'token:{user_id}'\n", encoding="utf-8")
@@ -776,7 +765,6 @@ def test_graph_query_js_ts_impact_is_file_level(tmp_path: Path, monkeypatch, cap
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "frontend/src/api").mkdir(parents=True)
     (repo / "frontend/src/client.ts").write_text("import { issueToken } from './api/tokens';\nexport const login = () => issueToken();\n", encoding="utf-8")
     (repo / "frontend/src/api/tokens.ts").write_text("export const issueToken = () => 'token';\n", encoding="utf-8")
@@ -798,7 +786,6 @@ def test_graph_and_context_follow_typescript_barrel_calls_inside_anonymous_callb
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "src").mkdir()
     (repo / "test").mkdir()
     (repo / "tsconfig.json").write_text(
@@ -888,7 +875,6 @@ def test_graph_and_context_prioritize_owner_source_and_direct_test(tmp_path: Pat
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "tests").mkdir()
     (repo / "auth.py").write_text(
         "def validate_token(token: str) -> bool:\n    return token == 'ok'\n",
@@ -929,7 +915,6 @@ def test_compact_graph_paths_and_continuations_share_one_budget(tmp_path: Path, 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "target.py").write_text("def run() -> int:\n    return 1\n", encoding="utf-8")
     for name in ("alpha", "beta", "gamma"):
         (repo / f"{name}.py").write_text("from target import run\n", encoding="utf-8")

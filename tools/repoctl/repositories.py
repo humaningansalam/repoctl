@@ -6,18 +6,15 @@ import re
 import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any
 
 from .io import RepoctlError, atomic_write
-from .markdown import parse_frontmatter
 from .settings import load_repoctl_settings
 
 
 REPO_ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 PRODUCT_REPO_DIRS = ("repos",)
-TASK_AREAS = frozenset({"", "repo", "backend", "frontend", "infra", "docs", "ops", "mobile"})
-REPO_REQUIRED_TASK_AREAS = frozenset({"repo", "backend", "frontend", "infra", "mobile"})
 
 
 class RepositoryIdentitySource(StrEnum):
@@ -50,43 +47,6 @@ class RepoSelectorStatus(StrEnum):
     NOT_FOUND = "not_found"
     INVALID = "invalid"
     AMBIGUOUS = "ambiguous"
-
-
-class RepositoryStateIdentityBinding(StrEnum):
-    REQUIRED = "required"
-    HISTORICAL = "historical"
-
-
-class RepositoryStateSource(StrEnum):
-    GRAPH = "graph"
-    KNOWLEDGE_RECORD = "knowledge_record"
-    COMPLETION_RECEIPT = "completion_receipt"
-
-    @property
-    def identity_binding(self) -> RepositoryStateIdentityBinding:
-        if self is RepositoryStateSource.COMPLETION_RECEIPT:
-            return RepositoryStateIdentityBinding.HISTORICAL
-        return RepositoryStateIdentityBinding.REQUIRED
-
-
-class TaskRepositoryScope(StrEnum):
-    WORKSPACE = "workspace"
-    REPOSITORY = "repository"
-    INVALID = "invalid"
-
-
-def task_repository_scope(frontmatter: Mapping[str, Any]) -> TaskRepositoryScope:
-    raw_repo_id = frontmatter.get("repo_id")
-    raw_area = frontmatter.get("area")
-    if not isinstance(raw_repo_id, str) or not isinstance(raw_area, str):
-        return TaskRepositoryScope.INVALID
-    if raw_repo_id != raw_repo_id.strip() or raw_area != raw_area.strip():
-        return TaskRepositoryScope.INVALID
-    if raw_area not in TASK_AREAS or (raw_repo_id and not REPO_ID_RE.fullmatch(raw_repo_id)):
-        return TaskRepositoryScope.INVALID
-    if raw_repo_id or raw_area in REPO_REQUIRED_TASK_AREAS:
-        return TaskRepositoryScope.REPOSITORY
-    return TaskRepositoryScope.WORKSPACE
 
 
 @dataclass(frozen=True)
@@ -139,6 +99,8 @@ class RepoLayout:
 
 def _safe_rel(value: str) -> str:
     raw = value.strip().replace("\\", "/")
+    if raw in {".", "./"}:
+        return "."
     if Path(raw).is_absolute():
         raise RepoctlError(
             f"repository path must be workspace-relative: {value}",
@@ -186,15 +148,6 @@ def resolve_repo_selector_path(
     return RepoSelectorResolution(RepoSelectorStatus.NOT_FOUND, workspace_candidate or normalized)
 
 
-def _validate_product_repo_rel(rel: str) -> None:
-    parts = rel.split("/")
-    if rel == "repos":
-        return
-    if len(parts) == 2 and parts[0] == "repos" and parts[1]:
-        return
-    raise RepoctlError(f"repository path must be repos or repos/<id>: {rel}", code="repository_topology_invalid", path=rel)
-
-
 def _casefold_id(value: str) -> str:
     return value.casefold()
 
@@ -231,9 +184,6 @@ def _target(root: Path, repo_id: str, rel: str, *, identity_source: str, require
     if not REPO_ID_RE.match(repo_id):
         raise RepoctlError(f"invalid repository id: {repo_id}")
     rel = _safe_rel(rel)
-    _validate_product_repo_rel(rel)
-    if rel == "repos" and repo_id != "main":
-        raise RepoctlError("direct repos/ repository must use repository id: main", code="repository_topology_invalid", path=rel)
     path = root / rel
     try:
         resolved = path.resolve()
@@ -246,7 +196,7 @@ def _target(root: Path, repo_id: str, rel: str, *, identity_source: str, require
     return RepoTarget(repo_id, path, rel, identity_source)
 
 
-def _configured_targets(root: Path, settings: dict[str, Any], *, allow_unconfigured: bool = False) -> tuple[RepoTarget, ...] | None:
+def _configured_targets(root: Path, settings: dict[str, Any]) -> tuple[RepoTarget, ...] | None:
     raw = settings.get("repositories")
     if raw is None:
         return None
@@ -285,12 +235,6 @@ def _configured_targets(root: Path, settings: dict[str, Any], *, allow_unconfigu
             raise RepoctlError(f"duplicate repository git root: {rel}", code="repository_topology_invalid", path=rel)
         git_toplevels.add(git_top_key)
         targets.append(target)
-    _validate_no_nested_targets(targets)
-    discovered = _discover_git_roots(root)
-    configured_paths = {target.display_path for target in targets}
-    extras = sorted(path for path in discovered if path not in configured_paths)
-    if extras and not allow_unconfigured:
-        raise RepoctlError(f"unconfigured product repository detected: {', '.join(extras)}")
     return tuple(targets)
 
 
@@ -324,95 +268,18 @@ def _candidates_for_discovered(root: Path, discovered: list[str]) -> tuple[RepoC
     return tuple(candidates)
 
 
-def _problem(severity: str, code: str, message: str, path: str) -> dict[str, str]:
-    return {"severity": severity, "code": code, "message": message, "path": path}
-
-
-def _unowned_product_paths(root: Path, owned_paths: set[str]) -> tuple[dict[str, str], ...]:
-    repos_dir = root / "repos"
-    if not repos_dir.is_dir():
-        return ()
-    problems: list[dict[str, str]] = []
-    for child in sorted(repos_dir.iterdir()):
-        if not is_git_repo_root(child):
-            continue
-        rel = f"repos/{child.name}"
-        if rel in owned_paths:
-            continue
-        problems.append(_problem("error", "repository_unowned_product_path", f"collection layout contains unowned product path: {rel}", rel))
-    return tuple(problems)
-
-
-def _nested_git_root_problems(root: Path, rels: set[str]) -> tuple[dict[str, str], ...]:
-    problems: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for rel in sorted(rels):
-        path = root / rel
-        if not path.is_dir():
-            continue
-        root_marker = path / ".git"
-        for marker in path.rglob(".git"):
-            if marker == root_marker:
-                continue
-            nested_root = marker.parent
-            try:
-                nested_rel = nested_root.relative_to(root).as_posix()
-            except ValueError:
-                nested_rel = nested_root.as_posix()
-            if nested_rel in seen:
-                continue
-            seen.add(nested_rel)
-            problems.append(_problem("error", "repository_topology_invalid", f"nested git repository is not allowed under product repository: {nested_rel}", nested_rel))
-    return tuple(problems)
-
-
-def _validate_no_nested_targets(targets: list[RepoTarget] | tuple[RepoTarget, ...]) -> None:
-    rels = sorted(target.display_path for target in targets)
-    for index, rel in enumerate(rels):
-        for other in rels[index + 1 :]:
-            if other.startswith(f"{rel}/"):
-                raise RepoctlError(f"nested repository paths are not allowed: {rel} and {other}")
-
-
 def _layout_from_settings(root: Path, settings: dict[str, Any]) -> RepoLayout:
-    configured = _configured_targets(root, settings, allow_unconfigured=True)
-    if configured is not None:
-        placement = "collection" if len(configured) > 1 or any("/" in target.display_path for target in configured) else "direct"
-        discovered = _discover_git_roots(root)
-        configured_paths = {target.display_path for target in configured}
-        extras = sorted(path for path in discovered if path not in configured_paths)
-        candidates = _candidates_for_discovered(root, extras)
-        topology_problems = _nested_git_root_problems(root, configured_paths)
-        unowned = _unowned_product_paths(root, configured_paths | set(discovered)) if placement == "collection" else ()
-        problems = (*topology_problems, *unowned)
-        ready = not candidates and not problems
-        layout = RepoLayout(placement, configured, candidates=candidates, registry_ready=ready, problems=problems)
-        return RepoLayout(placement, configured, candidates=candidates, registry_ready=ready, problems=problems, revision=_revision(layout.to_dict()))
-
+    configured = _configured_targets(root, settings)
     discovered = _discover_git_roots(root)
-    if not discovered:
-        if (root / "repos").exists():
-            problem = _problem("error", "repository_git_unavailable", "repository path is not a git top-level: repos", "repos")
-            layout = RepoLayout("direct", (), registry_ready=False, problems=(problem,))
-            return RepoLayout("direct", (), registry_ready=False, problems=(problem,), revision=_revision(layout.to_dict()))
-        layout = RepoLayout("empty", (), registry_ready=True)
-        return RepoLayout("empty", (), registry_ready=True, revision=_revision(layout.to_dict()))
-    if "repos" in discovered and len(discovered) > 1:
-        raise RepoctlError(
-            f"ambiguous product repositories detected; configure docs/repoctl.json repositories: {', '.join(discovered)}",
-            code="repository_topology_invalid",
-            path="repos",
-        )
-    if discovered == ["repos"]:
-        targets = (_target(root, "main", "repos", identity_source="reserved"),)
-        problems = _nested_git_root_problems(root, {"repos"})
-        ready = not problems
-        layout = RepoLayout("direct", targets, registry_ready=ready, problems=problems)
-        return RepoLayout("direct", targets, registry_ready=ready, problems=problems, revision=_revision(layout.to_dict()))
-    candidates = _candidates_for_discovered(root, discovered)
-    problems = (*_nested_git_root_problems(root, set(discovered)), *_unowned_product_paths(root, set(discovered)))
-    layout = RepoLayout("collection", (), candidates=candidates, registry_ready=False, problems=problems)
-    return RepoLayout("collection", (), candidates=candidates, registry_ready=False, problems=problems, revision=_revision(layout.to_dict()))
+    if configured is not None:
+        extras = [path for path in discovered if path not in {target.display_path for target in configured}]
+        layout = RepoLayout("collection", configured, candidates=_candidates_for_discovered(root, extras))
+    elif "repos" in discovered:
+        layout = RepoLayout("direct", (_target(root, "main", "repos", identity_source="reserved"),))
+    else:
+        candidates = _candidates_for_discovered(root, discovered)
+        layout = RepoLayout("collection" if candidates else "empty", (), candidates=candidates, registry_ready=not candidates)
+    return RepoLayout(layout.placement, layout.targets, layout.candidates, layout.registry_ready, _revision(layout.to_dict()))
 
 
 def repo_layout(root: Path) -> RepoLayout:
@@ -421,8 +288,6 @@ def repo_layout(root: Path) -> RepoLayout:
 
 def default_repo_target(root: Path, *, layout: RepoLayout | None = None) -> RepoTarget | None:
     layout = layout or repo_layout(root)
-    if not layout.registry_ready:
-        raise RepoctlError("repository identities are unbound; run repoctl repo adopt before mutating product repositories", code="repository_identity_unbound")
     if not layout.targets:
         return None
     if len(layout.targets) > 1:
@@ -450,47 +315,16 @@ def evidence_target(root: Path, *, repo_id: str | None = None, workspace: bool =
 
 def require_repo_target(root: Path, repo_id: str | None = None, *, layout: RepoLayout | None = None) -> RepoTarget:
     layout = layout or repo_layout(root)
-    if not layout.registry_ready:
-        raise RepoctlError("repository identities are unbound; run repoctl repo adopt before mutating product repositories", code="repository_identity_unbound")
     if not layout.targets:
         raise RepoctlError("product repository is missing", code="repository_not_found")
     if repo_id:
         for target in layout.targets:
             if target.id == repo_id:
                 return _require_git_target(root, target)
-        if repo_id == "main" and not layout.targets:
-            return RepoTarget("main", root / "repos", "repos", "reserved")
         raise RepoctlError(f"repository not found: {repo_id}", code="repository_not_found")
     if len(layout.targets) > 1:
         raise RepoctlError("multiple product repositories configured; pass --repo-id", code="repository_selector_required")
     return _require_git_target(root, layout.targets[0])
-
-
-def resolve_task_repo_target(
-    root: Path,
-    *,
-    repo_id: str = "",
-    repo_scoped: bool,
-    layout: RepoLayout | None = None,
-    task_path: str = "",
-) -> RepoTarget | None:
-    """Apply one repository-selection policy for every task command."""
-
-    try:
-        if repo_id:
-            return require_repo_target(root, repo_id=repo_id, layout=layout)
-        if repo_scoped:
-            return default_repo_target(root, layout=layout)
-        return None
-    except RepoctlError as exc:
-        if not task_path or exc.path:
-            raise
-        raise RepoctlError(
-            str(exc),
-            code=exc.code,
-            path=task_path,
-            cause_code=exc.cause_code,
-        ) from exc
 
 
 def repo_check_problems(root: Path, layout: RepoLayout) -> list[dict[str, str]]:
@@ -514,7 +348,7 @@ def repo_check_problems(root: Path, layout: RepoLayout) -> list[dict[str, str]]:
         for candidate in layout.candidates:
             problems.append(
                 {
-                    "severity": "error",
+                    "severity": "warning",
                     "code": "repository_identity_unbound",
                     "message": f"repository candidate has no pinned stable id: {candidate.display_path}",
                     "path": candidate.display_path,
@@ -523,231 +357,23 @@ def repo_check_problems(root: Path, layout: RepoLayout) -> list[dict[str, str]]:
     return problems
 
 
-def _completion_receipt_task_scope(root: Path, receipt_path: Path, payload: Mapping[str, Any]) -> TaskRepositoryScope:
-    raw_task_path = payload.get("task_path_at_completion")
-    task_id = payload.get("task_id")
-    if not isinstance(raw_task_path, str) or not isinstance(task_id, str):
-        return TaskRepositoryScope.INVALID
-    if (
-        raw_task_path != raw_task_path.strip()
-        or "\\" in raw_task_path
-        or not re.fullmatch(r"T-[0-9]{14}Z", task_id)
-        or receipt_path.stem != task_id
-    ):
-        return TaskRepositoryScope.INVALID
-    task_path = PurePosixPath(raw_task_path)
-    if task_path.is_absolute() or ".." in task_path.parts or task_path.parent.as_posix() not in {"docs/tasks", "docs/archive/tasks"}:
-        return TaskRepositoryScope.INVALID
-    if not task_path.name.startswith(f"{task_id}--") or task_path.suffix != ".md":
-        return TaskRepositoryScope.INVALID
-
-    exact = root / raw_task_path
-    if not exact.is_file():
-        return TaskRepositoryScope.INVALID
-
-    try:
-        root_resolved = root.resolve()
-        resolved = exact.resolve(strict=True)
-        relative = resolved.relative_to(root_resolved)
-        if PurePosixPath(relative.as_posix()).parent.as_posix() not in {"docs/tasks", "docs/archive/tasks"}:
-            return TaskRepositoryScope.INVALID
-        frontmatter, _body = parse_frontmatter(resolved.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError, RepoctlError):
-        return TaskRepositoryScope.INVALID
-    if frontmatter.get("id") != task_id or frontmatter.get("status") != "done":
-        return TaskRepositoryScope.INVALID
-    return task_repository_scope(frontmatter)
-
-
-def repository_state_namespaces(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    namespaces: dict[str, dict[str, Any]] = {}
-    problems: list[dict[str, str]] = []
-
-    def add(repo_id: str, *, source: RepositoryStateSource, path: Path) -> None:
-        normalized = repo_id.strip()
-        rel = path.relative_to(root).as_posix()
-        if not normalized:
-            problems.append(_problem("error", "repository_state_identity_missing", "repository-scoped state is missing repo_id", rel))
-            return
-        item = namespaces.setdefault(normalized, {"repo_id": normalized, "sources": set(), "paths": []})
-        item["sources"].add(source)
-        item["paths"].append(rel)
-
-    def add_json(path: Path, *, source: RepositoryStateSource) -> None:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            problems.append(_problem("error", "repository_state_invalid", str(exc), path.relative_to(root).as_posix()))
-            return
-        if not isinstance(payload, dict):
-            problems.append(_problem("error", "repository_state_invalid", "repository-scoped state must be a JSON object", path.relative_to(root).as_posix()))
-            return
-        raw_repo_id = payload.get("repo_id")
-        if source is RepositoryStateSource.KNOWLEDGE_RECORD and raw_repo_id == "" and payload.get("schema_version") == 2:
-            return
-        if source is RepositoryStateSource.COMPLETION_RECEIPT and raw_repo_id == "":
-            if _completion_receipt_task_scope(root, path, payload) is TaskRepositoryScope.WORKSPACE:
-                return
-            # A missing archived Task is missing source evidence, not an
-            # invented repository identity. Preserve this distinction for
-            # one-time adopter repair without manufacturing completed bytes.
-            declared = payload.get("task_path_at_completion")
-            task_id = payload.get("task_id")
-            if (isinstance(declared, str) and isinstance(task_id, str)
-                    and task_id == path.stem and re.fullmatch(r"T-[0-9]{14}Z", task_id)
-                    and declared == declared.strip() and "\\" not in declared):
-                rel_task = PurePosixPath(declared)
-                if (not rel_task.is_absolute() and ".." not in rel_task.parts
-                        and rel_task.parent.as_posix() in {"docs/tasks", "docs/archive/tasks"}
-                        and rel_task.name.startswith(f"{task_id}--") and rel_task.suffix == ".md"):
-                    exact = root / declared
-                    if not exact.is_file() and not exact.is_symlink():
-                        problems.append(_problem(
-                            "error", "repository_completion_task_missing",
-                            f"completion receipt declares a missing Task source: {declared}",
-                            path.relative_to(root).as_posix(),
-                        ))
-                        return
-        add(str(raw_repo_id or ""), source=source, path=path)
-
-    for state_root, source in (
-        (root / ".repoctl-state/graph", RepositoryStateSource.GRAPH),
-    ):
-        if not state_root.is_dir():
-            continue
-        for path in sorted(item for item in state_root.iterdir() if item.is_dir()):
-            if path.name == "_workspace":
-                try:
-                    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-                    if manifest.get("repository") == workspace_target(root).to_dict():
-                        continue
-                except (OSError, ValueError):
-                    pass
-            if any(child.is_file() for child in path.rglob("*")):
-                add(path.name, source=source, path=path)
-
-    for directory, pattern, source in (
-        (root / "docs/knowledge/records", "K-*.json", RepositoryStateSource.KNOWLEDGE_RECORD),
-        (root / "docs/tasks/.repoctl-state/completions", "T-*.json", RepositoryStateSource.COMPLETION_RECEIPT),
-    ):
-        if directory.is_dir():
-            for path in sorted(directory.glob(pattern)):
-                add_json(path, source=source)
-
-    result: list[dict[str, Any]] = []
-    for repo_id, item in sorted(namespaces.items()):
-        paths = sorted(set(str(path) for path in item["paths"]))
-        sources = sorted(item["sources"], key=lambda source: source.value)
-        identity_binding = (
-            RepositoryStateIdentityBinding.REQUIRED
-            if any(source.identity_binding is RepositoryStateIdentityBinding.REQUIRED for source in sources)
-            else RepositoryStateIdentityBinding.HISTORICAL
-        )
-        result.append(
-            {
-                "repo_id": repo_id,
-                "sources": [source.value for source in sources],
-                "identity_binding": identity_binding.value,
-                "path_count": len(paths),
-                "paths": paths[:20],
-                "paths_truncated": len(paths) > 20,
-            }
-        )
-    return result, problems
-
-
-def unbound_repository_state_namespaces(namespaces: list[dict[str, Any]], *, repo_ids: set[str]) -> list[dict[str, Any]]:
-    unbound: list[dict[str, Any]] = []
-    for item in namespaces:
-        if str(item.get("repo_id") or "") in repo_ids:
-            continue
-        try:
-            binding = RepositoryStateIdentityBinding(str(item.get("identity_binding") or ""))
-        except ValueError:
-            binding = RepositoryStateIdentityBinding.REQUIRED
-        if binding is RepositoryStateIdentityBinding.REQUIRED:
-            unbound.append(item)
-    return unbound
-
-
-def _require_bound_repository_state(root: Path, *, repo_ids: set[str]) -> None:
-    namespaces, problems = repository_state_namespaces(root)
-    if problems:
-        first = problems[0]
-        raise RepoctlError(first["message"], code=first["code"], path=first["path"])
-    unbound = unbound_repository_state_namespaces(namespaces, repo_ids=repo_ids)
-    if not unbound:
-        return
-    ids = ", ".join(str(item["repo_id"]) for item in unbound)
-    paths = [str(path) for item in unbound for path in item.get("paths", []) if str(path)]
-    raise RepoctlError(
-        f"repository-scoped state is not bound to the adopted repository identities: {ids}; do not guess a state migration",
-        code="repository_state_identity_unbound",
-        path=paths[0] if paths else ".repoctl-state",
-    )
-
-
 def adopt_repositories(root: Path, *, all_candidates: bool = False, path: str = "", repo_id: str = "") -> RepoLayout:
     layout = repo_layout(root)
-    if not layout.candidates:
-        raise RepoctlError("no unbound repository candidates to adopt")
     if all_candidates and repo_id:
-        raise RepoctlError("--id can only be used when adopting one repository candidate")
-    selected: list[RepoCandidate]
+        raise RepoctlError("--id selects one repository; omit it with --all")
     if all_candidates:
-        selected = list(layout.candidates)
+        selected = [(candidate.suggested_id, candidate.display_path) for candidate in layout.candidates]
     else:
         rel = _safe_rel(path)
-        selected = [candidate for candidate in layout.candidates if candidate.display_path == rel]
-        if not selected:
-            raise RepoctlError(f"repository candidate not found: {rel}", code="repository_not_found")
+        selected = [(repo_id or ("main" if rel == "repos" else _suggested_id_for_candidate(rel)), rel)]
+    if not selected:
+        raise RepoctlError("no repository candidates to adopt")
     settings = load_repoctl_settings(root)
-    raw_entries = settings.get("repositories", [])
-    if raw_entries is None:
-        raw_entries = []
-    if not isinstance(raw_entries, list):
-        raise RepoctlError("docs/repoctl.json repositories must be an array")
-
-    entries: list[dict[str, str]] = []
-    ids: set[str] = set()
-    paths: set[str] = set()
-    for item in raw_entries:
-        if not isinstance(item, dict):
-            raise RepoctlError("docs/repoctl.json repositories entries must be objects")
-        existing_id = item.get("id")
-        existing_path = item.get("path")
-        if not isinstance(existing_id, str) or not isinstance(existing_path, str):
-            raise RepoctlError("repository entries require string id and path")
-        folded = _casefold_id(existing_id.strip())
-        rel = _safe_rel(existing_path)
-        if folded in ids:
-            raise RepoctlError(f"duplicate repository id: {existing_id}")
-        if rel in paths:
-            raise RepoctlError(f"duplicate repository path: {rel}")
-        ids.add(folded)
-        paths.add(rel)
-        entries.append({"id": existing_id.strip(), "path": rel})
-
-    for candidate in selected:
-        chosen_id = repo_id.strip() if repo_id else candidate.suggested_id
-        if not REPO_ID_RE.match(chosen_id):
-            raise RepoctlError(f"invalid repository id: {chosen_id}", code="repository_topology_invalid", path=candidate.display_path)
-        folded = _casefold_id(chosen_id)
-        if folded in ids:
-            raise RepoctlError(f"duplicate repository id: {chosen_id}", code="repository_topology_invalid")
-        ids.add(folded)
-        if candidate.display_path in paths:
-            raise RepoctlError(f"duplicate repository path: {candidate.display_path}", code="repository_topology_invalid")
-        paths.add(candidate.display_path)
-        entries.append({"id": chosen_id, "path": candidate.display_path})
-
-    new_settings = dict(settings)
-    new_settings["repositories"] = entries
+    entries = [{"id": target.id, "path": target.display_path} for target in layout.targets]
+    for identity, rel in selected:
+        _target(root, identity, rel, identity_source="pinned")
+        entries.append({"id": identity, "path": rel})
+    new_settings = {**settings, "repositories": entries}
     validated = _layout_from_settings(root, new_settings)
-    _require_bound_repository_state(root, repo_ids={target.id for target in validated.targets})
-    docs_dir = root / "docs"
-    docs_dir.mkdir(parents=True, exist_ok=True)
-    config_path = docs_dir / "repoctl.json"
-    rendered = json.dumps(new_settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    atomic_write(config_path, rendered)
+    atomic_write(root / "docs/repoctl.json", json.dumps(new_settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     return validated

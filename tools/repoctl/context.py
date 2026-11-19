@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-import json
 import re
 from typing import Any
 
@@ -41,11 +40,7 @@ from .context_retrieval import (
     retrieve_context_balanced,
 )
 from .context_sources import collect_context_sources, context_document_paths, context_graph_problems, context_overlay_chunks, current_source_chunks_for_paths
-from .completion_catalogue import (
-    CompletionCatalogueUnavailable,
-    completion_catalogue_status,
-    search_completion_history,
-)
+from .task_history import search_task_history
 from .component_projection import component_projection
 from .document_roles import AUTHORITY_DOCUMENT_ROLES, DocumentRole, source_document_role
 from .evidence_store import evidence_chunks_for_paths, query_evidence_index
@@ -53,7 +48,7 @@ from .graph import build_context_projection_index, compact_relationship_candidat
 from .graph_model import GraphContextAnchor, GraphContextAnchorKind, digest_data, symbol_id
 from .graph_store import compact_graph_freshness, graph_materialization_freshness, graph_stale_paths, load_materialized_graph
 from .graph_structured_relations import STRUCTURED_EDGE_KIND
-from .io import RepoctlError
+from .io import Problem, RepoctlError
 from .knowledge_records import (
     KnowledgeExplicitPathKind,
     KnowledgeExplicitPathRole,
@@ -62,7 +57,7 @@ from .knowledge_records import (
 )
 from .path_roles import is_test_path
 from .repositories import RepoSelectorStatus, RepoTarget, resolve_repo_selector_path
-from .tasks import Problem, completion_receipt_authority_exists, normalize_task_id
+from .tasks import normalize_task_id
 
 
 CONTEXT_GROUPS = (
@@ -80,13 +75,12 @@ COMPACT_ITEM_LIMIT = 8
 COMPACT_CONTINUATION_LIMIT = 8
 GRAPH_ANCHOR_LIMIT = 3
 EXPLICIT_TASK_HISTORY_LIMIT = 2
-_TASK_ID_QUERY_RE = re.compile(r"T-[0-9]{14}Z")
+_TASK_ID_QUERY_RE = re.compile(r"T-[0-9]{14}Z(?:-[a-f0-9]{8})?")
 ACTIONABLE_PRODUCT_KINDS = CONTEXT_SOURCE_KIND_VALUES
 LEXICAL_GRAPH_ANCHOR_KINDS = LEXICAL_CONTEXT_SOURCE_KIND_VALUES
 GRAPH_DERIVED_CONTEXT_EVIDENCE_KINDS = {
     ContextEvidenceKind.GRAPH_SEED,
     ContextEvidenceKind.GRAPH_RELATION,
-    ContextEvidenceKind.HISTORY_CORROBORATION,
 }
 _LEXICAL_QUERY_EVIDENCE_KINDS = {
     ContextEvidenceKind.PATH_TERMS,
@@ -175,7 +169,6 @@ def _coverage_selected_component_ids(
 CONTEXT_GRAPH_FRESHNESS_WARNING_CODES = frozenset(
     {
         "context_graph_stale",
-        "context_task_history_stale",
         "context_graph_freshness_unavailable",
     }
 )
@@ -316,17 +309,14 @@ def build_graph_source_evidence(
             for key in ("document_manifest_digest", "current_source_manifest_digest", "snapshot_digest")
             if index_meta.get(key)
         }
-        receipt_problems = snapshot.completeness.get("receipt_problems", []) if snapshot is not None else []
         completeness = {
             "documents_checked": int(indexed_source_path_counts.get("document") or 0),
             "manifests_checked": int(indexed_source_path_counts.get("product_manifest") or 0),
-            "receipts_checked": int(indexed_source_path_counts.get("completion_receipt") or 0),
+            "tasks_checked": 0,
             "current_sources_checked": int(indexed_source_path_counts.get("current_source") or 0)
             + int(indexed_source_path_counts.get("config") or 0)
             + int(indexed_source_path_counts.get("structured_data") or 0),
             "history_loaded": False,
-            "receipt_problem_count": len(receipt_problems),
-            "receipt_problem_paths": sorted(str(problem.get("path") or "") for problem in receipt_problems if isinstance(problem, dict) and problem.get("path")),
             "graph_available": snapshot is not None,
             "graph_meta": graph_meta,
         }
@@ -350,16 +340,6 @@ def build_graph_source_evidence(
             completeness["graph_completeness"] = snapshot.completeness
         problems.extend(problem for problem in index_problems if problem.severity != "error")
         problems.extend(evidence_index_problems)
-        receipt_graph_problems = [
-            Problem(
-                str(problem.get("severity") or "warning"),
-                str(problem.get("code") or "invalid_completion_receipt"),
-                str(problem.get("message") or "completion receipt is invalid"),
-                str(problem.get("path") or ""),
-            )
-            for problem in receipt_problems
-            if isinstance(problem, dict)
-        ]
         problems.extend(
             context_graph_problems(
                 [
@@ -368,7 +348,6 @@ def build_graph_source_evidence(
                         for problem in graph_problems
                         if problem not in evidence_index_problems
                     ),
-                    *receipt_graph_problems,
                 ],
                 graph_available=snapshot is not None,
             )
@@ -416,14 +395,6 @@ def build_graph_source_evidence(
     problems.extend(problem for problem in freshness_problems if problem.severity == "error")
     explicit_history_candidates: list[ContextCandidate] = []
     completeness["graph_freshness"] = freshness
-    if _task_history_stale(freshness) and isinstance(completeness.get("graph_completeness"), dict):
-        graph_completeness = dict(completeness["graph_completeness"])
-        capabilities = dict(graph_completeness.get("capabilities") or {})
-        capabilities["task_history"] = "partial"
-        graph_completeness["capabilities"] = capabilities
-        graph_completeness["status"] = "partial"
-        graph_completeness["task_history_fresh"] = False
-        completeness["graph_completeness"] = graph_completeness
     knowledge_data: dict[str, Any] = {}
     knowledge_results: list[dict[str, Any]] = []
     knowledge_path_resolutions: dict[str, list[dict[str, Any]]] = {}
@@ -681,7 +652,6 @@ def build_graph_source_evidence(
         graph_projection = _fresh_graph_projection(
             graph_projection,
             stale_paths=stale_paths,
-            task_history_stale=_task_history_stale(freshness),
         )
         if graph_anchor_resolution.status == ContextAnchorStatus.RESOLVED:
             graph_candidates, graph_warnings, graph_projection = _graph_context_candidates(
@@ -708,13 +678,9 @@ def build_graph_source_evidence(
             freshness_problems=freshness_problems,
         )
     )
-    # Cold history is deliberately loaded only after current retrieval,
-    # ranking anchors, Graph traversal, and component projection are fixed.
-    # It is appended to the isolated related_history lane below and cannot
-    # participate in those current-state decisions.
+    # Read historical Task documents after current-source selection.
     (
         explicit_history_candidates,
-        _explicit_history_owned_paths,
         explicit_history_completeness,
         explicit_history_warnings,
     ) = _explicit_task_history_candidates(
@@ -722,10 +688,6 @@ def build_graph_source_evidence(
         target=target,
         query=query,
         enabled=explicit_history,
-        observed_receipt_count=(
-            int(completeness.get("receipts_checked") or 0)
-            + int(completeness.get("receipt_problem_count") or 0)
-        ),
     )
     completeness["explicit_task_history"] = explicit_history_completeness
     completeness["history_loaded"] = explicit_history_completeness["status"] in {
@@ -793,11 +755,6 @@ def build_graph_source_evidence(
         target=target,
         completeness=completeness,
         graph_warnings=graph_warnings,
-        related_history=_related_path_history(
-            target=target,
-            evidence=evidence,
-            history=graph_projection.get("history", []) if include_linked_records and isinstance(graph_projection.get("history"), list) else [],
-        ),
     )
     for group in ("likely_change_surface", "tests_and_verification"):
         for item in groups[group]:
@@ -976,181 +933,27 @@ def normalize_context_mode(explicit_mode: str = "") -> str:
 
 
 def _explicit_task_history_candidates(
-    root: Path,
-    *,
-    target: RepoTarget,
-    query: str,
-    enabled: bool,
-    observed_receipt_count: int,
-) -> tuple[
-    list[ContextCandidate],
-    dict[str, list[str]],
-    dict[str, Any],
-    list[Problem],
-]:
-    """Run the only Context cold-history scan, behind an explicit mode."""
-
+    root: Path, *, target: RepoTarget, query: str, enabled: bool,
+) -> tuple[list[ContextCandidate], dict[str, Any], list[Problem]]:
     if not enabled:
-        return (
-            [],
-            {},
-            {
-                "status": "disabled",
-                "code": "context_explicit_task_history_disabled",
-                "scanned_event_count": 0,
-                "matched_event_count": 0,
-                "selected_record_count": 0,
-                "truncated": False,
-            },
-            [],
-        )
-    if not _has_completion_receipts(root, target.id, observed_receipt_count):
-        return (
-            [],
-            {},
-            {
-                "status": "not_applicable",
-                "code": "context_explicit_task_history_empty",
-                "scanned_event_count": 0,
-                "matched_event_count": 0,
-                "selected_record_count": 0,
-                "truncated": False,
-            },
-            [],
-        )
-
-    query_terms = context_query_terms(query)
-    task_ids = sorted(set(_TASK_ID_QUERY_RE.findall(query)))
-    try:
-        search = search_completion_history(
-            root,
-            target.id,
-            query_terms=query_terms,
-            task_ids=task_ids,
-            limit=EXPLICIT_TASK_HISTORY_LIMIT,
-        )
-    except CompletionCatalogueUnavailable as exc:
-        completeness = {
-            "status": "unavailable",
-            "code": "context_explicit_task_history_unavailable",
-            "reason": exc.reason.value,
-            "scanned_event_count": 0,
-            "matched_event_count": 0,
-            "selected_record_count": 0,
-            "truncated": False,
-        }
-        return (
-            [],
-            {},
-            completeness,
-            [
-                Problem(
-                    "warning",
-                    "context_explicit_task_history_unavailable",
-                    "explicit completion history is unavailable; current source and Graph evidence remain available",
-                    exc.path or target.display_path,
-                    exc.reason.value,
-                )
-            ],
-        )
-    except (OSError, RepoctlError, ValueError) as exc:
-        reason = str(getattr(exc, "code", "context_explicit_task_history_invalid"))
-        return (
-            [],
-            {},
-            {
-                "status": "unavailable",
-                "code": "context_explicit_task_history_unavailable",
-                "reason": reason,
-                "scanned_event_count": 0,
-                "matched_event_count": 0,
-                "selected_record_count": 0,
-                "truncated": False,
-            },
-            [
-                Problem(
-                    "warning",
-                    "context_explicit_task_history_unavailable",
-                    "explicit completion history is unavailable; current source and Graph evidence remain available",
-                    str(getattr(exc, "path", "") or target.display_path),
-                    reason,
-                )
-            ],
-        )
-
+        return [], {"status": "disabled", "scanned_task_count": 0, "matched_task_count": 0, "returned_count": 0, "truncated": False}, []
+    matches, summary, problems = search_task_history(root, target.id, query_terms=context_query_terms(query), task_ids=_TASK_ID_QUERY_RE.findall(query), limit=EXPLICIT_TASK_HISTORY_LIMIT)
     candidates: list[ContextCandidate] = []
-    owned_paths_by_task: dict[str, list[str]] = {}
-    for match in search.records:
-        task_id = match.record.task_id
-        receipt = match.record.receipt
-        owned_paths_by_task[task_id] = sorted(
-            {
-                str(entry.get("path") or "")
-                for entry in receipt.get("changed_entries", [])
-                if isinstance(entry, dict)
-                and str(entry.get("path") or "")
-                and (target.root_path / str(entry.get("path") or "")).is_file()
-            }
-        )
-        chunk = chunk_text_source(
-            root,
-            match.record.artifact_path,
-            match.artifact_text,
-            kind="task_artifact",
-            section=task_id,
-            section_kind=ContextSectionKind.TASK,
-        )
-        candidates.append(
-            ContextCandidate(
-                source_ref=chunk.source_ref,
-                text=excerpt_for_query(match.artifact_text, query, limit=700),
-                score=float(100 if match.exact_task else len(match.matched_terms)),
-                score_breakdown={
-                    "identity": 1.0 if match.exact_task else 0.0,
-                    "body": float(len(match.matched_terms)),
-                },
-                selection_reasons=[
-                    "exact completion task match"
-                    if match.exact_task
-                    else "explicit completion history term match",
-                    "explicit completion history matched changed paths: "
-                    + ", ".join(owned_paths_by_task.get(task_id, ())),
-                ],
-                evidence_kinds=(
-                    (ContextEvidenceKind.EXACT_TASK,)
-                    if match.exact_task
-                    else (ContextEvidenceKind.BODY_TERMS,)
-                ),
-                anchor_strength=(
-                    ContextAnchorStrength.EXACT
-                    if match.exact_task
-                    else ContextAnchorStrength.WEAK
-                ),
-                query_term_matches={"body": match.matched_terms},
-            )
-        )
-    status = (
-        "partial"
-        if search.truncated or search.search_terms_truncated_event_count
-        else "available"
-    )
-    completeness = {
-        "status": status,
-        "code": (
-            "context_explicit_task_history_partial"
-            if status == "partial"
-            else "context_explicit_task_history_available"
-        ),
-        "scanned_event_count": search.scanned_event_count,
-        "matched_event_count": search.matched_event_count,
-        "selected_record_count": len(search.records),
-        "result_limit": EXPLICIT_TASK_HISTORY_LIMIT,
-        "truncated": search.truncated,
-        "search_terms_truncated_event_count": search.search_terms_truncated_event_count,
-        "checkpoint_sequence": search.checkpoint_sequence,
-        "prefix_digest": search.prefix_digest,
-    }
-    return candidates, owned_paths_by_task, completeness, []
+    for match in matches:
+        task = match["entry"]
+        exact = match["exact_task_id"]
+        terms = match["matched_terms"]
+        chunk = chunk_text_source(root, task.path, task.text, kind="task_artifact", section=task.task_id, section_kind=ContextSectionKind.TASK)
+        candidates.append(ContextCandidate(
+            source_ref=chunk.source_ref, text=excerpt_for_query(task.text, query, limit=700),
+            score=float(100 if exact else len(terms)), score_breakdown={"identity": 1.0 if exact else 0.0, "body": float(len(terms))},
+            selection_reasons=["exact Task ID" if exact else "completed Task text matches query"],
+            evidence_kinds=(ContextEvidenceKind.EXACT_TASK,) if exact else (ContextEvidenceKind.BODY_TERMS,),
+            anchor_strength=ContextAnchorStrength.EXACT if exact else ContextAnchorStrength.WEAK,
+            query_term_matches={"body": terms},
+        ))
+    status = "partial" if problems or summary["truncated"] else "available"
+    return candidates, {**summary, "status": status}, problems
 
 
 def _project_knowledge_summary(
@@ -1183,7 +986,7 @@ def _project_knowledge_summary(
         },
         "task_history": {
             "loaded": bool(completeness.get("history_loaded")),
-            "checked_receipt_count": int(completeness.get("receipts_checked") or 0)
+            "checked_task_count": int((completeness.get("explicit_task_history") or {}).get("scanned_task_count") or completeness.get("tasks_checked") or 0)
             if completeness.get("history_loaded")
             else None,
             "result_count": len(task_refs) if completeness.get("history_loaded") else None,
@@ -1245,7 +1048,6 @@ def _fresh_graph_projection(
     projection: dict[str, Any],
     *,
     stale_paths: set[str],
-    task_history_stale: bool,
 ) -> dict[str, Any]:
     relations = projection.get("relations") if isinstance(projection.get("relations"), list) else []
     fresh_seed_paths = [path for path in projection.get("seed_paths", []) if str(path) not in stale_paths]
@@ -1286,36 +1088,13 @@ def _fresh_graph_projection(
         if isinstance(projection.get("relationship_candidates"), list)
         else []
     )
-    history = projection.get("history") if isinstance(projection.get("history"), list) else []
-    fresh_history = (
-        []
-        if task_history_stale
-        else [
-            item
-            for item in history
-            if isinstance(item, dict) and str(item.get("path") or "") in reachable_paths
-        ]
-    )
     return {
         **projection,
         "seed_paths": fresh_seed_paths,
         "related_paths": fresh_related_paths,
         "relations": fresh_relations,
         "relationship_candidates": fresh_relationship_candidates,
-        "history": fresh_history,
     }
-
-
-def _task_history_stale(freshness: dict[str, Any]) -> bool:
-    prefixes = (
-        "docs/tasks/.repoctl-state/completions/",
-        "docs/tasks/",
-        "docs/archive/tasks/",
-    )
-    return any(
-        str(path).startswith(prefixes)
-        for path in freshness.get("changed_root_paths", [])
-    )
 
 
 def _query_term_match_set(matches: dict[str, Any]) -> frozenset[str]:
@@ -1343,16 +1122,8 @@ def context_graph_freshness_warnings(
                 "message": f"Graph snapshot is stale for {stale_source_count} product path(s) and {stale_root_count} workspace evidence path(s); stale evidence was excluded or overlaid from current files",
             }
         )
-    if _task_history_stale(freshness):
-        warnings.append(
-            {
-                "code": "context_task_history_stale",
-                "message": "Task receipt or artifact evidence changed after Graph materialization; related history is omitted until Graph is rebuilt",
-            }
-        )
     if any(
         problem.severity == "warning"
-        and problem.code != "graph_metadata_unavailable"
         for problem in freshness_problems or []
     ):
         warnings.append(
@@ -1420,18 +1191,9 @@ def _markdown_coverage_lines(label: str, coverage: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _render_next_guidance(actions: list[dict[str, Any]] | None, fallback: str, *, markdown: bool) -> list[str]:
-    if actions is None:
-        return [f"- Next narrow action: {fallback}" if markdown else f"next {fallback}"]
-    prefix = "- Next" if markdown else "next"
-    return [
-        f"{prefix} ({action.get('priority', 'recommended')}): "
-        f"{action.get('path') or action.get('command') or action.get('label', '')}"
-        for action in actions
-    ]
 
 
-def render_graph_source_markdown(bundle: GraphSourceEvidence, *, next_actions: list[dict[str, Any]] | None = None) -> str:
+def render_graph_source_markdown(bundle: GraphSourceEvidence) -> str:
     data = bundle.to_dict()
     query = data["query"]
     projection = _bundle_final_projection(
@@ -1445,20 +1207,10 @@ def render_graph_source_markdown(bundle: GraphSourceEvidence, *, next_actions: l
     )
     graph_anchor = compact_completeness.get("graph_anchor") if isinstance(compact_completeness.get("graph_anchor"), dict) else {}
     working_set_coverage = compact_completeness.get("working_set_coverage") if isinstance(compact_completeness.get("working_set_coverage"), dict) else {}
-    guide = compact_graph_source_evidence(bundle).get("guide", {})
-    implementation = guide.get("first_implementation_file", {})
-    test = guide.get("test", {})
-    rule = guide.get("relevant_rule", {})
-    prior = guide.get("prior_reason", {})
     lines = [
         "# Graph Source Evidence",
         "",
-        f"- Current intent: {guide.get('current_intent', query.get('text', ''))}",
-        f"- First implementation file: `{implementation.get('path', '')}` — {implementation.get('reason', '') or implementation.get('status', '')}",
-        f"- Test: `{test.get('status', 'unconfirmed')}` `{test.get('path', '')}` — {test.get('reason', '')}",
-        f"- Relevant rule: `{rule.get('path', '')}` — {rule.get('reason', '')}",
-        f"- Prior reason: `{prior.get('path', '')}` — {prior.get('reason', '')}",
-        *_render_next_guidance(next_actions, guide.get("next_narrow_action", ""), markdown=True),
+        f"- Query: {query.get('text', '')}",
         f"- Mode: `{query.get('mode', '')}`",
         f"- Repository: `{bundle.repository.get('id', '')}`",
         f"- Graph evidence digest: `{bundle.evidence_digest}`",
@@ -1536,18 +1288,10 @@ def render_graph_source_markdown(bundle: GraphSourceEvidence, *, next_actions: l
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_graph_source_text(bundle: GraphSourceEvidence, *, next_actions: list[dict[str, Any]] | None = None) -> str:
+def render_graph_source_text(bundle: GraphSourceEvidence) -> str:
     data = compact_graph_source_evidence(bundle)
-    guide = data.get("guide") if isinstance(data.get("guide"), dict) else {}
-    implementation = guide.get("first_implementation_file") if isinstance(guide.get("first_implementation_file"), dict) else {}
-    test = guide.get("test") if isinstance(guide.get("test"), dict) else {}
     lines = [
-        f"intent {guide.get('current_intent', bundle.query.get('text', ''))}",
-        f"first_file {implementation.get('path', '')} - {implementation.get('reason', '') or implementation.get('status', '')}",
-        f"test status={test.get('status', 'unconfirmed')} path={test.get('path', '')} - {test.get('reason', '')}",
-        f"rule {(guide.get('relevant_rule') or {}).get('path', '')}",
-        f"prior_reason {(guide.get('prior_reason') or {}).get('path', '')}",
-        *_render_next_guidance(next_actions, guide.get("next_narrow_action", ""), markdown=False),
+        f"query {bundle.query.get('text', '')}",
         f"graph sources repository={bundle.repository.get('id', '')} mode={bundle.query.get('mode', '')}",
     ]
     graph_anchor = (
@@ -1637,13 +1381,7 @@ def render_graph_source_text(bundle: GraphSourceEvidence, *, next_actions: list[
     return "\n".join(lines).rstrip() + "\n"
 
 
-# Preserve every selected source ref and relationship; shorten only excerpts
-# when a large compact answer is near the release field-gate output ceiling.
-# This is a display budget, not a retrieval or evidence-selection threshold.
-MAX_COMPACT_CONTEXT_BYTES = 11920
-
-
-def compact_graph_source_evidence(bundle: GraphSourceEvidence, *, max_group_items: int = 8, excerpt_chars: int = 58) -> dict[str, Any]:
+def compact_graph_source_evidence(bundle: GraphSourceEvidence, *, max_group_items: int = 8, excerpt_chars: int = 180) -> dict[str, Any]:
     """Return a bounded agent-facing view without full evidence diagnostics."""
     projection = _bundle_final_projection(
         bundle,
@@ -1661,7 +1399,6 @@ def compact_graph_source_evidence(bundle: GraphSourceEvidence, *, max_group_item
         "authoritative": bundle.authoritative,
         "repository": bundle.repository,
         "query": bundle.query,
-        "guide": _context_query_guide(groups, query=bundle.query),
         "completeness": _compact_completeness(
             bundle.completeness,
             working_set_coverage=projection.stats.get("working_set_coverage"),
@@ -1677,78 +1414,9 @@ def compact_graph_source_evidence(bundle: GraphSourceEvidence, *, max_group_item
         "continuations": projection.continuations,
         "evidence_digest": bundle.evidence_digest,
     }
-    # One uncommon high-fanout query can exceed the compact-view budget even
-    # though paths, typed provenance and graph evidence are relevant. Shrink
-    # *only* human-readable excerpts; keep all sources, ordering, anchors,
-    # relation facts and continuations intact. Do not change benchmark gates
-    # or make a missing source appear resolved.
-    def serialized_bytes() -> int:
-        return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-
-    if serialized_bytes() > MAX_COMPACT_CONTEXT_BYTES:
-        for excerpt_limit in (48, 40, 32, 24, 16, 8):
-            payload["groups"] = {
-                group: [_compact_group_item(item, excerpt_chars=min(excerpt_chars, excerpt_limit)) for item in items]
-                for group, items in projection.groups.items()
-            }
-            payload["guide"] = _context_query_guide(payload["groups"], query=bundle.query)
-            if serialized_bytes() <= MAX_COMPACT_CONTEXT_BYTES:
-                break
     return payload
 
 
-def _context_query_guide(
-    groups: dict[str, list[dict[str, Any]]],
-    *,
-    query: dict[str, Any],
-) -> dict[str, Any]:
-    """Put the first useful reading decision ahead of retrieval diagnostics."""
-
-    def first(group: str) -> dict[str, Any] | None:
-        values = groups.get(group, [])
-        return values[0] if values else None
-
-    def summary(item: dict[str, Any] | None, *, status: str) -> dict[str, Any]:
-        if item is None:
-            return {"status": "unconfirmed", "path": "", "reason": ""}
-        source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
-        return {
-            "status": status,
-            "path": str(source_ref.get("path") or item.get("record_id") or ""),
-            # The group item preserves complete rationale; the guide is a
-            # bounded navigation hint, not a second copy of the explanation.
-            "reason": str(item.get("selection_reason") or item.get("status") or "")[:56],
-        }
-
-    implementation = first("likely_change_surface")
-    test = first("tests_and_verification")
-    test_provenance = test.get("provenance") if isinstance(test, dict) and isinstance(test.get("provenance"), dict) else {}
-    edge_kinds = test_provenance.get("edge_kinds") if isinstance(test_provenance.get("edge_kinds"), list) else []
-    test_status = "confirmed_direct_test" if "TESTS_FILE" in edge_kinds else "candidate" if test is not None else "unconfirmed"
-    rule = first("must_read")
-    prior = first("knowledge_records") or first("related_history")
-    implementation_summary = summary(implementation, status="candidate")
-    first_path = implementation_summary["path"]
-    next_action = (
-        f"Open {first_path} and inspect it against the cited reason."
-        if first_path
-        else "Open the relevant rule or refine the query to one implementation file."
-    )
-    if query.get("mode") == "startup_reading":
-        rule_path = summary(rule, status="source")["path"]
-        next_action = (
-            f"Open {rule_path}, then follow the project PRD index and selected repository guidance before choosing an implementation file."
-            if rule_path
-            else "Read AGENTS.md and the project PRD entry point, then confirm the selected repository guidance."
-        )
-    return {
-        "current_intent": str(query.get("text") or ""),
-        "first_implementation_file": implementation_summary,
-        "test": summary(test, status=test_status),
-        "relevant_rule": summary(rule, status="source"),
-        "prior_reason": summary(prior, status="recorded"),
-        "next_narrow_action": next_action,
-    }
 
 
 def _bundle_final_projection(
@@ -2272,7 +1940,6 @@ def _coverage_profile_anchor_rank_key(
     body_terms = _coverage_profile_body_terms(profile)
     return (
         _coverage_profile_identity_tier(profile),
-        0 if _coverage_profile_history_corroborated(profile) else 1,
         -_coverage_term_breadth_tier(body_terms),
         -len(body_terms),
         0 if _coverage_profile_graph_supported(profile) else 1,
@@ -2559,19 +2226,6 @@ def _apply_context_evidence_projection(
             ordered_paths=projection.ranked_test_paths,
         ),
     }
-
-
-def _has_completion_receipts(root: Path, repo_id: str = "main", observed_receipt_count: int = 0) -> bool:
-    """Use catalogue state or the fixed receipt authority; never scan task archives."""
-
-    if observed_receipt_count > 0:
-        return True
-    try:
-        if completion_catalogue_status(root, repo_id).status != "empty":
-            return True
-    except CompletionCatalogueUnavailable:
-        return True
-    return completion_receipt_authority_exists(root, repo_id=repo_id)
 
 
 def _resolved_relation_endpoint_paths(
@@ -2877,8 +2531,6 @@ def _compact_group_coverage_profiles(
                 "preselection_graph_support": preselection_graph_support,
                 "exact_reference_symbol_ids": exact_reference_symbol_ids,
                 "graph_supported": ContextEvidenceKind.GRAPH_RELATION.value in evidence_kinds,
-                "history_corroborated": ContextEvidenceKind.HISTORY_CORROBORATION.value
-                in evidence_kinds,
                 "related_record_ids": {
                     str(record_id)
                     for record_id in item.get("related_record_ids", [])
@@ -3223,7 +2875,6 @@ def _compact_bundle_projection(
     warning_codes = {
         "context_graph_stale",
         "context_graph_unavailable",
-        "context_task_history_stale",
         "context_graph_freshness_unavailable",
         ContextAnchorResolutionCode.AMBIGUOUS.value,
         "graph_source_anchor_snapshot_unresolved",
@@ -3232,7 +2883,6 @@ def _compact_bundle_projection(
         "context_graph_stale": 0,
         "context_graph_unavailable": 1,
         "context_graph_freshness_unavailable": 2,
-        "context_task_history_stale": 3,
         "graph_source_anchor_snapshot_unresolved": 4,
         ContextAnchorResolutionCode.AMBIGUOUS.value: 5,
     }
@@ -3692,16 +3342,6 @@ def _knowledge_records_path_candidates(
             )
         )
     return candidates, problems
-
-
-def _related_path_history(*, target: RepoTarget, evidence: list[ContextCandidate], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    product_prefix = f"{target.display_path.rstrip('/')}/"
-    selected_paths = {
-        candidate.source_ref.path.removeprefix(product_prefix)
-        for candidate in evidence
-        if candidate.source_ref.kind in ACTIONABLE_PRODUCT_KINDS and candidate.source_ref.path.startswith(product_prefix)
-    }
-    return [item for item in history if isinstance(item, dict) and str(item.get("path") or "") in selected_paths]
 
 
 def _startup_query_candidates(
@@ -4493,11 +4133,6 @@ def _ranked_heuristic_graph_anchors(
                     candidate.query_term_matches for candidate in path_candidates
                 ),
                 "graph_support": path_graph_support,
-                "history_corroborated": any(
-                    ContextEvidenceKind.HISTORY_CORROBORATION
-                    in set(candidate.evidence_kinds)
-                    for candidate in path_candidates
-                ),
                 "related_record_ids": {
                     record_id
                     for candidate in path_candidates
@@ -5279,7 +4914,6 @@ def _coverage_profile_related_key(
         0 if profile.get("strong_symbol") else 1,
         *compact_structural_order,
         0 if profile.get("direct_query", True) else 1,
-        0 if _coverage_profile_history_corroborated(profile) else 1,
         0 if lane and lane not in selected_lanes else 1,
         connection_priority if explicit_test_connection else 3,
         -_coverage_term_breadth_tier(new_terms),
@@ -5348,13 +4982,11 @@ def _coverage_profile_direct_rank_key(
         if _coverage_term_breadth_tier(_coverage_profile_terms(profile)) >= 2
         else 2
     )
-    history_priority = 0 if _coverage_profile_history_corroborated(profile) else 1
     item = profile.get("item") if isinstance(profile.get("item"), dict) else {}
     breakdown = item.get("score_breakdown") if isinstance(item.get("score_breakdown"), dict) else {}
     return (
         _coverage_profile_identity_tier(profile),
         query_plausibility_priority,
-        history_priority,
         -_coverage_profile_anchor_priority(profile),
         -float(breakdown.get("exact") or 0.0),
         -float(profile.get("path_name_coverage") or 0.0),
@@ -5362,37 +4994,6 @@ def _coverage_profile_direct_rank_key(
         -float(profile.get("score") or getattr(profile.get("primary"), "score", 0.0)),
         -float(breakdown.get("fts") or 0.0),
         str(profile.get("path") or ""),
-    )
-
-
-def _coverage_profile_history_corroborated(profile: dict[str, Any]) -> bool:
-    return bool(profile.get("history_corroborated"))
-
-
-def _coverage_profile_related_record_ids(profile: dict[str, Any]) -> set[str]:
-    record_ids = profile.get("related_record_ids")
-    if not isinstance(record_ids, (set, list, tuple)):
-        return set()
-    return {str(record_id) for record_id in record_ids if str(record_id)}
-
-
-def _coverage_profile_shares_history(
-    profile: dict[str, Any],
-    *,
-    reference_profiles: list[dict[str, Any]],
-) -> bool:
-    if not _coverage_profile_history_corroborated(profile):
-        return False
-    record_ids = _coverage_profile_related_record_ids(profile)
-    return bool(
-        record_ids
-        and record_ids
-        & {
-            record_id
-            for reference in reference_profiles
-            if _coverage_profile_history_corroborated(reference)
-            for record_id in _coverage_profile_related_record_ids(reference)
-        }
     )
 
 
@@ -5562,12 +5163,6 @@ def _coverage_profile_reference_key(
         0 if profile.get("strong_symbol") else 1,
         connection_priority,
         0 if profile.get("direct_query", True) else 1,
-        0
-        if _coverage_profile_shares_history(
-            profile,
-            reference_profiles=reference_profiles,
-        )
-        else 1,
         -_coverage_term_breadth_tier(shared_terms),
         -_coverage_pair_weight(shared_pairs, frequencies),
         _coverage_profile_initial_key(profile, frequencies=frequencies),
@@ -6251,7 +5846,6 @@ def _context_groups(
     target: RepoTarget,
     completeness: dict[str, Any],
     graph_warnings: list[dict[str, str]],
-    related_history: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
     repo_id = target.id
     groups: dict[str, list[dict[str, Any]]] = {group: [] for group in CONTEXT_GROUPS}
@@ -6274,57 +5868,14 @@ def _context_groups(
                 "score_breakdown": result.get("score_breakdown", {}),
                 "excerpt": record.get("claim") or record.get("summary") or "",
                 "provenance": record.get("provenance", {}) if isinstance(record.get("provenance"), dict) else {},
-                "source_ref": {"kind": "knowledge_record", "path": f"docs/knowledge/records/{record.get('id', '')}.json", "content_sha256": record.get("record_digest", "")},
+                "source_ref": {"kind": "knowledge_record", "path": f"docs/knowledge/records/{record.get('id', '')}.json", "content_sha256": record.get("content_sha256", "")},
                 "continuations": _knowledge_continuations(result),
             }
         )
-    history_by_task: dict[str, dict[str, Any]] = {}
-    for item in related_history:
-        if not isinstance(item, dict):
-            continue
-        task_id = str(item.get("task_id") or "")
-        if not task_id:
-            continue
-        aggregate = history_by_task.setdefault(
-            task_id,
-            {
-                "task_path": str(item.get("task_path") or ""),
-                "completed_at": str(item.get("completed_at") or ""),
-                "attribution": str(item.get("attribution") or ""),
-                "paths": set(),
-            },
-        )
-        changed_path = str(item.get("path") or "")
-        if changed_path:
-            aggregate["paths"].add(changed_path)
-    for task_id, item in sorted(history_by_task.items(), key=lambda pair: (str(pair[1].get("completed_at") or ""), pair[0]), reverse=True):
-        task_path = str(item.get("task_path") or "")
-        changed_paths = sorted(str(path) for path in item.get("paths", set()) if str(path))
-        groups["related_history"].append(
-            {
-                "repo_id": repo_id,
-                "record_id": task_id,
-                "status": "recorded",
-                "selection_reason": f"completion evidence touched {', '.join(changed_paths)}",
-                "excerpt": " ".join(
-                    part
-                    for part in (
-                        str(item.get("completed_at") or ""),
-                        str(item.get("attribution") or ""),
-                    )
-                    if part
-                ),
-                "source_ref": {"kind": "task_artifact", "path": task_path, "section": task_id} if task_path else {"kind": "task_history", "path": task_id},
-                "continuations": _task_history_continuations(task_id=task_id, task_path=task_path),
-            }
-        )
-    recorded_task_ids = {str(item.get("record_id") or "") for item in groups["related_history"]}
     for item in _path_group_items(grouped_candidates["related_history"], group="related_history", target=target):
         ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
         path = str(ref.get("path") or "")
         task_id = _task_id_from_history_item(item)
-        if task_id and task_id in recorded_task_ids:
-            continue
         item["record_id"] = task_id or path
         item["status"] = "recorded"
         item["selection_reason"] = "task history query match"
@@ -6404,7 +5955,7 @@ def _candidate_group(candidate: ContextCandidate) -> str:
         return "callers_and_dependents" if candidate.graph_path else "supporting_evidence"
     if document_role in AUTHORITY_DOCUMENT_ROLES or document_role == DocumentRole.PROCEDURE:
         return "must_read"
-    if ref.kind in {"completion_receipt", "task_artifact"}:
+    if ref.kind == "task_artifact":
         return "related_history"
     if ref.kind == "verification_hint" or is_test_path(path):
         return "tests_and_verification"

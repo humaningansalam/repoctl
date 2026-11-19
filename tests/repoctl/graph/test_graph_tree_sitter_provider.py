@@ -57,14 +57,12 @@ def test_invalid_native_source_is_failed_not_precise(tmp_path: Path) -> None:
 def test_native_provider_materializes_graph_relations_and_source_ranges(tmp_path, monkeypatch, capsys) -> None:
     import json
     from tests.repoctl.workspace.test_check import write_workspace
-    from tests.repoctl.meta.test_meta_check import write_repometa
     from tests.repoctl.repository.test_repositories import init_repo
     from tools.repoctl.cli import main
 
     write_workspace(tmp_path)
     repo = tmp_path / 'repos'
     init_repo(repo)
-    write_repometa(repo)
     (repo / 'src').mkdir()
     (repo / 'src/lib.rs').write_text('fn work(){}\nfn main(){ work(); }\n',encoding='utf-8')
     monkeypatch.setattr('tools.repoctl.cli.find_workspace_root', lambda: tmp_path)
@@ -85,14 +83,12 @@ def test_native_provider_materializes_graph_relations_and_source_ranges(tmp_path
 def test_rust_mod_declaration_materializes_verified_module_to_file_relation(tmp_path, monkeypatch, capsys) -> None:
     import json
     from tests.repoctl.workspace.test_check import write_workspace
-    from tests.repoctl.meta.test_meta_check import write_repometa
     from tests.repoctl.repository.test_repositories import init_repo
     from tools.repoctl.cli import main
 
     write_workspace(tmp_path)
     repo = tmp_path / 'repos'
     init_repo(repo)
-    write_repometa(repo)
     (repo / 'src').mkdir()
     (repo / 'src/main.rs').write_text('mod audio_clock;\nfn main(){ audio_clock::tick(); }\n',encoding='utf-8')
     (repo / 'src/audio_clock.rs').write_text('pub fn tick(){}\n',encoding='utf-8')
@@ -257,12 +253,12 @@ def test_java_ambiguous_or_non_type_import_is_never_confirmed(tmp_path: Path,imp
 def test_native_exact_java_import_materializes_test_to_production_relation(tmp_path,monkeypatch,capsys) -> None:
     import json
     from tests.repoctl.workspace.test_check import write_workspace
-    from tests.repoctl.meta.test_meta_check import write_repometa
     from tests.repoctl.repository.test_repositories import init_repo
     from tools.repoctl.cli import main
 
     write_workspace(tmp_path)
-    repo=tmp_path/'repos';init_repo(repo);write_repometa(repo)
+    repo = tmp_path / 'repos'
+    init_repo(repo)
     for name,content in {
         'src/Model.java':'package com.example;\npublic class Model {}\n',
         'tests/TestModel.java':'package com.other;\nimport com.example.Model;\nclass TestModel { Model model; }\n',
@@ -282,12 +278,12 @@ def test_native_exact_java_import_materializes_test_to_production_relation(tmp_p
 def test_go_same_package_graph_workflow_has_verified_caller_and_tests(tmp_path,monkeypatch,capsys) -> None:
     import json
     from tests.repoctl.workspace.test_check import write_workspace
-    from tests.repoctl.meta.test_meta_check import write_repometa
     from tests.repoctl.repository.test_repositories import init_repo
     from tools.repoctl.cli import main
 
     write_workspace(tmp_path)
-    repo=tmp_path/'repos';init_repo(repo);write_repometa(repo)
+    repo = tmp_path / 'repos'
+    init_repo(repo)
     for name,content in {
         'src/handler.go':'package queue\nfunc Run() {}\n',
         'src/main.go':'package queue\nfunc Dispatch() { Run() }\n',
@@ -353,11 +349,11 @@ def test_rust_mod_scoped_call_to_private_fn_stays_unconfirmed(tmp_path: Path) ->
 def test_rust_scoped_module_call_graph_end_to_end(tmp_path,monkeypatch,capsys) -> None:
     import json
     from tests.repoctl.workspace.test_check import write_workspace
-    from tests.repoctl.meta.test_meta_check import write_repometa
     from tests.repoctl.repository.test_repositories import init_repo
     from tools.repoctl.cli import main
     write_workspace(tmp_path)
-    repo=tmp_path/'repos';init_repo(repo);write_repometa(repo)
+    repo = tmp_path / 'repos'
+    init_repo(repo)
     for path,text in {
         'src/main.rs':'mod clock;\nfn main(){ clock::tick(); }\n',
         'src/clock.rs':'pub fn tick(){}\n',

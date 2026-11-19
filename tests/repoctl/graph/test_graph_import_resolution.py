@@ -7,7 +7,6 @@ from pathlib import Path
 from tools.repoctl.cli import main
 from tools.repoctl.graph_model import file_id, import_ref_id
 from tests.repoctl.workspace.test_check import write_workspace
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 
 
@@ -35,7 +34,6 @@ def test_graph_imports_are_raw_import_refs(tmp_path: Path, monkeypatch, capsys) 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "frontend/src").mkdir(parents=True)
     (repo / "frontend/src/app.ts").write_text("import axios from 'axios';\nexport const run = () => fetch('/');\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
@@ -53,7 +51,6 @@ def test_graph_resolves_repo_local_python_imports(tmp_path: Path, monkeypatch, c
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "utils").mkdir()
     (repo / "handlers").mkdir()
     (repo / "utils/__init__.py").write_text("", encoding="utf-8")
@@ -92,7 +89,6 @@ def test_graph_resolves_python_imports_from_manifest_declared_src_root(tmp_path:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "pyproject.toml").write_text(
         '[tool.setuptools]\npackage-dir = {"" = "src"}\n\n[tool.setuptools.packages.find]\nwhere = ["src"]\n',
         encoding="utf-8",
@@ -136,7 +132,6 @@ def test_graph_resolves_relative_python_imports(tmp_path: Path, monkeypatch, cap
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "handlers").mkdir()
     (repo / "handlers/__init__.py").write_text("", encoding="utf-8")
     (repo / "handlers/tokens.py").write_text("def issue_token(user_id: str) -> str:\n    return f'token:{user_id}'\n", encoding="utf-8")
@@ -166,7 +161,6 @@ def test_graph_relative_import_occurrences_keep_importer_identity(tmp_path: Path
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     for package in ("p1", "p2"):
         (repo / package).mkdir()
         (repo / package / "__init__.py").write_text("", encoding="utf-8")
@@ -207,7 +201,6 @@ def test_graph_python_imports_use_module_identity_and_package_attribute_preceden
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "pkg").mkdir()
     (repo / "top_level.py").write_text("from .sibling import target\n", encoding="utf-8")
     (repo / "sibling.py").write_text("def target():\n    return 1\n", encoding="utf-8")
@@ -265,7 +258,6 @@ def test_graph_skips_ambiguous_python_import_resolution(tmp_path: Path, monkeypa
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "pkg/mod").mkdir(parents=True)
     (repo / "consumer").mkdir()
     (repo / "pkg/__init__.py").write_text("", encoding="utf-8")
@@ -292,7 +284,6 @@ def test_graph_resolves_js_ts_relative_imports(tmp_path: Path, monkeypatch, caps
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "frontend/src/api").mkdir(parents=True)
     (repo / "frontend/src/client.ts").write_text("import { issueToken } from './api/tokens';\nexport const login = () => issueToken();\n", encoding="utf-8")
     (repo / "frontend/src/api/tokens.ts").write_text("export const issueToken = () => 'token';\n", encoding="utf-8")
@@ -313,7 +304,6 @@ def test_graph_resolves_dart_relative_and_local_package_imports(tmp_path: Path, 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "lib/src").mkdir(parents=True)
     (repo / "pubspec.yaml").write_text("name: demo_app\n", encoding="utf-8")
     (repo / "lib/main.dart").write_text(
@@ -341,7 +331,6 @@ def test_graph_skips_ambiguous_js_ts_relative_import_resolution(tmp_path: Path, 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "frontend/src/api").mkdir(parents=True)
     (repo / "frontend/src/client.ts").write_text("import { issueToken } from './api/tokens';\n", encoding="utf-8")
     (repo / "frontend/src/api/tokens.ts").write_text("export const issueToken = () => 'ts';\n", encoding="utf-8")

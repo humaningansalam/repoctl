@@ -13,7 +13,6 @@ from tools.repoctl.graph import query_graph
 from tools.repoctl.graph_model import GraphEdge, GraphNode, GraphSnapshot, file_id, repository_id
 from tools.repoctl.graph_store import materialize_graph
 from tools.repoctl.repositories import require_repo_target
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 from tests.repoctl.workspace.test_check import write_workspace
 
@@ -197,7 +196,6 @@ def test_graph_result_digest_is_pinned_until_explicit_rebuild(tmp_path: Path) ->
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "apps/web/src").mkdir(parents=True)
     (repo / "apps/web/package.json").write_text('{"name":"web"}\n', encoding="utf-8")
     path = "apps/web/src/client.ts"
@@ -233,7 +231,6 @@ def test_component_registry_identity_invalidates_a_reused_graph(tmp_path: Path) 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "features/search/src").mkdir(parents=True)
     (repo / "features/search/module.component").write_text(
         "component = discovery\n",

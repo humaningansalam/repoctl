@@ -105,7 +105,6 @@ LANGUAGE_PROFILES: tuple[LanguageProfile, ...] = (
 
 COMMON_EXCLUDE_PATTERNS: tuple[str, ...] = (
     ".git/**",
-    ".repometa/**",
     ".repoctl-state/**",
     ".cache/**",
     ".gstack/**",

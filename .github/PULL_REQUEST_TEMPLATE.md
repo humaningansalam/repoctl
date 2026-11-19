@@ -1,15 +1,11 @@
-<!-- 작은 변경은 한두 문장으로 충분합니다. 한국어 또는 영어로 작성하고 적용되지 않는 내용은 생략하세요. -->
+## Change
 
-## 변경 이유와 내용
+<!-- Explain the problem and resulting behavior. -->
 
-<!-- 해결할 문제와 달라지는 동작을 설명하세요. 파일별·커밋별 작업 일지는 필요하지 않습니다. -->
+## Checks
 
-## 확인 방법
+<!-- Record the relevant checks actually run and their results. -->
 
-<!-- 실제 실행한 검사와 결과 또는 CI 링크를 적으세요. 중요한 미실행 검증은 이유를 적으세요. 단순한 '테스트 완료' 선언은 필요하지 않습니다. -->
+## Related work
 
-## 관련 작업과 영향
-
-<!-- 완전히 해결한 이슈만 Closes #123, 일부 해결은 Related to #123으로 연결하세요. -->
-<!-- CLI/JSON/문서 계약, 기존 Task·receipt 보존, 설치·업그레이드에 영향이 있을 때만 설명하세요. -->
-<!-- 비공개 workspace 경로·Task 본문·토큰·원시 로그를 복사하지 마세요. -->
+<!-- Link related issues and mention compatibility changes when relevant. -->

@@ -18,16 +18,6 @@ from .code_index import (
     semantic_provider_entries,
 )
 from .context_sources import context_document_paths
-from .completion_catalogue import (
-    CompletionGraphInput,
-    CompletionCatalogueStatus,
-    CompletionCatalogueUnavailable,
-    CompletionCatalogueUnavailableReason,
-    completion_catalogue_status,
-    ingest_completion_catalogue_tail,
-    completion_graph_inputs,
-    unavailable_completion_catalogue_status,
-)
 from .component_projection import (
     DEFAULT_COMPONENT_MANIFEST_REGISTRY,
     ComponentManifestRegistry,
@@ -54,17 +44,15 @@ from .graph_semantic_model import (
 from .graph_semantic_provider import PROVIDER_INPUT_VERSIONS, PROVIDER_LANGUAGES, build_semantic_provider
 from .graph_structured_relations import STRUCTURED_RELATION_INPUT_VERSION
 from .git import repo_file_state_records
-from .io import atomic_write
+from .io import Problem, atomic_write
 from .language_profiles import language_for_path
-from .knowledge_projection import knowledge_projection_path, load_knowledge_projection
-from .meta import meta_inventory, without_absent_repometa
+from .knowledge_records import knowledge_records_for_graph
+from .inventory import file_inventory
 from .repositories import RepoTarget
-from .tasks import Problem, collect_completion_receipt_collection
 
 
 GRAPH_STATE_SCHEMA = "repoctl.graph.materialization"
-GRAPH_STATE_SCHEMA_VERSION = 3
-COMPLETION_RECEIPT_INPUT_VERSION = 2
+GRAPH_STATE_SCHEMA_VERSION = 4
 GRAPH_STATE_ROOT = Path(".repoctl-state/graph")
 PROVIDER_RESULT_SCHEMA_VERSION = 3
 PROVIDER_CONFIG_PATTERNS = {
@@ -105,65 +93,8 @@ class _MaterializedGraph:
     evidence_metadata: dict[str, Any]
 
 
-def _completion_catalogue_status_for_graph(
-    root: Path,
-    *,
-    target: RepoTarget,
-) -> CompletionCatalogueStatus:
-    """Reject a pre-catalogue workspace instead of erasing preserved history."""
-
-    status = completion_catalogue_status(root, target.id)
-    if status.status != "empty":
-        return status
-    legacy_receipts = collect_completion_receipt_collection(root, repo_id=target.id)
-    if legacy_receipts.problems:
-        first_problem = legacy_receipts.problems[0]
-        raise CompletionCatalogueUnavailable(
-            CompletionCatalogueUnavailableReason.SOURCE_AUDIT_FAILED,
-            f"preserved completion receipts cannot be audited: {first_problem.message}",
-            path=first_problem.path or "docs/tasks/.repoctl-state/completions",
-        )
-    if legacy_receipts.artifacts:
-        raise CompletionCatalogueUnavailable(
-            CompletionCatalogueUnavailableReason.MISSING,
-            "preserved completion receipts exist but the completion catalogue has not been rebuilt",
-            path="docs/tasks/.repoctl-state/completions",
-        )
-    return status
 
 
-def _graph_completion_inputs(
-    root: Path,
-    *,
-    target: RepoTarget,
-) -> tuple[tuple[CompletionGraphInput, ...], CompletionCatalogueStatus, list[Problem]]:
-
-    try:
-        status = _completion_catalogue_status_for_graph(root, target=target)
-        if status.tail_pending:
-            ingest_completion_catalogue_tail(root, target.id)
-            status = _completion_catalogue_status_for_graph(root, target=target)
-        records = completion_graph_inputs(root, target.id)
-    except CompletionCatalogueUnavailable as exc:
-        problem = Problem(
-            "warning",
-            exc.code,
-            f"completion history projection is unavailable: {exc}; run repoctl history rebuild",
-            exc.path,
-        )
-        empty_status = unavailable_completion_catalogue_status(
-            target.id,
-            exc.code,
-        )
-        return (), empty_status, [problem]
-    problems = [] if status.history_complete or status.status == "empty" else [
-        Problem(
-            "warning",
-            "completion_catalogue_hot_history_partial",
-            "active Graph task history is bounded by the completion catalogue hot policy; use exact cold lookup for older tasks",
-        )
-    ]
-    return records, status, problems
 
 
 def _file_record_fingerprint(record: dict[str, Any]) -> str:
@@ -358,62 +289,20 @@ def _root_evidence_records(
     previous: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, object]]:
     previous = previous or {}
-    records = [
-        *(_tree_records(target.root_path / ".repometa", prefix=f"{target.display_path}/.repometa", previous=previous) if target.id else []),
-    ]
-    projection_path = knowledge_projection_path(root, repo_id=target.id)
-    projection_rel = projection_path.relative_to(root).as_posix()
-    records.append(
-        _path_record(
-            projection_path,
-            logical_path=projection_rel,
-            previous=previous.get(projection_rel),
-        )
-    )
-    knowledge_projection, projection_problems = load_knowledge_projection(
-        root,
-        repo_id=target.id,
-    )
-    if not projection_problems:
-        for record in knowledge_projection.get("heads", []):
-            record = record if isinstance(record, dict) else {}
-            record_id = str(record.get("id") or "") if isinstance(record, dict) else ""
-            if record_id:
-                record_rel = f"docs/knowledge/records/{record_id}.json"
-                records.append(
-                    _path_record(
-                        root / record_rel,
-                        logical_path=record_rel,
-                        previous=previous.get(record_rel),
-                    )
-                )
-            refs = record.get("source_refs") if isinstance(record, dict) else []
-            for ref in refs if isinstance(refs, list) else []:
-                if not isinstance(ref, dict):
-                    continue
-                logical_path = str(ref.get("path") or "")
-                candidate = Path(logical_path)
-                if (
-                    not logical_path
-                    or candidate.is_absolute()
-                    or candidate.as_posix() != logical_path
-                    or any(part in {"", ".", ".."} for part in candidate.parts)
-                ):
-                    continue
-                records.append(
-                    _path_record(
-                        root / candidate,
-                        logical_path=logical_path,
-                        previous=previous.get(logical_path),
-                    )
-                )
+    records: list[dict[str, object]] = []
+    knowledge_records, _problems = knowledge_records_for_graph(root, repo_id=target.id)
+    for record in knowledge_records:
+        record_id = str(record.get("id") or "")
+        if record_id:
+            relative = f"docs/knowledge/records/{record_id}.json"
+            records.append(_path_record(root / relative, logical_path=relative, previous=previous.get(relative)))
     product_root = target.root_path.resolve()
     for path in context_document_paths(root, target=target):
         if target.id and path.resolve().is_relative_to(product_root):
             continue
         logical_path = path.relative_to(root).as_posix()
         records.append(_path_record(path, logical_path=logical_path, previous=previous.get(logical_path)))
-    for relative in ("docs/repoctl.json", "repoctl-upgrade-manifest.json", "pyproject.toml"):
+    for relative in ("docs/repoctl.json", "pyproject.toml"):
         path = root / relative
         if path.is_file():
             records.append(_path_record(path, logical_path=relative, previous=previous.get(relative)))
@@ -439,7 +328,6 @@ def collect_graph_inputs(
     target: RepoTarget,
     previous_manifest: dict[str, Any] | None = None,
     previous_snapshot: GraphSnapshot | None = None,
-    catalogue_status: CompletionCatalogueStatus,
     component_manifest_registry: ComponentManifestRegistry = DEFAULT_COMPONENT_MANIFEST_REGISTRY,
     rebuild: bool = False,
 ) -> tuple[
@@ -455,11 +343,10 @@ def collect_graph_inputs(
         inventory, inventory_problems, inventory_meta = [], [], {"summary": {"truncated": False}}
         file_records = {}
     else:
-        inventory, inventory_problems, inventory_meta = meta_inventory(root, changed=False, target=target)
-        inventory_problems, _metadata_absent = without_absent_repometa(inventory_problems, repo=target.root_path)
+        inventory, inventory_problems, inventory_meta = file_inventory(root, changed=False, target=target)
         file_records, git_state = repo_file_state_records(
             root,
-            paths=[item.path for item in inventory if item.classification not in {"orphan_annotation", "orphan_exclusion"}],
+            paths=[item.path for item in inventory],
             target=target,
             previous={str(path): value for path, value in previous_file_records.items() if isinstance(value, dict)},
         )
@@ -559,7 +446,6 @@ def collect_graph_inputs(
         "repository": target.to_dict(),
         "code_index_input_version": CODE_INDEX_INPUT_VERSION,
         "structured_relation_input_version": STRUCTURED_RELATION_INPUT_VERSION,
-        "completion_receipt_input_version": COMPLETION_RECEIPT_INPUT_VERSION,
         "component_manifest_registry": component_manifest_registry.identity,
         "file_records": file_records,
         "file_fingerprints": file_fingerprints,
@@ -567,9 +453,6 @@ def collect_graph_inputs(
         "root_evidence_digest": digest_data(root_evidence_fingerprints),
         "root_evidence_records": root_evidence_records,
         "root_evidence_fingerprints": root_evidence_fingerprints,
-        "completion_catalogue": catalogue_status.graph_identity(),
-        "completion_receipt_input_digest": digest_data(catalogue_status.graph_identity()),
-        "completion_receipt_input_paths": [],
         "providers": providers,
     }
     state["input_digest"] = digest_data(
@@ -1242,18 +1125,15 @@ def _observed_graph_freshness(
     if not target.id:
         inventory, current_records, problems = [], {}, []
     else:
-        inventory, inventory_problems, _inventory_meta = meta_inventory(root, changed=False, target=target)
-        inventory_problems, metadata_absent = without_absent_repometa(inventory_problems, repo=target.root_path)
+        inventory, inventory_problems, _inventory_meta = file_inventory(root, changed=False, target=target)
         previous_records = manifest.get("file_records") if isinstance(manifest.get("file_records"), dict) else {}
         current_records, git_state = repo_file_state_records(
             root,
-            paths=[item.path for item in inventory if item.classification not in {"orphan_annotation", "orphan_exclusion"}],
+            paths=[item.path for item in inventory],
             target=target,
             previous={str(path): value for path, value in previous_records.items() if isinstance(value, dict)},
         )
         problems = list(inventory_problems)
-        if metadata_absent:
-            problems.append(Problem("warning", "graph_metadata_unavailable", "repository metadata is not initialized; Graph source relations remain available without metadata enrichment", f"{target.display_path}/.repometa/policy.json", "missing_repometa_policy"))
         if not git_state.available:
             problems.append(Problem("error", "graph_git_unavailable", git_state.reason, target.display_path))
     current_fingerprints = {
@@ -1337,7 +1217,6 @@ def _observed_graph_freshness(
     graph_input_version_changed = (
         manifest.get("code_index_input_version") != CODE_INDEX_INPUT_VERSION
         or manifest.get("structured_relation_input_version") != STRUCTURED_RELATION_INPUT_VERSION
-        or manifest.get("completion_receipt_input_version") != COMPLETION_RECEIPT_INPUT_VERSION
         or manifest.get("component_manifest_registry") != component_manifest_registry.identity
     )
     semantic_stale_paths = sorted(
@@ -1374,24 +1253,6 @@ def _observed_graph_freshness(
         if str(record.get("path") or "")
     }
     previous_root_fingerprints = manifest.get("root_evidence_fingerprints") if isinstance(manifest.get("root_evidence_fingerprints"), dict) else {}
-    try:
-        catalogue_status = _completion_catalogue_status_for_graph(root, target=target)
-        current_catalogue = catalogue_status.graph_identity()
-        catalogue_problem: Problem | None = None
-    except CompletionCatalogueUnavailable as exc:
-        current_catalogue = unavailable_completion_catalogue_status(
-            target.id,
-            exc.code,
-        ).graph_identity()
-        catalogue_problem = Problem(
-            "warning",
-            exc.code,
-            f"completion history projection is unavailable: {exc}; run repoctl history rebuild",
-            exc.path,
-        )
-        problems.append(catalogue_problem)
-    previous_catalogue = manifest.get("completion_catalogue") if isinstance(manifest.get("completion_catalogue"), dict) else {}
-    completion_receipt_input_changed = current_catalogue != previous_catalogue
     changed_root_paths = sorted(
         {
             path
@@ -1402,7 +1263,6 @@ def _observed_graph_freshness(
     root_evidence_digest = digest_data(current_root_fingerprints)
     root_evidence_changed = (
         root_evidence_digest != str(manifest.get("root_evidence_digest") or "")
-        or completion_receipt_input_changed
     )
     status = (
         "current"
@@ -1425,8 +1285,6 @@ def _observed_graph_freshness(
         },
         "inventory_stale_paths": inventory_stale_paths,
         "root_evidence_changed": root_evidence_changed,
-        "completion_receipt_input_changed": completion_receipt_input_changed,
-        "completion_catalogue": current_catalogue,
         "changed_root_paths": changed_root_paths,
         "changed_root_path_count": len(changed_root_paths),
         "provider_state_changed": provider_state_changed,
@@ -1757,16 +1615,11 @@ def materialize_graph(
             previous_manifest = materialized.manifest
             previous_snapshot = materialized.snapshot
             previous_provider_results = materialized.provider_results
-    completion_inputs, catalogue_state, catalogue_problems = _graph_completion_inputs(
-        root,
-        target=target,
-    )
     index_result, provider_entries, import_result, current, index_update = collect_graph_inputs(
         root,
         target=target,
         previous_manifest=previous_manifest,
         previous_snapshot=previous_snapshot,
-        catalogue_status=catalogue_state,
         component_manifest_registry=component_manifest_registry,
         rebuild=rebuild,
     )
@@ -1795,7 +1648,7 @@ def materialize_graph(
             "provider_result_digests": previous_manifest.get("provider_result_digests", {}),
         }
         atomic_write(state_dir / "manifest.json", json.dumps(reused_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        return previous_snapshot, [*catalogue_problems, *evidence_problems], {
+        return previous_snapshot, evidence_problems, {
             "repository": target.to_dict(),
             "materialization": {
                 "status": "reused",
@@ -1879,8 +1732,6 @@ def materialize_graph(
         target=target,
         code_index_result=index_result,
         cached_semantic_results=results,
-        completion_inputs=completion_inputs,
-        completion_problems=tuple(catalogue_problems),
         component_manifest_registry=component_manifest_registry,
     )
     if snapshot is None or any(problem.severity == "error" for problem in problems):

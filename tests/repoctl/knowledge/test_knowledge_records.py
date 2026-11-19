@@ -1,390 +1,226 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
-import pytest
-
-import tools.repoctl.cli as cli
-from tools.repoctl.cli import main
-from tools.repoctl.tasks import Problem
-from tests.repoctl.knowledge_test_helpers import (
-    _add_knowledge_source,
-    _setup_knowledge_workspace,
-    add_task,
-    init_repo,
-    task_text,
-    write_repometa,
-    write_workspace,
+from tools.repoctl.knowledge_records import (
+    add_knowledge_record,
+    prepare_knowledge_record,
+    query_knowledge_records,
+    knowledge_status,
+    show_knowledge_record,
+    check_knowledge_records,
 )
-from tests.repoctl.repository.test_repositories import commit_all
-from tests.repoctl.repository.test_repositories import write_settings
-from tools.repoctl.debug import DEBUG_EVENTS_REL
+from tests.repoctl.repository.test_repositories import init_repo
 
 
-def _payload(capsys) -> dict:
-    return json.loads(capsys.readouterr().out)
-
-
-def _finishable_task(root: Path, monkeypatch, capsys, *, task_id: str) -> None:
-    write_workspace(root)
-    repo = root / "repos"
-    init_repo(repo)
-    write_repometa(repo)
-    source = repo / "service.py"
-    source.write_text("VALUE = 'before'\n", encoding="utf-8")
-    commit_all(repo)
-    body = task_text(task_id, status="todo").replace('repo_id: ""', 'repo_id: "main"')
-    add_task(root, f"{task_id}--knowledge-closeout.md", body)
-    (root / "docs/BOARD.md").write_text(
-        f"# BOARD\n\n## Board\n\n- docs/tasks/{task_id}--knowledge-closeout.md\n\n## Backlog\n",
-        encoding="utf-8",
+def add(
+    root: Path,
+    claim: str,
+    *,
+    source: str = "repos/source.py",
+    replaces: list[str] | None = None,
+) -> dict:
+    data, problems, warnings = add_knowledge_record(
+        root,
+        repo_id="main",
+        kind="decision",
+        claim=claim,
+        reason="Explains the design choice",
+        sources=[source],
+        replaces=replaces,
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: root)
-    assert main(["task", "start", task_id, "--json"]) == 0
-    _payload(capsys)
-    assert main(["task", "discovery", "add", task_id, "--chosen", "repos/service.py", "--json"]) == 0
-    _payload(capsys)
-    source.write_text("VALUE = 'after'\n", encoding="utf-8")
+    assert not problems and not warnings
+    return data["record"]
 
 
-def _finish_with_knowledge(task_id: str) -> list[str]:
-    return [
-        "task",
-        "finish",
-        task_id,
-        "--knowledge-kind",
-        "invariant",
-        "--knowledge-claim",
-        "Service updates keep one owner.",
-        "--knowledge-reason",
-        "A second owner previously caused divergent behavior.",
-        "--knowledge-applies-to",
-        "service.py",
-        "--json",
-    ]
-
-
-def test_knowledge_add_writes_one_record_and_source_change_is_advisory(
+def test_claims_are_not_artificially_limited_and_sources_use_exact_bytes(
     tmp_path: Path,
-    monkeypatch,
-    capsys,
 ) -> None:
-    _setup_knowledge_workspace(tmp_path, monkeypatch)
-
-    payload = _add_knowledge_source(capsys)
-    record = payload["data"]["record"]
-    assert record["schema_version"] == 2
-    assert record["reason"] == "This reusable rule explains later work."
-    assert record["source_refs"][0]["content_sha256"].startswith("sha256:")
-    assert "author" not in record
-    assert not (tmp_path / ".repoctl-state/knowledge/candidates").exists()
-    assert not list((tmp_path / "docs/knowledge/events").glob("E-*.json"))
-
-    source = tmp_path / "docs/contracts/repoctl-evidence-contract.md"
-    source.write_text(source.read_text(encoding="utf-8") + "\nChanged later.\n", encoding="utf-8")
-
-    assert main(["knowledge", "query", "source bundles", "--repo-id", "main", "--json"]) == 0
-    query = _payload(capsys)
-    compact_record = query["data"]["results"][0]["record"]
-    assert compact_record["id"] == record["id"]
-    assert compact_record["claim"] == record["claim"]
-    assert compact_record["reason"] == record["reason"]
-    assert compact_record["source_refs"] == [{
-        "path": record["source_refs"][0]["path"],
-        "kind": record["source_refs"][0]["kind"],
-        "status": "digest_mismatch",
-    }]
-    assert [item["code"] for item in query["warnings"]] == ["knowledge_source_changed"]
-
-    assert main(["knowledge", "query", "source bundles", "--repo-id", "main", "--full", "--json"]) == 0
-    full = _payload(capsys)
-    full_record = full["data"]["results"][0]["record"]
-    assert full_record["source_refs"] == record["source_refs"]
-    assert full_record["source_resolutions"][0]["digest_matches"] is False
-    assert len(json.dumps(query)) < len(json.dumps(full))
-
-    assert main(["knowledge", "check", "--repo-id", "main", "--json"]) == 0
-    check = _payload(capsys)
-    assert check["ok"] is True
-    assert [(item["severity"], item["code"]) for item in check["problems"]] == [
-        ("warning", "knowledge_source_changed")
-    ]
+    init_repo(tmp_path / "repos")
+    content = b"value = 42\r\n"
+    (tmp_path / "repos/source.py").write_bytes(content)
+    record = add(tmp_path, "설계 판단 " * 100)
+    assert len(record["claim"]) > 300
+    assert (
+        record["source_refs"][0]["content_sha256"]
+        == "sha256:" + hashlib.sha256(content).hexdigest()
+    )
+    data, problems, warnings = query_knowledge_records(
+        tmp_path, repo_id="main", query="설계 판단"
+    )
+    assert not problems and not warnings
+    assert data["results"][0]["record"]["source_resolutions"][0]["status"] == "current"
+    assert not (tmp_path / ".repoctl-state/knowledge").exists()
 
 
-def test_knowledge_query_source_warnings_follow_selected_results(
+def test_final_task_bytes_can_be_prepared_before_atomic_publication(
     tmp_path: Path,
-    monkeypatch,
-    capsys,
 ) -> None:
-    _setup_knowledge_workspace(tmp_path, monkeypatch)
-    for index, claim in enumerate(("quartzlookup first", "quartzlookup second", "Unrelated routing", "freshanchor rule")):
-        source = tmp_path / f"docs/contracts/selection-{index}.md"
-        source.write_text("# Original source\n", encoding="utf-8")
-        _add_knowledge_source(capsys, source=source.relative_to(tmp_path).as_posix(), claim=claim)
-        if index < 3:
-            source.write_text("# Changed source\n", encoding="utf-8")
+    relative = "docs/archive/tasks/T-20261120120000Z-01234567--done.md"
+    text = b"---\nid: T-20261120120000Z-01234567\nstatus: done\ncompleted_at: 2026-11-20T12:00:00Z\n---\n\nFinal result.\n"
+    prepared, problems = prepare_knowledge_record(
+        tmp_path,
+        repo_id="",
+        kind="invariant",
+        claim="Result survives closeout",
+        reason="Final Task document is the source",
+        sources=[relative],
+        source_bytes={relative: text},
+    )
+    assert not problems and prepared is not None
+    assert (
+        prepared.data["source_refs"][0]["content_sha256"]
+        == "sha256:" + hashlib.sha256(text).hexdigest()
+    )
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(text)
+    prepared.path.parent.mkdir(parents=True)
+    prepared.path.write_text(prepared.text)
+    data, problems = check_knowledge_records(tmp_path, repo_id="")
+    assert not problems
+    assert data["records"][0]["source_resolutions"][0]["status"] == "current"
+    path.write_bytes(text + b"Changed\n")
+    data, problems = check_knowledge_records(tmp_path, repo_id="")
+    assert data["records"][0]["source_resolutions"][0]["status"] == "digest_mismatch"
+    assert problems[0].code == "knowledge_source_changed"
 
-    assert main(["knowledge", "query", "quartzlookup", "--repo-id", "main", "--limit", "1", "--json"]) == 0
-    selected = _payload(capsys)
-    assert len(selected["data"]["results"]) == 1
-    assert selected["data"]["lifecycle"]["source_changed_count"] == 3
-    assert [(item["code"], item["path"]) for item in selected["warnings"]] == [
-        ("knowledge_source_changed", selected["data"]["results"][0]["record"]["id"])
-    ]
 
-    for query in ("freshanchor", "absentmarker"):
-        assert main(["knowledge", "query", query, "--repo-id", "main", "--json"]) == 0
-        result = _payload(capsys)
-        assert result["warnings"] == []
-        assert result["data"]["lifecycle"]["source_changed_count"] == 3
+def test_query_observes_only_selected_sources_and_status_reads_records(
+    tmp_path: Path, monkeypatch
+) -> None:
+    init_repo(tmp_path / "repos")
+    for index in range(3):
+        (tmp_path / f"repos/source{index}.py").write_text(f"value = {index}\n")
+        add(tmp_path, f"decision{index}", source=f"repos/source{index}.py")
+    original = Path.read_bytes
+    observed: list[str] = []
 
-    assert main(["knowledge", "check", "--repo-id", "main", "--json"]) == 0
-    catalog = _payload(capsys)
-    assert sum(item["code"] == "knowledge_source_changed" for item in catalog["problems"]) == 3
+    def read(path: Path) -> bytes:
+        if path.parent == tmp_path / "repos":
+            observed.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    assert knowledge_status(tmp_path, repo_id="main")["record_count"] == 3
+    assert observed == []
+    data, problems, warnings = query_knowledge_records(
+        tmp_path, repo_id="main", query="decision1", limit=1
+    )
+    assert not problems and not warnings
+    assert len(data["results"]) == 1
+    assert observed == ["source1.py"]
 
 
-def test_knowledge_replacement_and_optional_author_use_records_only(
+def test_missing_source_is_reported_without_automatic_relocation(
     tmp_path: Path,
-    monkeypatch,
-    capsys,
 ) -> None:
-    _setup_knowledge_workspace(tmp_path, monkeypatch)
-    original = _add_knowledge_source(capsys, claim="Keep the original routing rule.")["data"]["record"]
-
-    assert main(
-        [
-            "knowledge",
-            "add",
-            "--repo-id",
-            "main",
-            "--kind",
-            "decision",
-            "--claim",
-            "Use the corrected routing rule.",
-            "--reason",
-            "The original rule misses retry traffic.",
-            "--source",
-            "docs/contracts/repoctl-evidence-contract.md",
-            "--replaces",
-            original["id"],
-            "--author",
-            "codex",
-            "--json",
-        ]
-    ) == 0
-    replacement = _payload(capsys)["data"]["record"]
-    assert replacement["replaces"] == [original["id"]]
-    assert replacement["author"] == "codex"
-
-    assert main(["knowledge", "query", "routing rule", "--repo-id", "main", "--json"]) == 0
-    current = _payload(capsys)
-    assert [item["record"]["id"] for item in current["data"]["results"]] == [replacement["id"]]
-
-    assert main(["knowledge", "query", "routing rule", "--repo-id", "main", "--include-history", "--json"]) == 0
-    history = _payload(capsys)
-    statuses = {item["record"]["id"]: item["record"]["status"] for item in history["data"]["results"]}
-    assert statuses == {original["id"]: "superseded", replacement["id"]: "current"}
-    assert not list((tmp_path / "docs/knowledge/events").glob("E-*.json"))
+    init_repo(tmp_path / "repos")
+    original = tmp_path / "repos/source.py"
+    original.write_text("value = 42\n")
+    record = add(tmp_path, "Stable source location")
+    original.rename(tmp_path / "repos/moved.py")
+    data, problems = show_knowledge_record(
+        tmp_path, repo_id="main", record_id=record["id"]
+    )
+    assert not problems
+    resolution = data["record"]["source_resolutions"][0]
+    assert resolution["status"] == "missing"
+    assert resolution["resolved_path"] == "repos/source.py"
 
 
-def test_legacy_knowledge_is_preserved_and_reported_for_manual_migration(
+def test_replacement_excludes_superseded_record_from_default_query(
     tmp_path: Path,
-    monkeypatch,
-    capsys,
 ) -> None:
-    _setup_knowledge_workspace(tmp_path, monkeypatch)
-    record_id = "K-20260609184045Z--legacy-routing"
-    path = tmp_path / f"docs/knowledge/records/{record_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    original = json.dumps(
-        {
-            "schema": "repoctl.knowledge.record",
-            "schema_version": 1,
-            "id": record_id,
-            "repo_id": "main",
-            "kind": "decision",
-            "claim": "Keep the accumulated routing decision.",
-        },
-        indent=2,
-        sort_keys=True,
-    ) + "\n"
-    path.write_text(original, encoding="utf-8")
-
-    assert main(["knowledge", "check", "--repo-id", "main", "--json"]) == 0
-    payload = _payload(capsys)
-    assert payload["data"]["record_count"] == 0
-    assert payload["data"]["legacy_record_count"] == 1
-    assert [problem["code"] for problem in payload["problems"]] == [
-        "knowledge_record_migration_required"
-    ]
-    assert path.read_text(encoding="utf-8") == original
-
-
-def test_task_finish_saves_knowledge_without_candidate_or_event(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-) -> None:
-    task_id = "T-20260609184046Z"
-    _finishable_task(tmp_path, monkeypatch, capsys, task_id=task_id)
-
-    assert main(_finish_with_knowledge(task_id)) == 0
-    payload = _payload(capsys)
-    closeout = payload["data"]["knowledge_closeout"]
-    assert closeout["status"] == "saved"
-    record = json.loads((tmp_path / closeout["record_path"]).read_text(encoding="utf-8"))
-    assert record["claim"] == "Service updates keep one owner."
-    assert record["reason"] == "A second owner previously caused divergent behavior."
-    assert record["applies_to"] == {"paths": ["service.py"]}
-    assert "author" not in record
-    assert not (tmp_path / ".repoctl-state/knowledge/candidates").exists()
-    assert not list((tmp_path / "docs/knowledge/events").glob("E-*.json"))
-
-
-@pytest.mark.parametrize("operation", ["add", "finish"])
-def test_saved_knowledge_keeps_successful_graph_history_advisory(
-    tmp_path: Path, monkeypatch, capsys, operation: str,
-) -> None:
-    task_id = "T-20260609184048Z"
-    _finishable_task(tmp_path, monkeypatch, capsys, task_id=task_id)
-    materialize = cli.materialize_graph
-
-    def bounded_history(*args, **kwargs):
-        snapshot, problems, meta = materialize(*args, **kwargs)
-        return snapshot, [*problems, Problem(
-            "warning", "completion_catalogue_hot_history_partial",
-            "active Graph task history is bounded by the completion catalogue hot policy; use exact cold lookup for older tasks",
-        )], meta
-
-    monkeypatch.setattr(cli, "materialize_graph", bounded_history)
-    if operation == "finish":
-        args = _finish_with_knowledge(task_id)
-    else:
-        assert main(["task", "finish", task_id, "--json"]) == 0
-        _payload(capsys)
-        args = ["knowledge", "add", "--repo-id", "main", "--kind", "invariant",
-                "--claim", "Service updates keep one owner.",
-                "--reason", "A second owner previously caused divergent behavior.",
-                "--source", "repos/service.py", "--applies-to", "service.py", "--json"]
-    assert main(args) == 0
-    payload = _payload(capsys)
-    saved = payload["data"]["knowledge_closeout"] if operation == "finish" else payload["data"]
-    assert saved["graph_sync"]["status"] == "synced"
-    codes = {item["code"] for item in payload["warnings"]}
-    assert "completion_catalogue_hot_history_partial" in codes
-    assert "knowledge_graph_sync_failed" not in codes
-    record = json.loads((tmp_path / saved["record_path"]).read_text())
-    assert main(["knowledge", "query", "Service updates", "--repo-id", "main", "--json"]) == 0
-    assert _payload(capsys)["data"]["results"][0]["record"]["id"] == record["id"]
-
-
-def test_task_finish_stays_successful_when_derived_knowledge_sync_fails(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-) -> None:
-    task_id = "T-20260609184047Z"
-    _finishable_task(tmp_path, monkeypatch, capsys, task_id=task_id)
-    projection_problem = Problem("error", "synthetic_projection_failure", "projection failed")
-    graph_problem = Problem("error", "synthetic_graph_failure", "graph failed")
-    monkeypatch.setattr(cli, "rebuild_knowledge_projection", lambda *_args, **_kwargs: ({}, [projection_problem]))
-    monkeypatch.setattr(cli, "_sync_graph_after_knowledge_change", lambda *_args, **_kwargs: ({"status": "stale"}, [graph_problem]))
-
-    assert main(_finish_with_knowledge(task_id)) == 0
-    payload = _payload(capsys)
-    assert payload["ok"] is True
-    assert payload["data"]["status"] == "done"
-    assert (tmp_path / payload["data"]["knowledge_closeout"]["record_path"]).is_file()
-    assert {item["code"] for item in payload["warnings"]} == {
-        "knowledge_projection_sync_failed",
-        "knowledge_graph_sync_failed",
+    init_repo(tmp_path / "repos")
+    (tmp_path / "repos/source.py").write_text("value = 42\n")
+    first = add(tmp_path, "original cache decision")
+    second = add(tmp_path, "replacement cache decision", replaces=[first["id"]])
+    data, _, _ = query_knowledge_records(tmp_path, repo_id="main", query="cache")
+    assert [item["record"]["id"] for item in data["results"]] == [second["id"]]
+    history, _, _ = query_knowledge_records(
+        tmp_path, repo_id="main", query="cache", include_history=True
+    )
+    assert {item["record"]["status"] for item in history["results"]} == {
+        "current",
+        "superseded",
     }
 
 
-def test_knowledge_search_matches_content_and_provenance_not_json_field_names(
-    tmp_path: Path, monkeypatch, capsys,
+def test_source_escape_is_rejected_even_with_supplied_bytes(tmp_path: Path) -> None:
+    prepared, problems = prepare_knowledge_record(
+        tmp_path,
+        repo_id="",
+        kind="decision",
+        claim="No escape",
+        reason="Source must be inside workspace",
+        sources=["../external.md"],
+        source_bytes={"../external.md": b"content"},
+    )
+    assert prepared is None and problems
+
+
+def test_existing_historical_source_is_a_plain_file(tmp_path: Path) -> None:
+    relative = "docs/archive/legacy/evidence.json"
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"historical":true}\r\n')
+    record, problems, _ = add_knowledge_record(
+        tmp_path,
+        repo_id="",
+        kind="decision",
+        claim="Historical decision",
+        reason="Original source remains readable",
+        sources=[relative],
+    )
+    assert not problems
+    assert record["record"]["source_refs"][0]["kind"] == "workspace_file"
+    data, problems = check_knowledge_records(tmp_path, repo_id="")
+    assert (
+        not problems
+        and data["records"][0]["source_resolutions"][0]["status"] == "current"
+    )
+
+
+def test_repository_at_workspace_root_keeps_code_refs_and_task_provenance_distinct(
+    tmp_path: Path,
 ) -> None:
-    _setup_knowledge_workspace(tmp_path, monkeypatch)
-    record = _add_knowledge_source(capsys, claim="Keep sensor forwarding distinct from virtual devices.")["data"]["record"]
-    for query in ("content", "declared", "resolution"):
-        assert main(["knowledge", "query", query, "--repo-id", "main", "--json"]) == 0
-        assert _payload(capsys)["data"]["results"] == []
-    for query in ("sensor forwarding", record["id"], record["source_refs"][0]["path"], record["source_refs"][0]["content_sha256"]):
-        assert main(["knowledge", "query", query, "--repo-id", "main", "--json"]) == 0
-        assert _payload(capsys)["data"]["results"][0]["record"]["id"] == record["id"]
-    content = _add_knowledge_source(capsys, claim="Keep content resolution separate from delivery.")["data"]["record"]
-    assert main(["knowledge", "query", "content resolution", "--repo-id", "main", "--json"]) == 0
-    assert [item["record"]["id"] for item in _payload(capsys)["data"]["results"]] == [content["id"]]
+    from tests.repoctl.repository.test_repositories import write_settings
+
+    init_repo(tmp_path)
+    write_settings(tmp_path, {"repositories": [{"id": "main", "path": "."}]})
+    (tmp_path / "app.py").write_text("value = 1\n")
+    task_path = tmp_path / "docs/archive/tasks/finished.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("Completed Task\n")
+    prepared, problems = prepare_knowledge_record(
+        tmp_path,
+        repo_id="main",
+        kind="decision",
+        claim="Root repository source",
+        reason="Code is a code anchor and Task is provenance",
+        sources=["./app.py", "docs/archive/tasks/finished.md"],
+    )
+    assert prepared is not None and not problems
+    assert [ref["kind"] for ref in prepared.data["source_refs"]] == [
+        "current_source",
+        "task_artifact",
+    ]
 
 
-@pytest.mark.parametrize("operation", ["add", "finish"])
-def test_workspace_task_knowledge_is_searchable_and_linked_without_product(
-    tmp_path: Path, monkeypatch, capsys, operation: str,
+def test_malformed_source_references_are_reported_without_hiding_valid_records(
+    tmp_path: Path,
 ) -> None:
-    write_workspace(tmp_path)
-    write_settings(tmp_path, {"debug_mode": True})
-    monkeypatch.setattr(cli, "find_workspace_root", lambda: tmp_path)
-    task_id = "T-20260609184059Z"
-    add_task(tmp_path, f"{task_id}--workspace.md", task_text(task_id).replace('area: ""', 'area: "ops"'))
-    (tmp_path / "docs/BOARD.md").write_text(f"# BOARD\n\n## Board\n\n- docs/tasks/{task_id}--workspace.md\n\n## Backlog\n")
-    assert main(["task", "start", task_id, "--json"]) == 0
-    _payload(capsys)
-    assert main(["graph", "build", "--workspace", "--json"]) == 0
-    _payload(capsys)
-    knowledge_args = ["--kind", "failure_mode", "--claim", "Reviewed external paths retain baseline and ownership boundaries.",
-                      "--reason", "External dirty work must survive another task closing."]
-    if operation == "finish":
-        finish_args = [value.replace("--", "--knowledge-", 1) if value.startswith("--") else value for value in knowledge_args]
-        assert main(["task", "finish", task_id, *finish_args, "--json"]) == 0
-        result = _payload(capsys)
-        record_id = Path(result["data"]["knowledge_closeout"]["record_path"]).stem
-        sync = result["data"]["knowledge_closeout"]["graph_sync"]
-    else:
-        assert main(["task", "finish", task_id, "--json"]) == 0
-        _payload(capsys)
-        assert main(["knowledge", "add", "--workspace", *knowledge_args,
-                     "--source", f"docs/archive/tasks/{task_id}--workspace.md", "--json"]) == 0
-        result = _payload(capsys)
-        record_id = result["data"]["record"]["id"]
-        sync = result["data"]["graph_sync"]
-    assert result["ok"] is True
-    assert sync["status"] == "synced"
-    saved_event = json.loads((tmp_path / DEBUG_EVENTS_REL).read_text().splitlines()[-1])
-    assert saved_event["result"]["status"] == "saved"
-    assert saved_event["result"]["references"] == [{"record_id": record_id}]
-    assert not [warning for warning in result["warnings"] if warning["code"] == "knowledge_graph_sync_failed"]
-    assert main(["knowledge", "query", "external paths", "--workspace", "--json"]) == 0
-    assert _payload(capsys)["data"]["results"][0]["record"]["id"] == record_id
-    assert main(["graph", "query", "--workspace", "--task", task_id, "--json"]) == 0
-    graph = _payload(capsys)
-    assert "KNOWLEDGE_SOURCED_FROM" in json.dumps(graph["data"])
-    assert record_id in json.dumps(graph["data"])
-    assert main(["repo", "list", "--json"]) == 0
-    assert _payload(capsys)["data"]["targets"] == []
-    assert main(["upgrade", "postflight", "--json"]) == 0
-    postflight = _payload(capsys)
-    assert not [problem for problem in postflight["problems"] if problem["severity"] == "error"]
-
-
-def test_workspace_knowledge_keeps_product_scope_separate(tmp_path: Path, monkeypatch, capsys) -> None:
-    repo = _setup_knowledge_workspace(tmp_path, monkeypatch)
-    source = repo / "service.py"
-    source.write_text("VALUE = 'external dirty work'\n")
-    before = source.read_bytes()
-    args = ["knowledge", "add", "--workspace", "--claim", "Use workspace source bundles.", "--reason", "Keep product scope separate."]
-    for path in ("repos/service.py", "docs/product-link.py"):
-        if path.startswith("docs/"):
-            (tmp_path / path).symlink_to(source)
-        assert main([*args, "--source", path, "--json"]) == 1
-        assert _payload(capsys)["problems"][0]["code"] == "knowledge_source_repo_required"
-    assert main([*args, "--source", "AGENTS.md", "--applies-to", "service.py", "--json"]) == 1
-    assert _payload(capsys)["problems"][0]["code"] == "knowledge_applies_to_invalid"
-    assert main([*args, "--source", "AGENTS.md", "--json"]) == 0
-    workspace_record = _payload(capsys)["data"]["record"]["id"]
-    product_record = _add_knowledge_source(capsys)["data"]["record"]["id"]
-    for scope, expected, excluded in ((["--workspace"], workspace_record, product_record), (["--repo-id", "main"], product_record, workspace_record)):
-        assert main(["knowledge", "query", "source bundles", *scope, "--json"]) == 0
-        ids = [item["record"]["id"] for item in _payload(capsys)["data"]["results"]]
-        assert expected in ids and excluded not in ids
-    assert source.read_bytes() == before
+    init_repo(tmp_path / "repos")
+    (tmp_path / "repos/source.py").write_text("value = 1\n")
+    record = add(tmp_path, "valid decision")
+    broken = {**record, "id": "broken", "source_refs": ["repos/source.py"]}
+    path = tmp_path / "docs/knowledge/records/broken.json"
+    path.write_text(json.dumps(broken))
+    data, problems = check_knowledge_records(tmp_path, repo_id="main")
+    assert [item["id"] for item in data["records"]] == [record["id"]]
+    assert len(problems) == 1
+    assert problems[0].code == "knowledge_record_unreadable"
+    assert problems[0].path == "docs/knowledge/records/broken.json"

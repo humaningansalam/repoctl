@@ -5,15 +5,14 @@ from pathlib import Path
 
 from tools.repoctl.cli import main
 from tests.repoctl.workspace.test_check import write_workspace
-from tests.repoctl.meta.test_meta_check import init_repo, write_repometa
+from tests.repoctl.repository.test_repositories import init_repo
 
 
-def test_index_code_extracts_python_facts_without_writing_annotations(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_index_code_extracts_python_facts(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     repo.mkdir()
     init_repo(repo)
-    write_repometa(repo)
     rel = "backend/auth/token_service.py"
     (repo / "backend/auth").mkdir(parents=True)
     (repo / rel).write_text(
@@ -24,7 +23,6 @@ def test_index_code_extracts_python_facts_without_writing_annotations(tmp_path: 
         "        Path('token.txt').write_text(hashlib.sha256(value).hexdigest())\n",
         encoding="utf-8",
     )
-    before = (repo / ".repometa/annotations" / "0.json").read_text(encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
     assert main(["index", "code", "--json"]) == 0
@@ -44,7 +42,6 @@ def test_index_code_extracts_python_facts_without_writing_annotations(tmp_path: 
     assert "hashlib.sha256" in entry["calls"]
     assert entry["deps"] == ["hashlib", "pathlib"]
     assert {"crypto", "fs"} <= set(entry["observed_effects"])
-    assert (repo / ".repometa/annotations" / "0.json").read_text(encoding="utf-8") == before
 
 
 def test_index_code_keeps_typescript_inventory_separate_from_semantic_provider(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -52,7 +49,6 @@ def test_index_code_keeps_typescript_inventory_separate_from_semantic_provider(t
     repo = tmp_path / "repos"
     repo.mkdir()
     init_repo(repo)
-    write_repometa(repo)
     rel = "frontend/src/api/billingGateway.ts"
     (repo / "frontend/src/api").mkdir(parents=True)
     (repo / rel).write_text(
@@ -80,7 +76,6 @@ def test_index_code_extracts_dart_and_csharp_inventory(tmp_path: Path, monkeypat
     repo = tmp_path / "repos"
     repo.mkdir()
     init_repo(repo)
-    write_repometa(repo)
     (repo / "lib").mkdir()
     (repo / "Assets/Scripts").mkdir(parents=True)
     (repo / "lib/main.dart").write_text("import 'package:demo/app.dart';\nvoid main() {}\n", encoding="utf-8")
@@ -106,7 +101,6 @@ def test_index_code_changed_requires_repo_git(tmp_path: Path, monkeypatch, capsy
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     repo.mkdir()
-    write_repometa(repo)
     (repo / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
@@ -114,7 +108,7 @@ def test_index_code_changed_requires_repo_git(tmp_path: Path, monkeypatch, capsy
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
-    assert any(problem["code"] == "repository_identity_unbound" for problem in payload["problems"])
+    assert any(problem["code"] == "repository_not_found" for problem in payload["problems"])
 
 
 def test_index_code_reports_truncation_separately_from_total(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -122,7 +116,6 @@ def test_index_code_reports_truncation_separately_from_total(tmp_path: Path, mon
     repo = tmp_path / "repos"
     repo.mkdir()
     init_repo(repo)
-    write_repometa(repo)
     for index in range(3):
         (repo / f"mod{index}.py").write_text(f"def run_{index}():\n    return {index}\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
@@ -135,4 +128,3 @@ def test_index_code_reports_truncation_separately_from_total(tmp_path: Path, mon
     assert summary["returned"] == 2
     assert summary["truncated"] is True
     assert summary["dropped_count"] == 1
-    assert any(warning["code"] == "index_truncated" for warning in payload["warnings"])

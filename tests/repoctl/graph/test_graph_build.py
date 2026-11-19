@@ -8,12 +8,11 @@ from pathlib import Path
 from tools.repoctl.code_index import CodeIndexEntry
 from tools.repoctl.cli import main
 from tools.repoctl.graph import build_graph
-from tools.repoctl.graph_model import canonical_json, file_id, import_ref_id, topic_id
+from tools.repoctl.graph_model import canonical_json, file_id, import_ref_id
 from tools.repoctl.graph_store import load_materialized_graph, materialize_graph
 from tools.repoctl.repositories import RepoTarget, require_repo_target
-from tools.repoctl.tasks import Problem
+from tools.repoctl.io import Problem
 from tests.repoctl.workspace.test_check import write_workspace
-from tests.repoctl.meta.test_meta_check import BASE_POLICY, write_repometa
 from tests.repoctl.repository.test_repositories import init_repo, write_settings
 
 
@@ -35,7 +34,6 @@ def test_graph_build_direct_repo_uses_main(tmp_path: Path, monkeypatch, capsys) 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "app.py").write_text("import hashlib\n\ndef run():\n    return hashlib.sha256(b'x').hexdigest()\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
@@ -52,7 +50,6 @@ def test_graph_language_capabilities_do_not_claim_semantics_for_config_languages
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "config.yaml").write_text("feature: enabled\n", encoding="utf-8")
     (repo / "index.html").write_text("<main>searchable product surface</main>\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
@@ -78,7 +75,6 @@ def test_graph_build_json_is_summary_first_without_full(tmp_path: Path, monkeypa
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
@@ -88,9 +84,10 @@ def test_graph_build_json_is_summary_first_without_full(tmp_path: Path, monkeypa
     assert "snapshot" not in payload["data"]
     summary = payload["data"]["summary"]
     assert summary["repository"] == {"id": "main", "path": "repos", "identity_source": "reserved"}
-    assert summary["node_counts"]["file"] == 1
-    assert summary["edge_counts"]["CONTAINS"] == 1
-    assert payload["data"]["materialization"]["code_index"]["changed_path_count"] == 1
+    assert summary["node_count"] >= 2
+    assert summary["edge_count"] >= 1
+    assert summary["snapshot_digest"].startswith("sha256:")
+    assert payload["data"]["materialization"]["code_index"]["changed_paths"] == ["app.py"]
     assert "provider_coverage" not in payload["data"]
     assert "semantic_providers" not in summary
 
@@ -99,7 +96,6 @@ def test_graph_build_excludes_generated_dependency_dirs_by_default(tmp_path: Pat
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     (repo / ".venv/lib/python3.11/site-packages/pkg").mkdir(parents=True)
     (repo / ".venv/lib/python3.11/site-packages/pkg/noise.py").write_text("def vendor():\n    return 1\n", encoding="utf-8")
@@ -122,8 +118,6 @@ def test_graph_build_configured_multi_requires_repo_id(tmp_path: Path, monkeypat
     write_workspace(tmp_path)
     init_repo(tmp_path / "repos/web")
     init_repo(tmp_path / "repos/api")
-    write_repometa(tmp_path / "repos/web")
-    write_repometa(tmp_path / "repos/api")
     write_settings(tmp_path, {"repositories": [{"id": "web", "path": "repos/web"}, {"id": "api", "path": "repos/api"}]})
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
@@ -138,8 +132,6 @@ def test_graph_build_configured_multi_includes_only_selected_repo(tmp_path: Path
     api = tmp_path / "repos/api"
     init_repo(web)
     init_repo(api)
-    write_repometa(web)
-    write_repometa(api)
     (web / "app.py").write_text("import requests\n", encoding="utf-8")
     (api / "app.py").write_text("import urllib.request\n", encoding="utf-8")
     write_settings(tmp_path, {"repositories": [{"id": "web", "path": "repos/web"}, {"id": "api", "path": "repos/api"}]})
@@ -161,38 +153,13 @@ def test_graph_build_unconfigured_collection_fails(tmp_path: Path, monkeypatch, 
     assert main(["graph", "build", "--repo-id", "web", "--full", "--json"]) == 2
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["problems"][0]["code"] == "repository_identity_unbound"
+    assert payload["problems"][0]["code"] == "repository_not_found"
 
-def test_graph_topics_keep_policy_and_annotation_provenance(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    repo = tmp_path / "repos"
-    init_repo(repo)
-    rel = "backend/auth/token_service.py"
-    (repo / "backend/auth").mkdir(parents=True)
-    (repo / rel).write_text("def issue():\n    return 'token'\n", encoding="utf-8")
-    write_repometa(
-        repo,
-        annotations={rel: {"role": "service", "purpose": "issue tokens", "topics": ["session"], "declared_effects": ["none"], "caution": []}},
-    )
-    before = {path.as_posix(): path.read_text(encoding="utf-8") for path in (repo / ".repometa").rglob("*.json")}
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-
-    assert main(["graph", "build", "--full", "--json"]) == 0
-
-    snapshot = _snapshot(json.loads(capsys.readouterr().out))
-    file_node = next(node for node in snapshot["nodes"] if node["id"] == file_id("main", rel))
-    assert file_node["facts"]["policy"]["topics"] == ["auth"]
-    assert file_node["facts"]["annotation"]["topics"] == ["session"]
-    assert any(edge["kind"] == "HAS_TOPIC" and edge["to"] == topic_id("main", "auth") and edge["assertion"] == "default" for edge in snapshot["edges"])
-    assert any(edge["kind"] == "HAS_TOPIC" and edge["to"] == topic_id("main", "session") and edge["assertion"] == "declared" for edge in snapshot["edges"])
-    after = {path.as_posix(): path.read_text(encoding="utf-8") for path in (repo / ".repometa").rglob("*.json")}
-    assert after == before
 
 def test_graph_snapshot_digest_is_stable_after_incremental_round_trip(tmp_path: Path) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "lib").mkdir()
     (repo / "lib/main.dart").write_text(
         "import 'z.dart';\n"
@@ -221,7 +188,6 @@ def test_graph_materialization_updates_only_changed_python_dependents(tmp_path: 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "a.py").write_text("def target():\n    return 1\n", encoding="utf-8")
     (repo / "b.py").write_text("from a import target\n", encoding="utf-8")
     (repo / "c.py").write_text("from b import target\n\ndef caller():\n    return target()\n", encoding="utf-8")
@@ -288,7 +254,6 @@ def test_graph_materialization_invalidates_importers_when_module_identity_become
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "pyproject.toml").write_text(
         '[tool.setuptools]\npackage-dir = {"" = "src"}\n\n[tool.setuptools.packages.find]\nwhere = ["src"]\n',
         encoding="utf-8",
@@ -326,7 +291,6 @@ def test_graph_materialization_reuses_unchanged_source_evidence(tmp_path: Path) 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     target = require_repo_target(tmp_path, repo_id="main")
     first, problems, _meta = materialize_graph(tmp_path, target=target)
@@ -365,7 +329,6 @@ def test_graph_materialization_rebuilds_relations_when_structured_input_version_
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "Dockerfile").write_text("FROM scratch\nCOPY app.py /app/app.py\n", encoding="utf-8")
     (repo / "compose.yml").write_text(
         "services:\n  app:\n    build:\n      context: .\n      dockerfile: Dockerfile\n",
@@ -412,7 +375,6 @@ def test_graph_index_truncation_fails(tmp_path: Path, monkeypatch) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     target = require_repo_target(tmp_path, repo_id="main")
 
     def truncated_index(*args, **kwargs):
@@ -429,7 +391,6 @@ def test_graph_build_keeps_snapshot_with_code_index_warning(tmp_path: Path, monk
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     target = require_repo_target(tmp_path, repo_id="main")
 
     def warning_index(*args, **kwargs):
@@ -463,7 +424,6 @@ def test_graph_parse_error_keeps_file_node_and_marks_completeness(tmp_path: Path
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "bad.py").write_text("def broken(:\n", encoding="utf-8")
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
@@ -479,13 +439,11 @@ def test_graph_id_encoding_avoids_collisions() -> None:
     assert file_id("main", "a/b") != file_id("main", "a%2Fb")
     assert import_ref_id("main", "app.ts", "typescript", "a:b") != import_ref_id("main", "app.ts", "typescript", "a/b")
     assert import_ref_id("main", "one/app.ts", "typescript", "axios") != import_ref_id("main", "two/app.ts", "typescript", "axios")
-    assert topic_id("web", "auth") != topic_id("api", "auth")
 
 def test_graph_python_ast_provider_adds_symbol_and_anchor_nodes(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "service.py").write_text(
         "class TokenService:\n"
         "    def issue(self):\n"
@@ -509,32 +467,11 @@ def test_graph_python_ast_provider_adds_symbol_and_anchor_nodes(tmp_path: Path, 
     assert any(edge["kind"] == "ANCHORS" and edge["assertion"] == "resolved" and edge["source"] == "python_ast" for edge in snapshot["edges"])
 
 
-def test_graph_semantic_providers_respect_hard_excludes(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    repo = tmp_path / "repos"
-    init_repo(repo)
-    policy = copy.deepcopy(BASE_POLICY)
-    policy["indexing"]["exclude"].append("secret.py")
-    write_repometa(repo, policy=policy, exclusions={"visible.py": {"reason": "annotation exemption"}})
-    (repo / "secret.py").write_text("def hidden_symbol():\n    return 1\n", encoding="utf-8")
-    (repo / "visible.py").write_text("def visible_symbol():\n    return 1\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-
-    assert main(["graph", "build", "--full", "--json"]) == 0
-
-    snapshot = _snapshot(json.loads(capsys.readouterr().out))
-    symbols = [node for node in snapshot["nodes"] if node["kind"] == "symbol"]
-    assert {node["facts"]["provider"]["qualified_name"] for node in symbols} == {"visible_symbol"}
-    secret = next(node for node in snapshot["nodes"] if node["id"] == file_id("main", "secret.py"))
-    assert secret["facts"]["index"]["classification"] == "excluded"
-    assert secret["facts"]["index"]["parse_status"] == "skipped"
-    assert not any(edge["kind"] in {"DEFINES", "ANCHORS", "CALLS", "IMPORTS_FILE"} and edge["from"] == secret["id"] for edge in snapshot["edges"])
 
 def test_graph_python_ast_provider_distinguishes_nested_function_from_method(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "nested.py").write_text(
         "class Service:\n"
         "    def method(self):\n"

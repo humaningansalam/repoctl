@@ -30,7 +30,7 @@ from .document_roles import (
 from .graph_model import GraphSnapshot, digest_data
 from .language_profiles import collect_verification_hints
 from .repositories import RepoTarget
-from .tasks import Problem
+from .io import Problem
 
 
 EVIDENCE_INDEX_SCHEMA = "repoctl.evidence.index"
@@ -579,7 +579,6 @@ def materialize_evidence_index(
                 "problems": [
                     problem.to_dict()
                     for problem in problems
-                    if problem.code != "invalid_completion_receipt"
                 ],
             }
             _write_metadata(connection, metadata)

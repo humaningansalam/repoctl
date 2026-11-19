@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from enum import StrEnum
-import re
 from pathlib import PurePosixPath
 
 
@@ -72,21 +71,9 @@ def classify_document_role(path: str, *, repository_path: str = "") -> DocumentR
 
 
 
-_NOT_ADOPTED = re.compile(
-    r"(?im)^(?:status|decision status|adoption status)\s*:\s*(?:draft|proposed|research|experimental|superseded|rejected|retired)\b"
-)
-
-
 def declared_document_role(text: str, *, path: str, repository_path: str = "") -> DocumentRole:
-    """Do not promote an explicitly unadopted proposal because of its path.
-
-    Files lacking a status keep the conventional path role. This is a source
-    annotation, not a new external approval database or lifecycle gate.
-    """
-    role = classify_document_role(path, repository_path=repository_path)
-    if role in AUTHORITY_DOCUMENT_ROLES and _NOT_ADOPTED.search("\n".join(text.splitlines()[:32])):
-        return DocumentRole.REFERENCE
-    return role
+    """Classify navigation by location; prose does not confer or revoke authority."""
+    return classify_document_role(path, repository_path=repository_path)
 
 
 def source_document_role(

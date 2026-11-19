@@ -9,7 +9,6 @@ from tests.repoctl.workspace.test_check import (
     task_text as task_text,
     write_workspace as write_workspace,
 )
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 
 
@@ -17,12 +16,10 @@ from tests.repoctl.repository.test_repositories import init_repo
 def _write_knowledge_docs(root: Path) -> None:
     (root / "docs/adr").mkdir(parents=True, exist_ok=True)
     (root / "docs/contracts").mkdir(parents=True, exist_ok=True)
-    (root / ".repoctl-state/knowledge").mkdir(parents=True, exist_ok=True)
     (root / "docs/contracts/repoctl-evidence-contract.md").write_text(
         "# repoctl Context contract\n\n## Decision\n\nContext returns source bundles but does not create authoritative knowledge.\n\n## Authority Rules\n\nSaved Knowledge requires an explicit claim, reason, and source.\n",
         encoding="utf-8",
     )
-    (root / ".repoctl-state/knowledge/private-plan.md").write_text("# Private Plan\n\nDo not ingest this.\n", encoding="utf-8")
 
 
 def _setup_knowledge_workspace(root: Path, monkeypatch) -> Path:
@@ -30,7 +27,6 @@ def _setup_knowledge_workspace(root: Path, monkeypatch) -> Path:
     _write_knowledge_docs(root)
     repo = root / "repos"
     init_repo(repo)
-    write_repometa(repo)
     monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: root)
     return repo
 
@@ -40,8 +36,6 @@ def _setup_knowledge_multirepo_workspace(root: Path, monkeypatch) -> None:
     _write_knowledge_docs(root)
     init_repo(root / "repos/web")
     init_repo(root / "repos/api")
-    write_repometa(root / "repos/web")
-    write_repometa(root / "repos/api")
     (root / "docs/repoctl.json").write_text(
         json.dumps({"repositories": [{"id": "web", "path": "repos/web"}, {"id": "api", "path": "repos/api"}]}),
         encoding="utf-8",

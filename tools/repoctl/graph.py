@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .code_index import CodeIndexEntry, build_code_index, semantic_provider_entries
-from .completion_catalogue import CompletionCatalogueUnavailable, CompletionGraphInput, lookup_completion_exact
+from .task_history import TaskHistoryEntry, lookup_task_history
 from .component_projection import (
     DEFAULT_COMPONENT_MANIFEST_REGISTRY,
     ComponentManifestRegistry,
@@ -16,44 +16,20 @@ from .component_projection import (
 )
 from .git import normalize_repo_path
 from .graph_import_resolver import IMPORT_RESOLVER_LANGUAGES, resolve_code_imports
-from .graph_model import GRAPH_QUERY_SELECTOR_SCHEMAS, GraphContextAnchor, GraphContextAnchorKind, GraphContinuation, GraphEdge, GraphNode, GraphQuerySelectorKind, GraphSnapshot, ProviderCoverage, anchor_id, artifact_id, canonical_graph_query_selector, change_event_id, digest_data, document_id, file_id, import_ref_id, knowledge_id, repository_id, symbol_id, task_id as graph_task_id, topic_id
+from .graph_model import GRAPH_QUERY_SELECTOR_SCHEMAS, GraphContextAnchor, GraphContextAnchorKind, GraphContinuation, GraphEdge, GraphNode, GraphQuerySelectorKind, GraphSnapshot, ProviderCoverage, anchor_id, artifact_id, canonical_graph_query_selector, digest_data, document_id, file_id, import_ref_id, knowledge_id, repository_id, symbol_id, task_id as graph_task_id
 from .graph_semantic_model import SemanticProviderResult
 from .graph_semantic_provider import build_semantic_providers
 from .graph_structured_relations import RpcResolutionOutcome, STRUCTURED_EDGE_KIND, build_structured_file_relations
 from .language_profiles import graph_language_capabilities, is_semantic_source_language, language_for_path
 from .knowledge_records import KnowledgeExplicitPathKind, KnowledgeExplicitPathRole, knowledge_records_for_graph
-from .io import RepoctlError
-from .meta import RepoMetadataFacts, read_metadata_facts, without_absent_repometa
+from .io import Problem, RepoctlError
 from .path_roles import is_test_path
 from .repositories import RepoSelectorResolution, RepoSelectorStatus, RepoTarget, resolve_repo_selector_path
-from .tasks import Problem, completion_receipt_task_path, normalize_task_id
+from .tasks import normalize_task_id
 
 
 def _has_errors(problems: list[Problem]) -> bool:
     return any(problem.severity == "error" for problem in problems)
-
-
-def _annotation_topics(annotation: dict[str, Any] | None) -> list[str]:
-    if not annotation:
-        return []
-    topics = annotation.get("topics")
-    if not isinstance(topics, list):
-        return []
-    return sorted({str(topic) for topic in topics if str(topic).strip()})
-
-
-def _annotation_payload(annotation: dict[str, Any] | None) -> dict[str, Any]:
-    if not annotation:
-        return {}
-    payload: dict[str, Any] = {}
-    for key in ("role", "purpose", "topics", "declared_effects", "caution"):
-        if key in annotation:
-            value = annotation[key]
-            if isinstance(value, list):
-                payload[key] = sorted({str(item) for item in value if str(item).strip()})
-            else:
-                payload[key] = value
-    return payload
 
 
 def _import_provider_coverage(
@@ -218,26 +194,8 @@ def _index_facts(entry: CodeIndexEntry) -> dict[str, Any]:
     return facts
 
 
-def _file_node(repo_id: str, entry: CodeIndexEntry, metadata: RepoMetadataFacts | None) -> GraphNode:
-    facts: dict[str, Any] = {"index": _index_facts(entry)}
-    if metadata is not None:
-        if metadata.annotation is not None:
-            facts["annotation"] = _annotation_payload(metadata.annotation)
-        if metadata.areas or metadata.policy_topics:
-            facts["policy"] = {
-                "areas": list(metadata.areas),
-                "topics": list(metadata.policy_topics),
-            }
-    return GraphNode(
-        id=file_id(repo_id, entry.path),
-        kind="file",
-        identity={
-            "repo_id": repo_id,
-            "path": entry.path,
-            "workspace_path": entry.workspace_path,
-        },
-        facts=facts,
-    )
+def _file_node(repo_id: str, entry: CodeIndexEntry) -> GraphNode:
+    return GraphNode(id=file_id(repo_id, entry.path), kind="file", identity={"repo_id": repo_id, "path": entry.path, "workspace_path": entry.workspace_path}, facts={"index": _index_facts(entry)})
 
 
 def _materialize_component_manifest(
@@ -298,10 +256,9 @@ def build_graph(
     code_index_result: tuple[list[CodeIndexEntry], list[Problem], dict[str, Any]] | None = None,
     cached_semantic_results: list[SemanticProviderResult] | None = None,
     provider_results_out: list[SemanticProviderResult] | None = None,
-    completion_inputs: tuple[CompletionGraphInput, ...] = (),
-    completion_problems: tuple[Problem, ...] = (),
+    task_inputs: tuple[TaskHistoryEntry, ...] = (),
     component_manifest_registry: ComponentManifestRegistry = DEFAULT_COMPONENT_MANIFEST_REGISTRY,
-    include_historical_receipt_files: bool = False,
+    include_declared_paths: bool = False,
     include_knowledge: bool = True,
 ) -> tuple[GraphSnapshot | None, list[Problem], dict[str, Any]]:
     entries, index_problems, index_meta = code_index_result or (([], [], {"summary": {}}) if not target.id else build_code_index(root, changed=False, limit=-1, target=target))
@@ -323,25 +280,8 @@ def build_graph(
             {"repository": target.to_dict(), "index": summary},
         )
 
-    if not target.id:
-        metadata_facts, metadata_problems, metadata_meta, metadata_absent = [], [], {}, False
-    else:
-        metadata_facts, metadata_problems, metadata_meta = read_metadata_facts(root, target=target)
-        metadata_problems, metadata_absent = without_absent_repometa(metadata_problems, repo=target.root_path)
-    problems = [*index_problems, *metadata_problems]
-    if metadata_absent:
-        problems.append(Problem("warning", "graph_metadata_unavailable", "repository metadata is not initialized; Graph source relations were materialized without metadata enrichment", f"{target.display_path}/.repometa/policy.json", "missing_repometa_policy"))
-    problems.extend(completion_problems)
-    invalid_completion_problems = tuple(
-        problem
-        for problem in completion_problems
-        if problem.code != "completion_catalogue_hot_history_partial"
-    )
-    if _has_errors(metadata_problems):
-        return None, problems, {"repository": target.to_dict()}
-
+    problems = list(index_problems)
     repo_id = target.id
-    metadata_by_path = {fact.path: fact for fact in metadata_facts}
     nodes: dict[str, GraphNode] = {
         repository_id(repo_id): GraphNode(
             id=repository_id(repo_id),
@@ -354,9 +294,9 @@ def build_graph(
     def add_edge(edge: GraphEdge) -> None:
         edges[(edge.kind, edge.from_id, edge.to_id, edge.assertion, edge.source)] = edge
 
-    def receipt_file_node(path: str) -> str | None:
+    def declared_file_node(path: str) -> str | None:
         node_id = file_id(repo_id, path)
-        if node_id not in nodes and not include_historical_receipt_files:
+        if node_id not in nodes and not include_declared_paths:
             return None
         nodes.setdefault(
             node_id,
@@ -364,14 +304,14 @@ def build_graph(
                 id=node_id,
                 kind="file",
                 identity={"repo_id": repo_id, "path": path, "workspace_path": f"{target.display_path}/{path}"},
-                facts={"receipt": {"present_in_current_inventory": False}},
+                facts={"inventory": {"present_in_current_inventory": False}},
             ),
         )
         return node_id
 
     for entry in entries:
         file_node = _materialize_component_manifest(
-            _file_node(repo_id, entry, metadata_by_path.get(entry.path)),
+            _file_node(repo_id, entry),
             repository_root=target.root_path,
             registry=component_manifest_registry,
         )
@@ -409,86 +349,19 @@ def build_graph(
             )
             add_edge(GraphEdge("DECLARES_IMPORT", file_node.id, import_node_id, "observed", "code_index"))
 
-        metadata = metadata_by_path.get(entry.path)
-        if metadata is None:
-            continue
-        for topic in metadata.policy_topics:
-            topic_node_id = topic_id(repo_id, topic)
-            nodes.setdefault(topic_node_id, GraphNode(id=topic_node_id, kind="topic", identity={"repo_id": repo_id, "topic": topic}))
-            add_edge(GraphEdge("HAS_TOPIC", file_node.id, topic_node_id, "default", "repometa_policy"))
-        for topic in _annotation_topics(metadata.annotation):
-            topic_node_id = topic_id(repo_id, topic)
-            nodes.setdefault(topic_node_id, GraphNode(id=topic_node_id, kind="topic", identity={"repo_id": repo_id, "topic": topic}))
-            add_edge(GraphEdge("HAS_TOPIC", file_node.id, topic_node_id, "declared", "repometa_annotation"))
-
-    for completion_input in completion_inputs:
-        receipt = completion_input.receipt
-        receipt_task_id = str(receipt.get("task_id") or "")
-        if not receipt_task_id:
-            continue
-        receipt_task_path = completion_receipt_task_path(receipt)
-        task_node_id = graph_task_id(receipt_task_id)
-        nodes[task_node_id] = GraphNode(
-            id=task_node_id,
-            kind="task",
-            identity={"task_id": receipt_task_id, "repo_id": repo_id},
-            facts={
-                "receipt": {
-                    "status": str(receipt.get("status") or ""),
-                    "task_path_at_completion": receipt_task_path,
-                    "completed_at": str(receipt.get("completed_at") or ""),
-                    "content_sha256": str(receipt.get("content_sha256") or ""),
-                    "repo_evidence": receipt.get("repo_evidence") if isinstance(receipt.get("repo_evidence"), dict) else {},
-                }
-            },
-        )
-        verification = receipt.get("verification") if isinstance(receipt.get("verification"), dict) else {}
-        artifact_path = completion_input.artifact_path
-        if artifact_path:
-            artifact_node_id = artifact_id(receipt_task_id, artifact_path)
-            artifact_receipt = {
-                "content_sha256": str(receipt.get("content_sha256") or "")
-            }
-            if verification:
-                artifact_receipt["verification"] = verification
-            nodes[artifact_node_id] = GraphNode(
-                id=artifact_node_id,
-                kind="artifact",
-                identity={"task_id": receipt_task_id, "path": artifact_path},
-                facts={"receipt": artifact_receipt},
-            )
-            add_edge(GraphEdge("TASK_VERIFIED_BY", task_node_id, artifact_node_id, "recorded", "task_completion"))
-        repo_evidence = receipt.get("repo_evidence") if isinstance(receipt.get("repo_evidence"), dict) else {}
-        attribution = str(repo_evidence.get("attribution") or "none")
-        task_owns_changes = attribution == "task_working_tree"
-        raw_changes = receipt.get("changed_entries") if isinstance(receipt.get("changed_entries"), list) else []
-        for index, raw_change in enumerate(raw_changes):
-            if not isinstance(raw_change, dict):
+    for task in task_inputs:
+        task_node_id = graph_task_id(task.task_id)
+        nodes[task_node_id] = GraphNode(id=task_node_id, kind="task", identity={"task_id": task.task_id, "repo_id": repo_id}, facts={"task": task.to_dict()})
+        artifact_node_id = artifact_id(task.task_id, task.path)
+        nodes[artifact_node_id] = GraphNode(id=artifact_node_id, kind="artifact", identity={"task_id": task.task_id, "path": task.path}, facts={"document": {"content_sha256": task.content_sha256}})
+        add_edge(GraphEdge("TASK_DOCUMENTED_BY", task_node_id, artifact_node_id, "recorded", "task_document"))
+        for chosen in task.chosen_paths:
+            resolution = resolve_repo_selector_path(chosen, repository_path=target.display_path)
+            if resolution.status != RepoSelectorStatus.RESOLVED:
                 continue
-            change = str(raw_change.get("change") or "")
-            path = str(raw_change.get("path") or "")
-            old_path = str(raw_change.get("old_path") or "")
-            if not change or not path:
-                continue
-            change_node_id = change_event_id(receipt_task_id, index)
-            nodes[change_node_id] = GraphNode(
-                id=change_node_id,
-                kind="change_event",
-                identity={"task_id": receipt_task_id, "index": index},
-                facts={"receipt": {"change": change, "path": path, "old_path": old_path, "attribution": attribution}},
-            )
-            add_edge(GraphEdge("TASK_RECORDED_CHANGE", task_node_id, change_node_id, "recorded", "task_completion", {"attribution": attribution}))
-            affected_file_id = receipt_file_node(path)
-            if affected_file_id is not None:
-                add_edge(GraphEdge("CHANGE_AFFECTED_FILE", change_node_id, affected_file_id, "recorded", "task_completion", {"role": "path"}))
-                if task_owns_changes:
-                    add_edge(GraphEdge("TASK_CHANGED_FILE", task_node_id, affected_file_id, "recorded", "task_completion", {"change": change, "role": "path"}))
-            if old_path:
-                old_file_id = receipt_file_node(old_path)
-                if old_file_id is not None:
-                    add_edge(GraphEdge("CHANGE_AFFECTED_FILE", change_node_id, old_file_id, "recorded", "task_completion", {"role": "old_path"}))
-                    if task_owns_changes:
-                        add_edge(GraphEdge("TASK_CHANGED_FILE", task_node_id, old_file_id, "recorded", "task_completion", {"change": change, "role": "old_path"}))
+            file_node_id = declared_file_node(resolution.path)
+            if file_node_id is not None:
+                add_edge(GraphEdge("TASK_REFERENCES_FILE", task_node_id, file_node_id, "declared", "task_document"))
 
     knowledge_records, knowledge_problems = (
         knowledge_records_for_graph(
@@ -538,9 +411,9 @@ def build_graph(
                         "KNOWLEDGE_APPLIES_TO",
                         record_node_id,
                         file_id(repo_id, resolution.path),
-                        "current",
+                        "declared",
                         "knowledge_record",
-                        {"freshness": record.get("status", "current"), "path_kind": path_ref.get("kind")},
+                        {"path_kind": path_ref.get("kind")},
                     )
                 )
             elif resolution.status == RepoSelectorStatus.AMBIGUOUS:
@@ -573,7 +446,7 @@ def build_graph(
             source_node_id = next(
                 (node.id for node in nodes.values() if node.kind == "artifact" and node.identity.get("path") == path),
                 document_id(path),
-            ) if not repo_id else document_id(path)
+            )
             nodes.setdefault(
                 source_node_id,
                 GraphNode(
@@ -590,7 +463,7 @@ def build_graph(
                     source_node_id,
                     "recorded",
                     "knowledge_record",
-                    {"freshness": record.get("status", "current")},
+                    {"source_status": str(ref.get("resolution_status") or "unobserved")},
                 )
             )
     provider_entries = semantic_provider_entries(entries)
@@ -879,16 +752,7 @@ def build_graph(
     }
     source_payloads = {
         "code_index": [entry.to_dict() for entry in entries],
-        "repometa_annotation": [
-            {"path": fact.path, "annotation": fact.annotation}
-            for fact in metadata_facts
-            if fact.annotation is not None
-        ],
-        "repometa_policy": [
-            {"path": fact.path, "areas": list(fact.areas), "policy_topics": list(fact.policy_topics)}
-            for fact in metadata_facts
-        ],
-        "task_completion": [item.receipt for item in completion_inputs],
+        "task_documents": [item.to_dict() for item in task_inputs],
         "knowledge_records": knowledge_records,
         "structured_file_relations": [relation.to_dict() for relation in structured_result.relations],
         "rpc_resolutions": [resolution.to_dict() for resolution in structured_result.rpc_resolutions],
@@ -913,13 +777,11 @@ def build_graph(
     capability_completeness = {
         "source_inventory": "complete",
         "file_inventory": "complete",
-        "metadata": "unavailable" if metadata_absent else "complete",
         "imports": provider_coverage["imports"].status,
         "symbols": provider_coverage["symbols"].status,
         "calls": provider_coverage["calls"].status,
         "rpc_resolution": rpc_resolution_status,
         "structured_relations": provider_coverage["structured_relations"].status,
-        "task_history": "partial" if completion_problems else "complete",
         "knowledge": "partial" if knowledge_problems else "complete",
     }
     overall_completeness = "complete" if all(value == "complete" for value in capability_completeness.values()) else "partial"
@@ -927,9 +789,7 @@ def build_graph(
         repository=target.to_dict(),
         sources=[
             {"kind": "code_index", "assertion": "observed", "digest": digest_data(source_payloads["code_index"])},
-            {"kind": "repometa_annotation", "assertion": "declared", "digest": digest_data(source_payloads["repometa_annotation"])},
-            {"kind": "repometa_policy", "assertion": "default", "digest": digest_data(source_payloads["repometa_policy"])},
-            {"kind": "task_completion", "assertion": "recorded", "digest": digest_data(source_payloads["task_completion"])},
+            {"kind": "task_documents", "assertion": "recorded", "digest": digest_data(source_payloads["task_documents"])},
             {"kind": "knowledge_records", "assertion": "current", "digest": digest_data(source_payloads["knowledge_records"])},
             {"kind": "structured_file_relations", "assertion": "resolved", "digest": digest_data(source_payloads["structured_file_relations"])},
             {"kind": "rpc_resolutions", "assertion": "resolved", "digest": digest_data(source_payloads["rpc_resolutions"])},
@@ -946,10 +806,6 @@ def build_graph(
             "capabilities": capability_completeness,
             "inventory_complete": True,
             "identity_collisions": 0,
-            "metadata_store_valid": True,
-            "receipt_set_complete": not invalid_completion_problems,
-            "invalid_completion_receipts": len(invalid_completion_problems),
-            "receipt_problems": [problem.to_dict() for problem in invalid_completion_problems],
             "index_truncated": False,
             "code_facts_complete": parse_error_count == 0,
             "parse_error_count": parse_error_count,
@@ -963,12 +819,11 @@ def build_graph(
         },
         nodes=list(nodes.values()),
         edges=list(edges.values()),
-        capabilities=["repository", "file", "import_ref", "topic", "task", "change_event", "artifact", "document", "knowledge", "symbol", "anchor", "import_resolution", "same_file_calls", "cross_file_import_calls", "direct_tests", "structured_file_relations", "rpc_resolution", "language_capabilities"],
+        capabilities=["repository", "file", "import_ref", "task", "artifact", "document", "knowledge", "symbol", "anchor", "import_resolution", "same_file_calls", "cross_file_import_calls", "direct_tests", "structured_file_relations", "rpc_resolution", "language_capabilities"],
     ).with_digest()
     return snapshot, problems, {
         "repository": target.to_dict(),
         "index": summary,
-        "metadata": metadata_meta.get("summary", {}),
         "semantic_providers": [result.to_meta() for result in semantic_results],
         "import_resolvers": import_meta,
         "structured_relations": structured_result.to_meta(),
@@ -1007,8 +862,6 @@ def _node_summary(node: GraphNode | None, *, symbol_paths: dict[str, str] | None
         summary["language"] = node.identity.get("language")
         summary["importer_path"] = node.identity.get("importer_path")
         summary["form"] = node.identity.get("form")
-    elif node.kind == "topic":
-        summary["topic"] = node.identity.get("topic")
     elif node.kind == "task":
         summary["task_id"] = node.identity.get("task_id")
     elif node.kind == "artifact":
@@ -1022,9 +875,6 @@ def _node_summary(node: GraphNode | None, *, symbol_paths: dict[str, str] | None
         summary["knowledge_kind"] = record.get("kind")
         summary["status"] = record.get("status")
         summary["title"] = record.get("title")
-    elif node.kind == "change_event":
-        summary["task_id"] = node.identity.get("task_id")
-        summary["change_index"] = node.identity.get("index")
     return summary
 
 
@@ -1269,16 +1119,6 @@ def _query_warnings(snapshot: GraphSnapshot) -> list[dict[str, str]]:
                 "message": f"code index has {snapshot.completeness.get('parse_error_count', 0)} parse error(s); query results may be incomplete",
             }
         )
-    for problem in snapshot.completeness.get("receipt_problems", []):
-        if not isinstance(problem, dict):
-            continue
-        warning = {
-            "code": str(problem.get("code") or "invalid_completion_receipt"),
-            "message": str(problem.get("message") or "completion receipt is invalid"),
-        }
-        if problem.get("path"):
-            warning["path"] = str(problem["path"])
-        warnings.append(warning)
     for failure in snapshot.completeness.get("provider_failures", []):
         if isinstance(failure, dict):
             warnings.append(
@@ -1355,7 +1195,7 @@ def _file_neighborhood_edges(snapshot: GraphSnapshot, file_node_id: str) -> list
     related_entity_ids = {
         edge.from_id if edge.to_id == file_node_id else edge.to_id
         for edge in direct
-        if edge.kind in {"TASK_CHANGED_FILE", "KNOWLEDGE_APPLIES_TO"}
+        if edge.kind in {"TASK_REFERENCES_FILE", "KNOWLEDGE_APPLIES_TO"}
     }
     second_hop = [
         edge
@@ -1373,7 +1213,7 @@ def _file_query_path_edges(snapshot: GraphSnapshot, edges: list[GraphEdge], file
         for edge in snapshot.edges
         if edge.kind == "DEFINES" and edge.from_id == file_node_id
     }
-    direct_kinds = {"IMPORTS_FILE", "TESTS_FILE", STRUCTURED_EDGE_KIND, "TASK_CHANGED_FILE", "KNOWLEDGE_APPLIES_TO"}
+    direct_kinds = {"IMPORTS_FILE", "TESTS_FILE", STRUCTURED_EDGE_KIND, "TASK_REFERENCES_FILE", "KNOWLEDGE_APPLIES_TO"}
     selected: list[tuple[GraphEdge, str]] = []
     for edge in edges:
         if edge.kind in direct_kinds and file_node_id in {edge.from_id, edge.to_id}:
@@ -1424,10 +1264,6 @@ class _ContextProjectionIndex:
     anchor_nodes_by_symbol: dict[str, GraphNode]
     file_relations_by_file: dict[str, list[tuple[GraphEdge, str, str, str, str]]]
     call_relations_by_symbol: dict[str, list[tuple[GraphEdge, str, str, str, str]]]
-    changes_by_file: dict[str, list[str]]
-    tasks_by_change: dict[str, list[tuple[str, GraphEdge]]]
-    changed_files_by_task: dict[str, list[tuple[str, GraphEdge]]]
-    artifact_paths_by_task: dict[str, set[str]]
 
 
 def _build_context_projection_index(snapshot: GraphSnapshot) -> _ContextProjectionIndex:
@@ -1437,10 +1273,6 @@ def _build_context_projection_index(snapshot: GraphSnapshot) -> _ContextProjecti
     anchor_nodes_by_symbol: dict[str, GraphNode] = {}
     file_relations: list[tuple[GraphEdge, str, str, str, str]] = []
     call_edges: list[GraphEdge] = []
-    changes_by_file: dict[str, list[str]] = {}
-    tasks_by_change: dict[str, list[tuple[str, GraphEdge]]] = {}
-    changed_files_by_task: dict[str, list[tuple[str, GraphEdge]]] = {}
-    artifact_paths_by_task: dict[str, set[str]] = {}
 
     for edge in snapshot.edges:
         if edge.kind == "DEFINES":
@@ -1452,17 +1284,6 @@ def _build_context_projection_index(snapshot: GraphSnapshot) -> _ContextProjecti
             file_relations.append((edge, edge.from_id, edge.to_id, "", ""))
         elif edge.kind == "CALLS":
             call_edges.append(edge)
-        elif edge.kind == "CHANGE_AFFECTED_FILE":
-            changes_by_file.setdefault(edge.to_id, []).append(edge.from_id)
-        elif edge.kind == "TASK_RECORDED_CHANGE":
-            tasks_by_change.setdefault(edge.to_id, []).append((edge.from_id, edge))
-        elif edge.kind == "TASK_CHANGED_FILE":
-            changed_files_by_task.setdefault(edge.from_id, []).append((edge.to_id, edge))
-        elif edge.kind == "TASK_VERIFIED_BY":
-            artifact_node = nodes.get(edge.to_id)
-            artifact_path = str(artifact_node.identity.get("path") or "") if artifact_node is not None else ""
-            if artifact_node is not None and artifact_node.kind == "artifact" and artifact_path:
-                artifact_paths_by_task.setdefault(edge.from_id, set()).add(artifact_path)
 
     for edge in call_edges:
         from_file_id = symbol_files.get(edge.from_id, "")
@@ -1485,8 +1306,6 @@ def _build_context_projection_index(snapshot: GraphSnapshot) -> _ContextProjecti
         relations.sort(key=lambda item: _edge_key(item[0]))
     for relations in call_relations_by_symbol.values():
         relations.sort(key=lambda item: _edge_key(item[0]))
-    for changed_files in changed_files_by_task.values():
-        changed_files.sort(key=lambda item: _edge_key(item[1]))
 
     return _ContextProjectionIndex(
         nodes=nodes,
@@ -1495,10 +1314,6 @@ def _build_context_projection_index(snapshot: GraphSnapshot) -> _ContextProjecti
         anchor_nodes_by_symbol=anchor_nodes_by_symbol,
         file_relations_by_file=file_relations_by_file,
         call_relations_by_symbol=call_relations_by_symbol,
-        changes_by_file=changes_by_file,
-        tasks_by_change=tasks_by_change,
-        changed_files_by_task=changed_files_by_task,
-        artifact_paths_by_task=artifact_paths_by_task,
     )
 
 
@@ -1654,7 +1469,6 @@ def project_context_neighborhood(
     anchors: list[GraphContextAnchor],
     mode: str,
     max_relations: int = 128,
-    max_history: int = 5,
     excluded_candidate_paths: set[str] | None = None,
     projection_index: _ContextProjectionIndex | None = None,
     component_data: dict[str, Any] | None = None,
@@ -1986,62 +1800,6 @@ def project_context_neighborhood(
         visible_paths.add(str(relation.get("from_path") or ""))
         visible_paths.add(str(relation.get("to_path") or ""))
 
-    excluded_paths = {
-        path
-        for raw_path in (excluded_candidate_paths or set())
-        if (path := normalize_repo_path(raw_path))
-    }
-    visible_file_ids = {file_id(repo_id, path) for path in visible_paths if path}
-    changes_by_file = {
-        current_file_id: index.changes_by_file[current_file_id]
-        for current_file_id in visible_file_ids
-        if current_file_id in index.changes_by_file
-    }
-
-    history_by_task: dict[str, list[dict[str, Any]]] = {}
-    seen_history: set[tuple[str, str]] = set()
-    for current_file_id in sorted(changes_by_file):
-        file_node = nodes.get(current_file_id)
-        path = str(file_node.identity.get("path") or "") if file_node is not None else ""
-        if normalize_repo_path(path) in excluded_paths:
-            continue
-        for change_id in sorted(changes_by_file[current_file_id]):
-            change_node = nodes.get(change_id)
-            change_facts = change_node.facts.get("receipt") if change_node is not None and isinstance(change_node.facts.get("receipt"), dict) else {}
-            for task_node_id, task_edge in sorted(index.tasks_by_change.get(change_id, []), key=lambda item: item[0]):
-                task_node = nodes.get(task_node_id)
-                if task_node is None:
-                    continue
-                task_id_value = str(task_node.identity.get("task_id") or "")
-                key = (task_id_value, path)
-                if not task_id_value or not path or key in seen_history:
-                    continue
-                seen_history.add(key)
-                receipt = task_node.facts.get("receipt") if isinstance(task_node.facts.get("receipt"), dict) else {}
-                artifact_paths = index.artifact_paths_by_task.get(task_node_id, set())
-                history_by_task.setdefault(task_id_value, []).append(
-                    {
-                        "task_id": task_id_value,
-                        "path": path,
-                        "change": str(change_facts.get("change") or ""),
-                        "attribution": str(task_edge.facts.get("attribution") or change_facts.get("attribution") or ""),
-                        "completed_at": str(receipt.get("completed_at") or ""),
-                        "task_path": next(iter(artifact_paths)) if len(artifact_paths) == 1 else "",
-                    }
-                )
-    selected_task_ids = sorted(
-        history_by_task,
-        key=lambda task_id: (
-            max(str(item.get("completed_at") or "") for item in history_by_task[task_id]),
-            task_id,
-        ),
-        reverse=True,
-    )[:max_history]
-    history = [
-        item
-        for task_id in selected_task_ids
-        for item in sorted(history_by_task[task_id], key=lambda value: str(value.get("path") or ""))
-    ]
     projection = {
         "mode": mode,
         "policy": {
@@ -2063,7 +1821,6 @@ def project_context_neighborhood(
             normalized_seeds,
             excluded_paths=excluded_candidate_paths,
         ),
-        "history": history,
     }
     annotate_context_projection_components(
         projection,
@@ -2280,14 +2037,6 @@ def _query_continuations(
             query_types = ["import"]
             actions = ["graph.import"]
             label = value
-        elif node.kind == "topic":
-            value = str(node.identity.get("topic") or "")
-            if not value:
-                continue
-            selector = {"kind": "topic", "value": value}
-            query_types = ["topic"]
-            actions = ["graph.topic"]
-            label = value
         elif node.kind == "task":
             value = str(node.identity.get("task_id") or "")
             if not value:
@@ -2319,14 +2068,6 @@ def _query_continuations(
             selector = {"kind": "knowledge_record", "value": value}
             query_types = ["knowledge_record"]
             actions = ["knowledge.show"]
-            label = value
-        elif node.kind == "change_event":
-            value = str(node.identity.get("task_id") or "")
-            if not value:
-                continue
-            selector = {"kind": "task", "value": value}
-            query_types = ["task"]
-            actions = ["graph.task"]
             label = value
         else:
             continue
@@ -2475,7 +2216,7 @@ def _semantic_query_status(snapshot: GraphSnapshot, *, capability_name: str, in_
         if index.get("classification") == "excluded":
             return "unsupported", {
                 "code": "graph_query_unsupported",
-                "message": f"semantic analysis is excluded by policy for {in_file}",
+                "message": f"source indexing is unavailable for {in_file}",
             }
         status = _provider_capability_status(
             snapshot.completeness,
@@ -2523,7 +2264,6 @@ def query_graph(
     *,
     root: Path | None = None,
     file: str = "",
-    topic: str = "",
     import_ref: str = "",
     symbol: str = "",
     callers_of: str = "",
@@ -2538,7 +2278,6 @@ def query_graph(
 ) -> tuple[dict[str, Any] | None, list[Problem]]:
     selector_inputs = {
         GraphQuerySelectorKind.FILE: file,
-        GraphQuerySelectorKind.TOPIC: topic,
         GraphQuerySelectorKind.IMPORT: import_ref,
         GraphQuerySelectorKind.SYMBOL: symbol,
         GraphQuerySelectorKind.CALLERS_OF: callers_of,
@@ -2558,7 +2297,7 @@ def query_graph(
             Problem(
                 "error",
                 "graph_query_selector_required",
-                "pass exactly one graph query selector: --file, --topic, --import, --symbol, --callers-of, --callees-of, --impact-file, --impact-symbol, --task, or --artifact",
+                "pass exactly one graph query selector: --file, --import, --symbol, --callers-of, --callees-of, --impact-file, --impact-symbol, --task, or --artifact",
             )
         ]
     if len(selectors) > 1:
@@ -2615,36 +2354,11 @@ def query_graph(
         if root is None:
             return None, []
         try:
-            record = lookup_completion_exact(root, repo_id, task_id)
-        except ValueError as exc:
-            return None, [
-                Problem(
-                    "error",
-                    "invalid_task_id",
-                    str(exc),
-                    task_id,
-                )
-            ]
-        except CompletionCatalogueUnavailable as exc:
-            return None, [
-                Problem(
-                    "error",
-                    exc.code,
-                    f"exact completion history is unavailable: {exc}",
-                    exc.path,
-                )
-            ]
+            record = lookup_task_history(root, repo_id, task_id)
+        except (ValueError, OSError, RuntimeError, RepoctlError) as exc:
+            return None, [Problem("warning", "task_history_unreadable", str(exc), task_id)]
         if record is None:
             return None, []
-        completion_input = CompletionGraphInput(
-            event_id=str(record.event.get("event_id") or ""),
-            sequence=int(record.event.get("sequence") or 0),
-            receipt=record.receipt,
-            receipt_path=record.receipt_path,
-            receipt_sha256=str(record.event.get("receipt_sha256") or ""),
-            artifact_path=record.artifact_path,
-            artifact_sha256=str(record.event.get("artifact_sha256") or ""),
-        )
         history_snapshot, history_problems, _meta = build_graph(
             root,
             target=RepoTarget(
@@ -2657,9 +2371,9 @@ def query_graph(
             ),
             code_index_result=([], [], {"summary": {"truncated": False}}),
             cached_semantic_results=[],
-            completion_inputs=(completion_input,),
-            include_historical_receipt_files=True,
-            include_knowledge=not repo_id,
+            task_inputs=(record,),
+            include_declared_paths=True,
+            include_knowledge=True,
         )
         return history_snapshot, [
             problem
@@ -2694,20 +2408,10 @@ def query_graph(
             for edge in history_snapshot.edges
             if edge.from_id == task_node_id or edge.to_id == task_node_id
         ]
-        change_ids = {
-            edge.to_id
-            for edge in direct
-            if edge.kind == "TASK_RECORDED_CHANGE" and edge.from_id == task_node_id
-        }
-        artifact_ids = {edge.to_id for edge in direct if edge.kind == "TASK_VERIFIED_BY"}
+        artifact_ids = {edge.to_id for edge in direct if edge.kind == "TASK_DOCUMENTED_BY"}
         evidence_edges = [
             *direct,
             *[edge for edge in history_snapshot.edges if edge.kind == "KNOWLEDGE_SOURCED_FROM" and edge.to_id in artifact_ids],
-            *[
-                edge
-                for edge in history_snapshot.edges
-                if edge.kind == "CHANGE_AFFECTED_FILE" and edge.from_id in change_ids
-            ],
         ]
         paths = [
             _path_from_edge(
@@ -2756,13 +2460,6 @@ def query_graph(
         ]
         return query_payload(query={"type": "file", "path": normalized}, node_ids={wanted}, edges=matched_edges, matches=[_node_summary(nodes[wanted], symbol_paths=symbol_paths)], paths=paths), []
 
-    if selector_kind is GraphQuerySelectorKind.TOPIC:
-        wanted = topic_id(repo_id, value)
-        if wanted not in nodes:
-            return empty_query_payload(query={"type": "topic", "topic": value}, query_status="not_found"), []
-        matched_edges = [edge for edge in snapshot.edges if edge.kind == "HAS_TOPIC" and edge.to_id == wanted]
-        return query_payload(query={"type": "topic", "topic": value}, node_ids={wanted}, edges=matched_edges, matches=[_node_summary(nodes[wanted], symbol_paths=symbol_paths)]), []
-
     if selector_kind is GraphQuerySelectorKind.IMPORT:
         matched_import_nodes = [
             node
@@ -2781,19 +2478,9 @@ def query_graph(
             for edge in snapshot.edges
             if edge.from_id in task_node_ids or edge.to_id in task_node_ids
         ]
-        change_ids = {
-            edge.to_id
-            for edge in direct
-            if edge.kind == "TASK_RECORDED_CHANGE" and edge.from_id in task_node_ids
-        }
-        affected = [
-            edge
-            for edge in snapshot.edges
-            if edge.kind == "CHANGE_AFFECTED_FILE" and edge.from_id in change_ids
-        ]
-        artifact_ids = {edge.to_id for edge in direct if edge.kind == "TASK_VERIFIED_BY"}
+        artifact_ids = {edge.to_id for edge in direct if edge.kind == "TASK_DOCUMENTED_BY"}
         knowledge = [edge for edge in snapshot.edges if edge.kind == "KNOWLEDGE_SOURCED_FROM" and edge.to_id in artifact_ids]
-        return [*direct, *affected, *knowledge]
+        return [*direct, *knowledge]
 
     if selector_kind is GraphQuerySelectorKind.TASK:
         try:
@@ -2856,12 +2543,12 @@ def query_graph(
         task_ids = {
             edge.from_id
             for edge in snapshot.edges
-            if edge.kind == "TASK_VERIFIED_BY" and edge.to_id in artifact_ids
+            if edge.kind == "TASK_DOCUMENTED_BY" and edge.to_id in artifact_ids
         }
         matched_edge_map = {
             _edge_key(edge): edge
             for edge in [
-                *[edge for edge in snapshot.edges if edge.kind == "TASK_VERIFIED_BY" and edge.to_id in artifact_ids],
+                *[edge for edge in snapshot.edges if edge.kind == "TASK_DOCUMENTED_BY" and edge.to_id in artifact_ids],
                 *task_evidence_edges(task_ids),
             ]
         }

@@ -26,7 +26,6 @@ from tools.repoctl.graph_semantic_model import (
 from tools.repoctl.graph_store import _provider_result_from_dict, _provider_result_to_dict, graph_materialization_freshness, materialize_graph
 from tools.repoctl.graph_structured_relations import build_structured_file_relations
 from tools.repoctl.repositories import RepoTarget, require_repo_target
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 from tests.repoctl.workspace.test_check import write_workspace
 
@@ -501,7 +500,6 @@ def test_graph_preserves_every_dart_rpc_outcome_and_projects_only_linked_facts(t
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     source = (
         "import 'package:supabase/supabase.dart';\n"
         "class LocalBus {}\n"
@@ -727,7 +725,6 @@ def test_graph_preserves_every_dart_rpc_outcome_and_projects_only_linked_facts(t
     provider_stale_graph_payload = json.loads(capsys.readouterr().out)
     assert provider_stale_graph_payload["data"]["result"]["relationship_candidates"] == []
     assert provider_stale_graph_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(action["kind"] == "graph_refresh" for action in provider_stale_graph_payload["next_actions"])
 
     assert main(["graph", "search", "linked rpc", "--mode", "code-location", "--json"]) == 0
     provider_stale_context_payload = json.loads(capsys.readouterr().out)
@@ -758,7 +755,6 @@ def test_graph_preserves_every_dart_rpc_outcome_and_projects_only_linked_facts(t
         item["source"]["runtime_identity"]["value"]
         for item in target_stale_candidates
     }
-    assert any(action["kind"] == "graph_refresh" for action in target_stale_payload["next_actions"])
 
     target_refreshed, target_refresh_problems, _target_refresh_meta = materialize_graph(tmp_path, target=target)
     assert target_refreshed is not None
@@ -774,7 +770,6 @@ def test_graph_preserves_every_dart_rpc_outcome_and_projects_only_linked_facts(t
     source_stale_payload = json.loads(capsys.readouterr().out)
     assert source_stale_payload["data"]["result"]["relationship_candidates"] == []
     assert source_stale_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(action["kind"] == "graph_refresh" for action in source_stale_payload["next_actions"])
 
     assert main(["graph", "search", "linked rpc", "--mode", "code-location", "--json"]) == 0
     stale_context_payload = json.loads(capsys.readouterr().out)
@@ -799,71 +794,12 @@ def test_graph_preserves_every_dart_rpc_outcome_and_projects_only_linked_facts(t
     assert len(reduced_rpc["resolutions"][0]["candidates"]) == 1
 
 
-def test_repometa_eligibility_change_invalidates_materialized_rpc_evidence(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    repo = tmp_path / "repos"
-    init_repo(repo)
-    write_repometa(repo)
-    _write_dart_package(
-        repo,
-        tmp_path / "pub-cache/supabase",
-        (
-            "import 'package:supabase/supabase.dart';\n"
-            "final client = SupabaseClient();\n"
-            "Future<void> run() => client.rpc('linked');\n"
-        ),
-    )
-    migration = repo / "supabase/migrations/20240201000000_linked.sql"
-    migration.parent.mkdir(parents=True)
-    migration.write_text(
-        "CREATE FUNCTION public.linked() RETURNS void LANGUAGE sql AS $$ SELECT 1; $$;\n",
-        encoding="utf-8",
-    )
-    _require_dart_analyzer(tmp_path)
-    target = require_repo_target(tmp_path, repo_id="main")
-
-    snapshot, problems, _meta = materialize_graph(tmp_path, target=target)
-    assert snapshot is not None
-    assert not [problem for problem in problems if problem.severity == "error"]
-
-    policy_path = repo / ".repometa/policy.json"
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
-    policy["indexing"]["exclude"].append("lib/client.dart")
-    policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    freshness, freshness_problems = graph_materialization_freshness(tmp_path, target=target)
-    assert freshness_problems == []
-    assert freshness["changed_paths"] == []
-    assert freshness["inventory_stale_paths"] == ["lib/client.dart"]
-    assert freshness["stale_paths"] == ["lib/client.dart"]
-    assert freshness["stale_path_classifications"] == {"lib/client.dart": "excluded"}
-
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-    assert main(["graph", "query", "--file", "lib/client.dart", "--json"]) == 0
-    graph_payload = json.loads(capsys.readouterr().out)
-    assert graph_payload["data"]["result"]["relationship_candidates"] == []
-    assert graph_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(action["kind"] == "graph_refresh" for action in graph_payload["next_actions"])
-
-    assert main(["graph", "search", "linked rpc", "--mode", "code-location", "--json"]) == 0
-    context_payload = json.loads(capsys.readouterr().out)
-    bundle = context_payload["data"]["result"]
-    assert bundle["relationship_candidates"] == []
-    assert bundle["relationship_candidate_count"] == 0
-    assert not [
-        item
-        for group in bundle["groups"].values()
-        for item in group
-        if item.get("source_ref", {}).get("path") == "repos/lib/client.dart"
-    ]
-    assert any(action["kind"] == "graph_refresh" for action in context_payload["next_actions"])
 
 
 def test_context_exact_rpc_identity_selects_one_same_line_source_fact(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     source = (
         "import 'package:supabase/supabase.dart';\n"
         "final client = SupabaseClient();\n"
