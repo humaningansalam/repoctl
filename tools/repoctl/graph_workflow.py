@@ -1,8 +1,4 @@
-"""One-shot work-path navigation using existing Graph and current source.
-
-This adds no provider, persistence, lifecycle, or execution authority. A source
-match is a candidate, never an invented provider-confirmed CALLS/TESTS_FILE edge.
-"""
+"""Locate route and symbol implementations through Graph edges and source references."""
 from __future__ import annotations
 
 import ast
@@ -15,29 +11,40 @@ from .git import normalize_repo_path
 from .path_roles import is_test_path
 from .repositories import RepoTarget
 
-MAX_WORKFLOW_SOURCE_FILES = 2048
-MAX_WORKFLOW_FILE_BYTES = 512 * 1024
-MAX_WORKFLOW_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024
-MAX_WORKFLOW_STAGE_ENTRIES = 30
 _ROUTE_METHODS = frozenset({"route", "api_route", "get", "post", "put", "patch", "delete"})
 _FALLBACK_SUFFIXES = frozenset({".rs", ".go", ".java", ".kt", ".kts", ".swift"})
 
 
-def _source(root: Path, target: RepoTarget, path: str) -> str:
-    """Only regular, bounded files inside the selected product Git root."""
+def _source(target: RepoTarget, path: str) -> tuple[str | None, int, str]:
+    """Return text, bytes read, and a reason when source cannot be inspected."""
     if not path or normalize_repo_path(path) != path:
-        return ""
+        return None, 0, "invalid_path"
     file = target.root_path / path
+    raw = b""
     try:
         base = target.root_path.resolve()
         resolved = file.resolve()
-        if base not in (resolved, *resolved.parents) or not file.is_file() or file.is_symlink():
-            return ""
-        if file.stat().st_size > MAX_WORKFLOW_FILE_BYTES:
-            return ""
-        return file.read_text(encoding="utf-8")
-    except (OSError, UnicodeError, ValueError, RuntimeError):
-        return ""
+        if base not in (resolved, *resolved.parents):
+            return None, 0, "outside_repository"
+        if file.is_symlink():
+            return None, 0, "symlink"
+        if not file.is_file():
+            return None, 0, "not_regular_file"
+        before = file.stat()
+        raw = file.read_bytes()
+        after = file.stat()
+        if (
+            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+        ) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ) or len(raw) != before.st_size:
+            return None, len(raw), "file_changed_during_read"
+    except (OSError, ValueError, RuntimeError):
+        return None, len(raw), "read_error"
+    try:
+        return raw.decode("utf-8"), len(raw), ""
+    except UnicodeError:
+        return None, len(raw), "decode_error"
 
 
 def _node_path_index(snapshot: GraphSnapshot) -> tuple[dict[str, str], dict[str, dict[str, str]], dict[str, dict[str, Any]]]:
@@ -59,10 +66,8 @@ def _node_path_index(snapshot: GraphSnapshot) -> tuple[dict[str, str], dict[str,
     return owner, symbols, nodes
 
 
-def _route_functions(source: str, route: str) -> list[tuple[str, int, ast.AST]]:
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
+def _route_functions(tree: ast.AST | None, route: str) -> list[tuple[str, int, ast.AST]]:
+    if tree is None:
         return []
     matches: list[tuple[str, int, ast.AST]] = []
     for node in ast.walk(tree):
@@ -80,7 +85,7 @@ def _route_functions(source: str, route: str) -> list[tuple[str, int, ast.AST]]:
 
 
 def discover_route_entrypoints(
-    seed_files: list[str], source_read: Any, route: str,
+    seed_files: list[str], python_tree: Any, route: str,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str, ast.AST]]]:
     """Discover exact route decorators without deriving meaning from filenames."""
     entries: list[dict[str, Any]] = []
@@ -88,114 +93,89 @@ def discover_route_entrypoints(
     for path in seed_files:
         if not path.endswith(".py") or is_test_path(path):
             continue
-        for name, line, function in _route_functions(source_read(path), route):
+        for name, line, function in _route_functions(python_tree(path), route):
             entries.append(_entry(path, relation="source", evidence="HTTP decorator literal", symbol=name, line=line))
             functions.append((path, name, function))
     return entries, functions
 
 
-def _called_names(function: ast.AST) -> set[tuple[str, str]]:
-    calls: set[tuple[str, str]] = set()
-    for node in ast.walk(function):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Attribute):
-            receiver = ast.unparse(node.func.value) if hasattr(ast, "unparse") else ""
-            calls.add((node.func.attr, receiver))
-        elif isinstance(node.func, ast.Name):
-            calls.add((node.func.id, ""))
-    return calls
-
-
 def collect_route_value_flow(function: ast.AST) -> set[tuple[str, str]]:
-    """Find calls that produce values used by a handler's returned response.
+    """Find calls contributing values to a handler's returned response.
 
-    Local assignments are traced backwards through containers, serializers and
-    response wrappers. Calls used only for metrics, audit or logging do not
-    contribute to the returned value. This is bounded intrafunction source
-    evidence, not an assertion of dynamic dispatch or runtime execution.
+    Follow local assignments through response wrappers. These source
+    dependencies identify candidates; they do not resolve dynamic dispatch.
     """
     if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return set()
-    result: set[tuple[str, str]] = set()
-    max_depth = 24
-    max_bindings = 128
 
-    def trace(expr: ast.AST, bindings: dict[str, ast.AST], seen: frozenset[str], depth: int) -> set[tuple[str, str]]:
-        if depth >= max_depth:
-            return set()
-        if isinstance(expr, ast.Name):
-            if expr.id in seen or expr.id not in bindings:
-                return set()
-            return trace(bindings[expr.id], bindings, seen | {expr.id}, depth + 1)
-        if isinstance(expr, ast.Call):
-            if isinstance(expr.func, ast.Attribute):
-                receiver = expr.func.value
-                # A method on a previously produced object is usually a
-                # serializer; follow the object's originating producer.
+    def trace(expr: ast.AST, bindings: dict[str, ast.AST]) -> set[tuple[str, str]]:
+        start = (expr, frozenset())
+        values: dict[tuple[ast.AST, frozenset[str]], set[tuple[str, str]]] = {}
+        pending = [(*start, False)]
+        while pending:
+            node, seen, expanded = pending.pop()
+            key = (node, seen)
+            if key in values:
+                continue
+            children: list[tuple[ast.AST, frozenset[str]]] = []
+            fallback: set[tuple[str, str]] = set()
+            if isinstance(node, ast.Name):
+                if node.id not in seen and node.id in bindings:
+                    children = [(bindings[node.id], seen | {node.id})]
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                receiver = node.func.value
                 if isinstance(receiver, ast.Name) and receiver.id in bindings:
                     bound = bindings[receiver.id]
-                    is_constructor = (
-                        isinstance(bound, ast.Call) and isinstance(bound.func, ast.Name)
-                    )
-                    if not is_constructor:
-                        upstream = trace(receiver, bindings, seen, depth + 1)
-                        if upstream:
-                            return upstream
+                    if not (isinstance(bound, ast.Call) and isinstance(bound.func, ast.Name)):
+                        children = [(receiver, seen)]
                 elif isinstance(receiver, ast.Call):
-                    upstream = trace(receiver, bindings, seen, depth + 1)
-                    if upstream:
-                        return upstream
-                # Attribute calls are producers themselves, even if their
-                # arguments were computed by other calls beforehand.
-                name = ast.unparse(receiver)
-                return {(expr.func.attr, name)}
-            if isinstance(expr.func, ast.Name):
-                upstream: set[tuple[str, str]] = set()
-                for arg in [*expr.args, *(keyword.value for keyword in expr.keywords)]:
-                    upstream.update(trace(arg, bindings, seen, depth + 1))
-                return upstream or {(expr.func.id, "")}
-        if isinstance(expr, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
-            return set()
-        found: set[tuple[str, str]] = set()
-        for child in ast.iter_child_nodes(expr):
-            found.update(trace(child, bindings, seen, depth + 1))
-        return found
+                    children = [(receiver, seen)]
+                fallback = {(node.func.attr, ast.unparse(receiver))}
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                children = [(arg, seen) for arg in [
+                    *node.args, *(keyword.value for keyword in node.keywords),
+                ]]
+                fallback = {(node.func.id, "")}
+            elif not isinstance(node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+                children = [(child, seen) for child in ast.iter_child_nodes(node)]
+            if children and not expanded:
+                pending.append((node, seen, True))
+                pending.extend((child, child_seen, False) for child, child_seen in children)
+                continue
+            upstream: set[tuple[str, str]] = set()
+            for child in children:
+                upstream.update(values[child])
+            values[key] = upstream or fallback
+        return values[start]
 
-    def scan(statements: list[ast.stmt], bindings: dict[str, ast.AST], depth: int = 0) -> None:
-        if depth >= max_depth:
-            return
+    result: set[tuple[str, str]] = set()
+    blocks: list[tuple[list[ast.stmt], dict[str, ast.AST]]] = [(function.body, {})]
+    while blocks:
+        statements, bindings = blocks.pop()
         for statement in statements:
             if isinstance(statement, ast.Assign):
                 for target in statement.targets:
-                    if isinstance(target, ast.Name) and len(bindings) < max_bindings:
+                    if isinstance(target, ast.Name):
                         bindings[target.id] = statement.value
             elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-                if statement.value is not None and len(bindings) < max_bindings:
+                if statement.value is not None:
                     bindings[statement.target.id] = statement.value
             elif isinstance(statement, ast.Return) and statement.value is not None:
-                result.update(trace(statement.value, bindings, frozenset(), 0))
-            elif isinstance(statement, ast.If):
-                scan(statement.body, bindings.copy(), depth + 1)
-                scan(statement.orelse, bindings.copy(), depth + 1)
+                result.update(trace(statement.value, bindings))
+            elif isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+                blocks.extend((body, bindings.copy()) for body in [statement.body, statement.orelse])
             elif isinstance(statement, (ast.With, ast.AsyncWith)):
-                scan(statement.body, bindings.copy(), depth + 1)
-            elif isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
-                scan(statement.body, bindings.copy(), depth + 1)
-                scan(statement.orelse, bindings.copy(), depth + 1)
+                blocks.append((statement.body, bindings.copy()))
             elif isinstance(statement, ast.Try):
-                scan(statement.body, bindings.copy(), depth + 1)
-                for handler in statement.handlers:
-                    scan(handler.body, bindings.copy(), depth + 1)
-                scan(statement.orelse, bindings.copy(), depth + 1)
-                scan(statement.finalbody, bindings.copy(), depth + 1)
-
-    scan(function.body, {})
+                blocks.extend((body, bindings.copy()) for body in [
+                    statement.body, *(handler.body for handler in statement.handlers),
+                    statement.orelse, statement.finalbody,
+                ])
     return result
 
 
 def _python_test_operation_evidence(
-    source: str, *, method: str, route: str,
+    tree: ast.AST | None, *, method: str, route: str,
     implementation_path: str = "", implementation_class: str = "",
 ) -> tuple[str, int] | None:
     """Verify a test's literal HTTP request or imported concrete manager call.
@@ -204,9 +184,7 @@ def _python_test_operation_evidence(
     test exercises this route or class. This is AST source evidence, not a
     claim that the test executed successfully.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
+    if tree is None:
         return None
     implementation_module = implementation_path.removesuffix(".py").replace("/", ".")
     imported_names = {
@@ -311,246 +289,39 @@ def _rust_embedded_test_evidence(source: str) -> tuple[str, int] | None:
     return None
 
 
-def _flask_factory_executable_wiring(
-    factory: ast.FunctionDef | ast.AsyncFunctionDef, *,
-    receiver_attribute: str, manager_names: set[str], blueprint_names: set[str],
-) -> int | None:
-    """Require wiring on every bounded normal factory exit, in one executable scope.
-
-    Definitions are declarations, not executed bodies. Conditional branches are
-    analyzed separately (including statically dead branches), so unrelated
-    operations in opposite branches cannot combine into a false source link.
-    Unsupported nested control-flow does not establish a wiring operation.
-    """
-    # (assignment line, blueprint registered); an absent assignment is None.
-    State = tuple[int | None, bool]
-    visits = 0
-    terminal: list[State] = []
-
-    def dedupe(states: list[State]) -> list[State]:
-        return list(dict.fromkeys(states))
-
-    def walk_block(body: list[ast.stmt], incoming: list[State]) -> list[State]:
-        nonlocal visits
-        states = incoming
-        for statement in body:
-            if not states:
-                break
-            visits += len(states)
-            if visits > 512 or len(states) > 64:
-                raise ValueError("factory wiring analysis budget exhausted")
-            if isinstance(statement, ast.If):
-                fixed = (statement.test.value
-                         if isinstance(statement.test, ast.Constant)
-                         and isinstance(statement.test.value, bool) else None)
-                branches = ([statement.body] if fixed is True else
-                            [statement.orelse] if fixed is False else
-                            [statement.body, statement.orelse])
-                states = dedupe([state for branch in branches
-                                 for state in walk_block(branch, list(states))])
-            elif isinstance(statement, ast.Return):
-                terminal.extend(states)
-                states = []
-            elif (isinstance(statement, ast.Assign)
-                  and isinstance(statement.value, ast.Call)
-                  and isinstance(statement.value.func, ast.Name)
-                  and statement.value.func.id in manager_names
-                  and any(isinstance(target, ast.Attribute)
-                          and isinstance(target.value, ast.Name)
-                          and target.value.id == "app"
-                          and target.attr == receiver_attribute
-                          for target in statement.targets)):
-                states = dedupe([(line if line is not None else statement.lineno, registered)
-                                 for line, registered in states])
-            elif (isinstance(statement, ast.Expr)
-                  and isinstance(statement.value, ast.Call)
-                  and isinstance(statement.value.func, ast.Attribute)
-                  and isinstance(statement.value.func.value, ast.Name)
-                  and statement.value.func.value.id == "app"
-                  and statement.value.func.attr == "register_blueprint"
-                  and statement.value.args
-                  and isinstance(statement.value.args[0], ast.Name)
-                  and statement.value.args[0].id in blueprint_names):
-                states = dedupe([(line, True) for line, _ in states])
-            # FunctionDef/AsyncFunctionDef/ClassDef/Lambda and unmodeled nested
-            # statements are never descended into or credited as runtime wiring.
-        return states
-
-    try:
-        terminal.extend(walk_block(factory.body, [(None, False)]))
-    except ValueError:
-        return None
-    if not terminal or not all(line is not None and registered for line, registered in terminal):
-        return None
-    return min(line for line, _ in terminal if line is not None)
-
-
-def _flask_factory_attribute_wiring(
-    paths: list[str], source_read: Any, *, route_path: str, implementation_path: str,
-    receiver: str, method: str, blueprint_export: str, implementation_class: str,
-) -> dict[str, Any] | None:
-    """Verify an app factory's *source wiring*, not runtime type dispatch.
-
-    Flask's `current_app` is dynamic. Only report a current-source path when a
-    factory explicitly imports the expected implementation and blueprint,
-    constructs and assigns `app.<route_receiver_attribute>`, and registers the blueprint. This is a
-    useful work-path link, not a compiler-confirmed CALLS edge.
-    """
-    if (not receiver.startswith("current_app.") or receiver.count(".") != 1
-            or not implementation_path.endswith(".py") or not blueprint_export
-            or not implementation_class.isidentifier()):
-        return None
-    receiver_attribute = receiver.partition(".")[2]
-    if not receiver_attribute.isidentifier():
-        return None
-    manager_module = implementation_path[:-3].replace("/", ".")
-    blueprint_module = route_path[:-3].replace("/", ".")
-    for candidate in paths:
-        # Source wiring, not a conventional bootstrap filename, establishes this relation.
-        if not candidate.endswith(".py") or is_test_path(candidate) or candidate in {route_path, implementation_path}:
-            continue
-        source = source_read(candidate)
-        if (not source or receiver_attribute not in source
-                or manager_module not in source or blueprint_module not in source):
-            continue
-        try:
-            tree = ast.parse(source)
-        except (SyntaxError, ValueError):
-            continue
-        # Only module imports are credited. Imports hidden inside a definition
-        # or a dead branch do not establish executable factory bindings.
-        manager_names = {
-            alias.asname or alias.name for node in tree.body
-            if isinstance(node, ast.ImportFrom) and node.module == manager_module
-            for alias in node.names if alias.name == implementation_class
-        }
-        blueprint_names = {
-            alias.asname or alias.name for node in tree.body
-            if isinstance(node, ast.ImportFrom) and node.module == blueprint_module
-            for alias in node.names if alias.name == blueprint_export
-        }
-        if not manager_names or not blueprint_names:
-            continue
-        for factory in tree.body:
-            if not isinstance(factory, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            assignment_line = _flask_factory_executable_wiring(
-                factory, receiver_attribute=receiver_attribute,
-                manager_names=manager_names, blueprint_names=blueprint_names,
-            )
-            if assignment_line is not None:
-                return {
-                    "path": candidate,
-                    "line": assignment_line,
-                    "evidence": "AST-verified same-scope factory assignment and blueprint registration on bounded normal paths; runtime dispatch unconfirmed",
-                    "method": method,
-                }
-    return None
-
-
-def _current_class_method(source: str, qualified: str, method: str) -> bool:
-    """A current class declaration is necessary before suggesting a provider symbol."""
-    if not source or "." not in qualified:
-        return False
-    try:
-        parsed = ast.parse(source)
-    except (SyntaxError, ValueError):
+def _current_class_method(tree: ast.AST | None, qualified: str, method: str) -> bool:
+    """Check a declaration before offering it as an unresolved call candidate."""
+    if tree is None or "." not in qualified:
         return False
     class_name = qualified.split(".", 1)[0]
     return any(
         isinstance(cls, ast.ClassDef) and cls.name == class_name
         and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == method
                 for member in cls.body)
-        for cls in ast.walk(parsed)
+        for cls in ast.walk(tree)
     )
 
 
-def resolve_source_wired_implementation(
-    symbols: dict[str, dict[str, str]],
-    paths: list[str],
-    source_read: Any,
-    *,
-    route_path: str,
-    receiver: str,
-    method: str,
-    blueprint_export: str,
-) -> tuple[str, dict[str, str], dict[str, Any] | None] | None:
-    """Resolve by current declarations and Flask factory imports, not names alone.
-
-    A unique name-only declaration is a candidate. Only an actual factory
-    wiring match is source evidence; multiple matches fail closed.
-    """
-    matches = [
-        (sid, info) for sid, info in symbols.items()
-        if info["path"] and info["path"] != route_path
-        and info["name"].endswith("." + method)
-        and not is_test_path(info["path"])
-        and _current_class_method(source_read(info["path"]), info["name"], method)
-    ]
-    wired: list[tuple[str, dict[str, str], dict[str, Any]]] = []
-    for sid, info in matches:
-        wiring = _flask_factory_attribute_wiring(
-            paths, source_read, route_path=route_path,
-            implementation_path=info["path"], receiver=receiver,
-            method=method, blueprint_export=blueprint_export,
-            implementation_class=info["name"].split(".", 1)[0],
-        )
-        if wiring:
-            wired.append((sid, info, wiring))
-    if len(wired) == 1:
-        return wired[0]
-    if wired:
-        return None
-    if len(matches) == 1:
-        sid, info = matches[0]
-        return sid, info, None
-    if receiver:
-        normalized = re.sub(r"[^a-z0-9]", "", receiver.casefold())
-        name_candidates = [
-            (sid, info) for sid, info in matches
-            if normalized.endswith(
-                re.sub(r"[^a-z0-9]", "", info["name"].split(".", 1)[0].casefold())
-            )
-        ]
-        if len(name_candidates) == 1:
-            sid, info = name_candidates[0]
-            return sid, info, None
-    return None
-
-
-def collect_source_verified_tests(
+def collect_test_references(
     paths: list[str],
     *,
-    route: str,
-    implementations: list[dict[str, Any]],
-    route_test_proof: Any,
+    test_reference: Any,
 ) -> list[dict[str, Any]]:
-    """Scan bounded test paths; filenames only guide priority, never proof."""
-    route_stem = route.strip("/").split("/")[-1]
-    implementation_stems = {
-        Path(item["path"]).stem for item in implementations if item.get("path")
-    }
-    python_test_paths = [
-        path for path in paths if is_test_path(path) and path.endswith(".py")
-    ]
-    python_test_paths.sort(key=lambda path: (
-        0 if route_stem in Path(path).stem
-        or any(stem in Path(path).stem for stem in implementation_stems) else 1,
-        path,
-    ))
-    verified: list[dict[str, Any]] = []
+    """Find source references to the selected operation in test files."""
+    python_test_paths = sorted(path for path in paths if is_test_path(path) and path.endswith(".py"))
+    referenced: list[dict[str, Any]] = []
     for path in python_test_paths:
-        proof = route_test_proof(path)
-        if not proof:
+        reference = test_reference(path)
+        if not reference:
             continue
         entry = _entry(
             path, relation="source",
-            evidence="AST-verified exact HTTP request or imported concrete implementation call",
-            line=proof[1],
+            evidence="AST request or imported implementation call",
+            line=reference[1],
         )
-        entry["verification"] = proof[0]
-        verified.append(entry)
-    return verified
+        entry["reference_kind"] = reference[0]
+        referenced.append(entry)
+    return referenced
 
 
 def _entry(path: str, *, relation: str, evidence: str, symbol: str = "", line: int = 0) -> dict[str, Any]:
@@ -575,10 +346,10 @@ def _dedupe_entries(entries: list[dict[str, Any]], *, preferred_symbol: str = ""
     result = list(merged.values())
     result.sort(key=lambda item: (
         0 if preferred_symbol and item.get("symbol", "").rsplit(".", 1)[-1] == preferred_symbol else 1,
-        {"confirmed": 0, "source": 1, "candidate": 2}.get(item["relation"], 3),
+        {"resolved": 0, "source": 1, "candidate": 2}.get(item["relation"], 3),
         item["path"],
     ))
-    return result[:MAX_WORKFLOW_STAGE_ENTRIES], len(result)
+    return result, len(result)
 
 
 def project_workflow_completeness(
@@ -591,39 +362,33 @@ def project_workflow_completeness(
     dependents: list[dict[str, Any]],
     tests: list[dict[str, Any]],
     freshness: dict[str, Any],
-    incomplete_inventory: bool,
-    scan_exhausted: bool,
+    skipped_sources: dict[str, str],
 ) -> tuple[str, list[str]]:
-    """Project status and warnings from provenance without fabricating success."""
+    """Report incomplete input coverage and unresolved references."""
     candidate_present = any(
         entry["relation"] == "candidate"
         for entry in [*implementations, *dependents, *tests]
     )
     freshness_status = str(freshness.get("status") or "current")
     partial = (
-        candidate_present or incomplete_inventory or scan_exhausted or not tests
-        or any(item["relation"] == "source" for item in [*implementations, *tests])
+        candidate_present or skipped_sources
         or freshness_status != "current"
     )
     if entrypoints or implementations:
         status = "partial" if partial else "found"
-    elif freshness_status != "current" or incomplete_inventory:
+    elif freshness_status != "current" or skipped_sources:
         status = "partial"
-    elif symbol and any(Path(path).suffix.casefold() in _FALLBACK_SUFFIXES for path in all_files[:MAX_WORKFLOW_SOURCE_FILES]):
+    elif symbol and any(Path(path).suffix.casefold() in _FALLBACK_SUFFIXES for path in all_files):
         status = "unsupported"
     else:
         status = "not_found"
     warnings: list[str] = []
-    if incomplete_inventory or scan_exhausted:
-        warnings.append("Source scan exceeded file or byte budget; narrow with --in-file")
+    if skipped_sources:
+        warnings.append("Some source paths could not be inspected; see completeness.skipped_sources")
     if freshness_status != "current":
-        warnings.append("Graph snapshot is stale; confirmed stale relations are excluded; rebuild before treating negative results as complete")
-    if candidate_present:
-        warnings.append("Candidate links are source matches, not provider-confirmed relations")
+        warnings.append("Graph inputs have changed; stale relationships are excluded")
     if route and len({entry["path"] for entry in implementations}) > 1:
-        warnings.append("Multiple return-contributing implementation producers; no single source is selected")
-    if not tests:
-        warnings.append("No confirmed relevant tests located; this is not a zero-impact claim")
+        warnings.append("Multiple implementation paths are shown; unresolved calls remain candidates")
     return status, warnings
 
 
@@ -639,18 +404,16 @@ def assemble_workflow_result(
     files_scanned: int,
     read_bytes: int,
     freshness: dict[str, Any],
-    incomplete_inventory: bool,
-    scan_exhausted: bool,
+    skipped_sources: dict[str, str],
 ) -> dict[str, Any]:
-    """Keep public JSON and the bounded-source completeness contract together."""
+    """Assemble navigation results with observed source coverage."""
     status, warnings = project_workflow_completeness(
         route=route, symbol=symbol, all_files=all_files,
         entrypoints=stages["entrypoints"],
         implementations=stages["implementation"],
         dependents=stages["callers_or_dependents"],
         tests=stages["tests"],
-        freshness=freshness, incomplete_inventory=incomplete_inventory,
-        scan_exhausted=scan_exhausted,
+        freshness=freshness, skipped_sources=skipped_sources,
     )
     return {
         "query": {"route": route, "symbol": symbol, "in_file": in_file},
@@ -659,12 +422,12 @@ def assemble_workflow_result(
         "counts": counts,
         "links": links,
         "completeness": {
-            "source_scan_bounded": not (incomplete_inventory or scan_exhausted),
+            "source_scan_complete": not skipped_sources,
+            "skipped_sources": [{"path": path, "reason": reason} for path, reason in sorted(skipped_sources.items())],
             "source_file_count": len(all_files),
             "files_scanned": files_scanned,
             "source_bytes_scanned": read_bytes,
             "graph_freshness": str(freshness.get("status") or "unknown"),
-            "precision": "partial" if status == "partial" else "confirmed" if status == "found" else "unavailable",
         },
         "warnings": warnings,
     }
@@ -673,7 +436,6 @@ def assemble_workflow_result(
 def query_graph_workflow(
     snapshot: GraphSnapshot,
     *,
-    root: Path,
     target: RepoTarget,
     route: str = "",
     symbol: str = "",
@@ -696,35 +458,40 @@ def query_graph_workflow(
     changed = {str(path) for path in freshness.get("changed_paths") or [] if isinstance(path, str)}
     # A stale, nearly empty Graph can still point at changed current files.
     all_files = sorted(graph_files | changed)
-    # Honor an explicit file before global file count, byte or sort order.
     # A current file missing from a stale Graph is still a valid exact seed.
     if in_file:
-        if not (target.root_path / in_file).is_file() or (target.root_path / in_file).is_symlink():
-            return {"status": "not_found", "query": {"in_file": in_file},
-                    "warnings": ["Exact file does not exist in the selected repository"]}
         files = [in_file, *(path for path in all_files if path != in_file)]
     else:
         files = all_files
-    bounded_files = files[:MAX_WORKFLOW_SOURCE_FILES]
-    incomplete_inventory = len(files) > len(bounded_files)
-    seed_files = [in_file] if in_file else bounded_files
+    seed_files = [in_file] if in_file else files
     source_cache: dict[str, str] = {}
+    tree_cache: dict[str, ast.AST | None] = {}
+    skipped_sources: dict[str, str] = {}
     read_bytes = 0
-    scan_exhausted = False
+    files_read = 0
 
     def source_read(path: str) -> str:
-        nonlocal read_bytes, scan_exhausted
+        nonlocal read_bytes, files_read
         if path not in source_cache:
-            if read_bytes >= MAX_WORKFLOW_TOTAL_SOURCE_BYTES:
-                scan_exhausted = True
-                return ""
-            value = _source(root, target, path)
-            if read_bytes + len(value.encode("utf-8")) > MAX_WORKFLOW_TOTAL_SOURCE_BYTES:
-                scan_exhausted = True
-                return ""
-            read_bytes += len(value.encode("utf-8"))
-            source_cache[path] = value
+            value, size, reason = _source(target, path)
+            read_bytes += size
+            if value is not None or size:
+                files_read += 1
+            if reason:
+                skipped_sources[path] = reason
+            source_cache[path] = value or ""
         return source_cache[path]
+
+    def python_tree(path: str) -> ast.AST | None:
+        if path not in tree_cache:
+            value = source_read(path)
+            tree_cache[path] = None
+            if path not in skipped_sources:
+                try:
+                    tree_cache[path] = ast.parse(value)
+                except (SyntaxError, ValueError, RecursionError):
+                    skipped_sources[path] = "parse_error"
+        return tree_cache[path]
 
     entrypoints: list[dict[str, Any]] = []
     implementations: list[dict[str, Any]] = []
@@ -734,54 +501,53 @@ def query_graph_workflow(
     chosen_symbol_ids: set[str] = set()
     entrypoint_source: list[tuple[str, str, ast.AST]] = []
     if route:
-        entrypoints, entrypoint_source = discover_route_entrypoints(seed_files, source_read, route)
+        entrypoints, entrypoint_source = discover_route_entrypoints(seed_files, python_tree, route)
         if len(entrypoints) > 1:
             return {
                 "query": {"route": route, "in_file": in_file},
-                "status": "ambiguous", "entrypoints": entrypoints[:MAX_WORKFLOW_STAGE_ENTRIES],
+                "status": "ambiguous", "entrypoints": entrypoints,
                 "warnings": ["Multiple entrypoints match; pass --in-file to disambiguate"],
-                "completeness": {"source_scan_bounded": not incomplete_inventory},
+                "completeness": {
+                    "source_scan_complete": not skipped_sources,
+                    "source_file_count": len(files), "files_scanned": files_read,
+                    "source_bytes_scanned": read_bytes,
+                    "skipped_sources": [{"path": path, "reason": reason} for path, reason in sorted(skipped_sources.items())],
+                },
             }
         for path, name, _function in entrypoint_source:
             chosen_symbol_ids.update(
                 sid for sid, info in symbols.items()
                 if info["path"] == path and info["name"].rsplit(".", 1)[-1] == name and path not in stale
             )
-        # A handler-to-method attribute call is not statically resolved just
-        # because the method name is identical: expose a bounded candidate.
+        # Use provider CALLS edges for resolved targets. Attribute names and
+        # application-factory assignments do not establish dynamic dispatch.
+        route_symbol_ids = chosen_symbol_ids.copy()
+        for edge in snapshot.edges:
+            if edge.kind != "CALLS" or edge.from_id not in route_symbol_ids:
+                continue
+            info = symbols.get(edge.to_id, {})
+            path = info.get("path", "")
+            if not path or path in stale or is_test_path(path):
+                continue
+            chosen_symbol_ids.add(edge.to_id)
+            implementations.append(_entry(path, relation="resolved", evidence="CALLS", symbol=info["name"]))
+            links.append({"from": symbols[edge.from_id]["path"], "to": path,
+                          "relation": "resolved", "evidence": "CALLS"})
         if entrypoint_source:
-            path, _name, func = entrypoint_source[0]
-            method_names = collect_route_value_flow(func)
-            blueprint_export = next((
-                decorator.func.value.id
-                for decorator in func.decorator_list
-                if isinstance(decorator, ast.Call)
-                and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr in _ROUTE_METHODS
-                and isinstance(decorator.func.value, ast.Name)
-            ), "")
-            for method, receiver in sorted(method_names):
-                match = resolve_source_wired_implementation(
-                    symbols, bounded_files, source_read,
-                    route_path=path, receiver=receiver, method=method,
-                    blueprint_export=blueprint_export,
-                )
-                if match:
-                    sid, info, wiring = match
-                    chosen_symbol_ids.add(sid)
-                    if wiring:
-                        verified = _entry(
-                            info["path"], relation="source", evidence=wiring["evidence"], symbol=info["name"],
-                        )
-                        verified["verification"] = "python_flask_factory_wiring"
-                        implementations.append(verified)
-                        links.extend([
-                            {"from": path, "to": wiring["path"], "relation": "source", "evidence": "Flask blueprint registration"},
-                            {"from": wiring["path"], "to": info["path"], "relation": "source", "evidence": "Imported implementation constructed and assigned to current_app receiver property", "line": wiring["line"]},
-                        ])
-                    else:
-                        implementations.append(_entry(info["path"], relation="candidate", evidence="unresolved attribute call in route handler", symbol=info["name"]))
-                        links.append({"from": path, "to": info["path"], "relation": "candidate", "evidence": "unresolved attribute call"})
+            route_path, _name, function = entrypoint_source[0]
+            methods = {method for method, receiver in collect_route_value_flow(function) if receiver}
+            for sid, info in symbols.items():
+                if sid in chosen_symbol_ids or not info["path"].endswith(".py") or is_test_path(info["path"]):
+                    continue
+                method = info["name"].rsplit(".", 1)[-1]
+                if method not in methods or not _current_class_method(python_tree(info["path"]), info["name"], method):
+                    continue
+                chosen_symbol_ids.add(sid)
+                implementations.append(_entry(info["path"], relation="candidate",
+                                               evidence="matching declaration for an unresolved attribute call",
+                                               symbol=info["name"]))
+                links.append({"from": route_path, "to": info["path"], "relation": "candidate",
+                              "evidence": "unresolved attribute call"})
     else:
         matches = [
             (sid, info) for sid, info in symbols.items()
@@ -793,8 +559,8 @@ def query_graph_workflow(
             return {
                 "query": {"symbol": symbol, "in_file": in_file},
                 "status": "ambiguous", "implementations": [
-                    _entry(info["path"], relation="confirmed", evidence="provider symbol", symbol=info["name"])
-                    for _sid, info in matches[:MAX_WORKFLOW_STAGE_ENTRIES]
+                    _entry(info["path"], relation="resolved", evidence="provider symbol", symbol=info["name"])
+                    for _sid, info in matches
                 ], "warnings": ["Multiple precise symbols match; pass a qualified name and --in-file"],
             }
         for sid, info in matches:
@@ -813,11 +579,11 @@ def query_graph_workflow(
                     )
                 }
                 if len(linked_paths) == 1:
-                    implementations.append(_entry(next(iter(linked_paths)), relation="confirmed",
+                    implementations.append(_entry(next(iter(linked_paths)), relation="resolved",
                                                   evidence="resolved Rust mod file", symbol=info["name"]))
                     continue
             chosen_symbol_ids.add(sid)
-            implementations.append(_entry(info["path"], relation="confirmed", evidence="provider symbol", symbol=info["name"]))
+            implementations.append(_entry(info["path"], relation="resolved", evidence="provider symbol", symbol=info["name"]))
         if not matches and symbol:
             # Unsupported languages still get source locations, never a
             # fabricated precise symbol, caller, or zero-impact assertion.
@@ -828,7 +594,7 @@ def query_graph_workflow(
                 suffix = Path(path).suffix.casefold()
                 # Dart can remain queryable as source evidence even on a
                 # machine without a Dart SDK/analyzer. Only the compiler
-                # provider may elevate a Dart symbol to `confirmed`.
+                # provider may elevate a Dart symbol to `resolved`.
                 if suffix not in _FALLBACK_SUFFIXES and suffix != ".dart" and not (
                     str(freshness.get("status") or "current") != "current" and suffix == ".py"
                 ):
@@ -852,7 +618,7 @@ def query_graph_workflow(
                         # A matched basename is not a Rust module for other
                         # languages. Dart `void main()` can be proven by
                         # current source syntax, but a filename match alone
-                        # is merely a candidate, never a verified call edge.
+                        # is merely a candidate, never a referenced call edge.
                         main_name = symbol.rsplit(".", 1)[-1]
                         rust_module = suffix == ".rs" and Path(path).stem == main_name
                         dart_top_level = (
@@ -872,12 +638,12 @@ def query_graph_workflow(
                                 else "current source text or module name; semantic relation unconfirmed"
                             ),
                         ))
-    # Provider-confirmed calls/imports and TESTS_FILE paths are preserved. An
+    # Provider-resolved calls/imports and TESTS_FILE paths are preserved. An
     # edge touching a stale source is never presented as a current relation.
     selected_files = {entry["path"] for entry in [*entrypoints, *implementations]}
 
-    def route_test_proof(path: str) -> tuple[str, int] | None:
-        current = source_read(path)
+    def test_reference(path: str) -> tuple[str, int] | None:
+        current = python_tree(path)
         direct = _python_test_operation_evidence(current, method="", route=route)
         if direct:
             return direct
@@ -905,32 +671,32 @@ def query_graph_workflow(
             continue
         if edge.kind == "CALLS" and edge.to_id in chosen_symbol_ids:
             if is_test_path(from_path):
-                tests.append(_entry(from_path, relation="confirmed", evidence="CALLS"))
+                tests.append(_entry(from_path, relation="resolved", evidence="CALLS"))
             else:
-                dependents.append(_entry(from_path, relation="confirmed", evidence="CALLS"))
+                dependents.append(_entry(from_path, relation="resolved", evidence="CALLS"))
         if edge.kind == "IMPORTS_FILE" and to_path in selected_files and from_path not in selected_files:
             if is_test_path(from_path):
                 if route and from_path.endswith(".py"):
-                    proof = route_test_proof(from_path)
-                    if not proof:
+                    reference = test_reference(from_path)
+                    if not reference:
                         continue
-                    verified = _entry(from_path, relation="source", evidence="AST-verified route or imported manager operation", line=proof[1])
-                    verified["verification"] = proof[0]
-                    tests.append(verified)
+                    referenced = _entry(from_path, relation="source", evidence="AST-referenced route or imported manager operation", line=reference[1])
+                    referenced["reference_kind"] = reference[0]
+                    tests.append(referenced)
                 else:
-                    tests.append(_entry(from_path, relation="confirmed", evidence="IMPORTS_FILE"))
+                    tests.append(_entry(from_path, relation="resolved", evidence="IMPORTS_FILE"))
             else:
-                dependents.append(_entry(from_path, relation="confirmed", evidence="IMPORTS_FILE"))
+                dependents.append(_entry(from_path, relation="resolved", evidence="IMPORTS_FILE"))
         if edge.kind == "TESTS_FILE" and to_path in selected_files:
             if route and from_path.endswith(".py"):
-                proof = route_test_proof(from_path)
-                if not proof:
+                reference = test_reference(from_path)
+                if not reference:
                     continue
-                verified = _entry(from_path, relation="source", evidence="AST-verified route or imported manager operation", line=proof[1])
-                verified["verification"] = proof[0]
-                tests.append(verified)
+                referenced = _entry(from_path, relation="source", evidence="AST-referenced route or imported manager operation", line=reference[1])
+                referenced["reference_kind"] = reference[0]
+                tests.append(referenced)
             else:
-                tests.append(_entry(from_path, relation="confirmed", evidence="TESTS_FILE"))
+                tests.append(_entry(from_path, relation="resolved", evidence="TESTS_FILE"))
     # Rust unit tests can live inside the implementation module itself.
     # Verify a real #[test] body references an AST-declared symbol from that
     # module; a similar test name in a different crate is not a test edge.
@@ -943,13 +709,13 @@ def query_graph_workflow(
         path = implementation["path"]
         if not path.endswith(".rs") or path in stale:
             continue
-        proof = _rust_embedded_test_evidence(source_read(path))
-        if proof:
-            verified = _entry(path, relation="source",
+        reference = _rust_embedded_test_evidence(source_read(path))
+        if reference:
+            referenced = _entry(path, relation="source",
                               evidence="Rust AST #[test] body references a declaration in this module",
-                              symbol=proof[0], line=proof[1])
-            verified["verification"] = "rust_embedded_test_decl"
-            tests.append(verified)
+                              symbol=reference[0], line=reference[1])
+            referenced["reference_kind"] = "rust_embedded_test_decl"
+            tests.append(referenced)
     # Name-only tests in the *same crate* remain candidate navigation. A
     # cross-crate name overlap never establishes a test of this module.
     if symbol and any(item["path"].endswith(".rs") for item in implementations):
@@ -960,7 +726,7 @@ def query_graph_workflow(
                 r"(?m)#\[(?:[A-Za-z_][A-Za-z0-9_]*::)?test\]"
                 r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"
             )
-            for candidate in bounded_files:
+            for candidate in files:
                 if not candidate.endswith(".rs") or candidate in stale:
                     continue
                 if Path(candidate).parts[:1] == ("crates",) and tuple(Path(candidate).parts[:2]) not in rust_crates:
@@ -978,7 +744,7 @@ def query_graph_workflow(
                     break
 
     # A Dart test imports the owning library, which can include another
-    # physical file through a verified `part`/`part of` declaration. The
+    # physical file through a referenced `part`/`part of` declaration. The
     # two-hop test -> library -> part path is typed source evidence rather
     # than a similar basename guess; do not claim individual assertions ran.
     dart_part_owners: set[str] = set()
@@ -998,40 +764,22 @@ def query_graph_workflow(
             test_path = str(test_node.identity.get("path") or "") if test_node else ""
             owner_path = str(owner_node.identity.get("path") or "") if owner_node else ""
             if test_path and test_path not in stale and owner_path in dart_part_owners and is_test_path(test_path):
-                tests.append(_entry(test_path, relation="confirmed", evidence="TESTS_FILE through exact Dart library/part chain"))
+                tests.append(_entry(test_path, relation="resolved", evidence="TESTS_FILE through exact Dart library/part chain"))
 
-    # Name-nearby test modules are navigation candidates, not confirmed
+    # Name-nearby test modules are navigation candidates, not resolved
     # TESTS_FILE relations (particularly when the snapshot is stale).
     for item in implementations:
         impl_path = item["path"]
         if Path(impl_path).suffix.casefold() == ".dart":
             expected_stem = Path(impl_path).stem + "_test"
-            for test_path in bounded_files:
+            for test_path in files:
                 if is_test_path(test_path) and Path(test_path).stem == expected_stem:
                     tests.append(_entry(test_path, relation="candidate", evidence="matching Dart test module name"))
-    # Verify direct Dart importers from current sibling source, including when
-    # the snapshot's stored import edge is stale. This is a source-proven
-    # module dependency, not an invented precise function CALLS edge.
-    for implementation in implementations:
-        implementation_path = str(implementation.get("path") or "")
-        if not implementation_path.endswith(".dart"):
-            continue
-        module_name = Path(implementation_path).name
-        parent = Path(implementation_path).parent
-        for candidate in bounded_files:
-            if candidate == implementation_path or Path(candidate).suffix != ".dart":
-                continue
-            if Path(candidate).parent != parent or is_test_path(candidate):
-                continue
-            text = source_read(candidate)
-            pattern = r"(?m)^\s*(?:import|export|part)\s+['\"][^'\"]*" + re.escape(module_name) + r"['\"]"
-            if re.search(pattern, text):
-                dependents.append(_entry(candidate, relation="source", evidence="current Dart module import/export literal"))
+    # Dart imports and library/part paths use the provider's structured
+    # relationships above. Stale edges require a rebuild, not a second regex
+    # resolver that can mistake comments or same-named paths for imports.
     if route:
-        tests.extend(collect_source_verified_tests(
-            bounded_files, route=route,
-            implementations=implementations, route_test_proof=route_test_proof,
-        ))
+        tests.extend(collect_test_references(files, test_reference=test_reference))
 
     entrypoints, entry_count = _dedupe_entries(entrypoints)
     implementations, implementation_count = _dedupe_entries(
@@ -1052,130 +800,7 @@ def query_graph_workflow(
         },
         counts={"entrypoints": entry_count, "implementation": implementation_count,
                 "callers_or_dependents": dependent_count, "tests": test_count},
-        links=links, all_files=files, files_scanned=len(source_cache),
+        links=links, all_files=files, files_scanned=files_read,
         read_bytes=read_bytes, freshness=freshness,
-        incomplete_inventory=incomplete_inventory, scan_exhausted=scan_exhausted,
+        skipped_sources=skipped_sources,
     )
-
-
-def evaluate_workflow_benchmark(result: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
-    """Score required stages, false positives, provenance, and first source.
-
-    Path recall is diagnostic only. A string candidate or a fabricated empty
-    caller answer cannot meet a required compiler-confirmed relation stage.
-    """
-    expected = case.get("expected_paths") if isinstance(case.get("expected_paths"), dict) else {}
-    related = case.get("expected_related_paths") if isinstance(case.get("expected_related_paths"), dict) else {}
-    stages = result.get("stages") if isinstance(result.get("stages"), dict) else {}
-    aliases = {"entrypoint": "entrypoints", "current_source": "implementation"}
-    required = case.get("required_stages") if isinstance(case.get("required_stages"), list) else []
-    metrics: dict[str, Any] = {}
-    verified_source_types = {
-        "python_flask_factory_wiring", "python_literal_http_test",
-        "python_imported_class_method_test", "rust_embedded_test_decl",
-    }
-    total = hits = confirmed_hits = output_count = false_positive_count = 0
-    for stage in sorted(expected):
-        values = expected[stage]
-        expected_paths = sorted({str(value) for value in values if isinstance(value, str) and value}) if isinstance(values, list) else []
-        related_values = related.get(stage)
-        related_paths = {value for value in related_values if isinstance(value, str) and value} if isinstance(related_values, list) else set()
-        stage_key = aliases.get(stage, stage)
-        observations = [entry for entry in stages.get(stage_key, []) if isinstance(entry, dict)]
-        matches = {str(entry.get("path") or ""): entry for entry in observations if entry.get("path")}
-        hit_paths = sorted(set(expected_paths) & set(matches))
-        confirmed_paths = sorted(
-            path for path in hit_paths if matches[path].get("relation") == "confirmed"
-        )
-        structural_paths = sorted(
-            path for path in hit_paths if matches[path].get("relation") in {"source", "confirmed"}
-        )
-        verified_paths = sorted(
-            path for path in hit_paths
-            if matches[path].get("relation") == "confirmed"
-            or (matches[path].get("relation") == "source"
-                and matches[path].get("verification") in verified_source_types)
-        )
-        # Secondary Dart tests import the library owning the queried part.
-        # They are verified compile dependencies, not direct behavioural
-        # ground truth. Only explicitly reviewed exact part-chain paths can
-        # avoid the false-positive count; a name candidate still fails.
-        verified_related = sorted(
-            path for path in related_paths & set(matches)
-            if matches[path].get("relation") == "confirmed"
-            and matches[path].get("evidence") == "TESTS_FILE through exact Dart library/part chain"
-        )
-        false_positive_paths = sorted(set(matches) - set(expected_paths) - set(verified_related))
-        total += len(expected_paths)
-        hits += len(hit_paths)
-        confirmed_hits += len(confirmed_paths)
-        output_count += len(matches)
-        false_positive_count += len(false_positive_paths)
-        first_observed = str(observations[0].get("path") or "") if observations else ""
-        metrics[stage] = {
-            "expected_count": len(expected_paths),
-            "found_count": len(hit_paths),
-            "confirmed_count": len(confirmed_paths),
-            "structural_count": len(structural_paths),
-            "verified_count": len(verified_paths),
-            "missing_paths": sorted(set(expected_paths) - set(matches)),
-            "false_positive_paths": false_positive_paths[:MAX_WORKFLOW_STAGE_ENTRIES],
-            "false_positive_count": len(false_positive_paths),
-            "verified_related_paths": verified_related,
-            "verified_related_count": len(verified_related),
-            "first_expected_path": expected_paths[0] if expected_paths else "",
-            "first_observed_path": first_observed,
-            "first_path_correct": bool(expected_paths and first_observed in expected_paths),
-            "path_recall": round(len(hit_paths) / len(expected_paths), 4) if expected_paths else None,
-            "path_precision": round(len(hit_paths) / len(matches), 4) if matches else None,
-        }
-    required_details: dict[str, dict[str, Any]] = {}
-    for requested in required:
-        stage = aliases.get(requested, requested)
-        if stage == "refresh":
-            refresh_proof = result.get("refresh") if isinstance(result.get("refresh"), dict) else {}
-            evidence = refresh_proof.get("source_rechecked") is True and refresh_proof.get("status") == "current"
-            required_details[requested] = {"status": "verified" if evidence else "not_evaluated", "covered": evidence, "precise": evidence}
-            continue
-        row = metrics.get(requested) or metrics.get(stage)
-        if not row or row["expected_count"] == 0:
-            required_details[requested] = {"status": "unscored_no_ground_truth", "covered": False, "precise": False}
-            continue
-        covered = row["found_count"] == row["expected_count"]
-        # Concrete route decorators are structural entrypoints. Other required
-        # stages need provider links or a specific verified AST source proof;
-        # a generic source/candidate path is insufficient.
-        precise = covered and (
-            row["structural_count"] == row["expected_count"] if stage == "entrypoints"
-            else row["verified_count"] == row["expected_count"]
-        )
-        required_details[requested] = {
-            "status": "precise" if precise else "candidate_only" if covered else "missing",
-            "covered": covered, "precise": precise,
-        }
-    all_covered = bool(required) and all(row["covered"] for row in required_details.values())
-    all_precise = bool(required) and all(row["precise"] for row in required_details.values())
-    allowed = case.get("expected_statuses") if isinstance(case.get("expected_statuses"), list) else []
-    status_expected = result.get("status") in allowed
-    primary_stage = "entrypoints" if "entrypoints" in expected else "implementation"
-    primary_row = metrics.get(primary_stage) or {}
-    first_path_correct = bool(primary_row.get("first_path_correct"))
-    return {
-        "case_id": str(case.get("id") or ""),
-        "query_status": result.get("status") or "unavailable",
-        "status_expected": status_expected,
-        "required_stages": required_details,
-        "required_stages_covered": all_covered,
-        "required_stages_precise": all_precise,
-        "first_path_correct": first_path_correct,
-        "task_navigation_complete": status_expected and all_covered and all_precise and first_path_correct and false_positive_count == 0,
-        "expected_path_count": total,
-        "found_path_count": hits,
-        "confirmed_path_count": confirmed_hits,
-        "false_positive_count": false_positive_count,
-        "false_positive_rate": round(false_positive_count / output_count, 4) if output_count else None,
-        "path_recall": round(hits / total, 4) if total else None,
-        "confirmed_path_recall": round(confirmed_hits / total, 4) if total else None,
-        "stages": metrics,
-        "limitations": list(result.get("warnings") or []),
-    }

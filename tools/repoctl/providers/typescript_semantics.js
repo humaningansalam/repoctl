@@ -83,7 +83,7 @@ function declarationKind(ts, node) {
   if (ts.isArrowFunction(node)) return "arrow_function";
   if (ts.isFunctionExpression(node)) return "function_expression";
   if (ts.isFunctionDeclaration(node)) {
-    return node.parent && !ts.isSourceFile(node.parent) ? "function" : "function";
+    return "function";
   }
   return "";
 }
@@ -202,6 +202,7 @@ function main() {
 
   const symbols = new Map();
   const calls = new Map();
+  const imports = new Map();
   const analyzedPaths = new Set();
   const failedPaths = new Set();
   const diagnostics = [];
@@ -395,6 +396,28 @@ function main() {
       analyzedPaths.add(relativePath);
       moduleDescriptorFor(sourceFile, relativePath);
       function collect(node) {
+        let moduleSpecifier;
+        if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+          moduleSpecifier = node.moduleSpecifier;
+        } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+          moduleSpecifier = node.moduleReference.expression;
+        } else if (ts.isCallExpression(node) && node.arguments.length === 1) {
+          if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+            moduleSpecifier = node.arguments[0];
+          } else if (ts.isIdentifier(node.expression) && node.expression.text === "require") {
+            const binding = checker.getSymbolAtLocation(node.expression);
+            const locallyDeclared = binding && (binding.declarations || []).some(
+              declaration => requested.has(normalizedAbsolute(declaration.getSourceFile().fileName)),
+            );
+            if (!locallyDeclared) moduleSpecifier = node.arguments[0];
+          }
+        }
+        if (moduleSpecifier && (ts.isStringLiteral(moduleSpecifier) || ts.isNoSubstitutionTemplateLiteral(moduleSpecifier))) {
+          const anchor = sourceAnchor(sourceFile, moduleSpecifier, relativePath);
+          imports.set(JSON.stringify([relativePath, moduleSpecifier.text, anchor.start_line, anchor.start_col]), {
+            module: moduleSpecifier.text, anchor,
+          });
+        }
         if (isSupportedDeclaration(ts, node)) descriptorFor(node);
         ts.forEachChild(node, collect);
       }
@@ -438,6 +461,7 @@ function main() {
     failed_paths: [...failedPaths].filter(Boolean).sort(),
     symbols: publicSymbols,
     calls: publicCalls,
+    imports: [...imports.values()].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     diagnostics,
   }));
 }

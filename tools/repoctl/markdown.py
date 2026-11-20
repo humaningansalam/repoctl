@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,77 +17,106 @@ class SectionRange:
     end: int
 
 
+def _frontmatter_bounds(text: str) -> tuple[int, int] | None:
+    opening = re.match(r"\A---\r?\n", text)
+    if opening is None:
+        return None
+    closing = re.search(r"^---(?:\r?\n|$)", text[opening.end():], re.MULTILINE)
+    if closing is None:
+        raise RepoctlError("frontmatter closing delimiter missing", code="invalid_frontmatter")
+    return opening.end(), opening.end() + closing.end()
+
+
 def _parse_scalar(value: str) -> Any:
     value = value.strip()
-    if value == "[]":
-        return []
-    if len(value) >= 2 and value[0] == value[-1] == '"':
-        return value[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+    if not value:
+        return ""
+    try:
+        return json.loads(value)
+    except ValueError:
+        pass
     if len(value) >= 2 and value[0] == value[-1] == "'":
-        return value[1:-1]
+        return value[1:-1].replace("''", "'")
     if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        return [part.strip().strip('"').strip("'") for part in inner.split(",")]
+        return [part.strip().strip("'") for part in next(csv.reader([value[1:-1]], skipinitialspace=True)) if part.strip()]
     return value
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-    if not text.startswith("---\n"):
+    bounds = _frontmatter_bounds(text)
+    if bounds is None:
         return {}, text
-    end = text.find("\n---\n", 4)
-    if end == -1:
-        raise RepoctlError("frontmatter closing delimiter missing")
-    raw = text[4:end]
+    start, end = bounds
     data: dict[str, Any] = {}
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+    for line in text[start:end].splitlines()[:-1]:
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
+        key, separator, value = line.partition(":")
         key = key.strip()
-        if key:
-            data[key] = _parse_scalar(value)
-    return data, text[end + len("\n---\n") :]
+        if not separator or not key:
+            raise RepoctlError("expected a frontmatter key and value", code="invalid_frontmatter")
+        if key in data:
+            raise RepoctlError(f"duplicate frontmatter key: {key}", code="duplicate_frontmatter_key")
+        data[key] = _parse_scalar(value)
+    return data, text[end:]
 
 
 def replace_frontmatter_line(text: str, key: str, value: str) -> str:
-    if not text.startswith("---\n"):
-        raise RepoctlError("frontmatter missing")
-    end = text.find("\n---\n", 4)
-    if end == -1:
-        raise RepoctlError("frontmatter closing delimiter missing")
-    front = text[:end]
-    rest = text[end:]
-    lines = front.splitlines()
-    prefix = f"{key}:"
-    for index, line in enumerate(lines):
-        if line.startswith(prefix):
-            lines[index] = f"{key}: {value}"
-            return "\n".join(lines) + rest
-    raise RepoctlError(f"frontmatter key missing: {key}")
+    """Set one scalar field while preserving unrelated source text."""
+    parse_frontmatter(text)
+    bounds = _frontmatter_bounds(text)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if bounds is None:
+        return f"---{newline}{key}: {value}{newline}---{newline}{text}"
+    start, end = bounds
+    offset = start
+    lines = text[start:end].splitlines(keepends=True)
+    for line in lines[:-1]:
+        if line.partition(":")[0].strip() == key:
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            return text[:offset] + f"{key}: {value}" + ending + text[offset + len(line):]
+        offset += len(line)
+    closing_start = end - len(lines[-1])
+    return text[:closing_start] + f"{key}: {value}{newline}" + text[closing_start:]
+
+
+def _without_comments(line: str, in_comment: bool) -> tuple[str, bool]:
+    if in_comment:
+        if "-->" not in line:
+            return "", True
+        line = line.split("-->", 1)[1]
+        in_comment = False
+    while "<!--" in line:
+        before, after = line.split("<!--", 1)
+        if "-->" in after:
+            line = before + after.split("-->", 1)[1]
+        else:
+            return before, True
+    return line, in_comment
 
 
 def _heading_ranges(text: str) -> list[tuple[str, int, int]]:
     ranges: list[tuple[str, int, int]] = []
     offset = 0
-    in_fence = False
-    fence_marker = ""
+    fence_char, fence_length = "", 0
+    in_comment = False
     for line in text.splitlines(keepends=True):
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            marker = stripped[:3]
-            if not in_fence:
-                in_fence = True
-                fence_marker = marker
-            elif marker == fence_marker:
-                in_fence = False
-                fence_marker = ""
-        if not in_fence and line.startswith("## "):
-            ranges.append((line.strip(), offset, offset + len(line)))
+        if fence_char:
+            close = re.match(r"^ {0,3}(\x60{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+            if close and close.group(1)[0] == fence_char and len(close.group(1)) >= fence_length and not close.group(2).strip():
+                fence_char, fence_length = "", 0
+            offset += len(line)
+            continue
+        visible, in_comment = _without_comments(line, in_comment)
+        marker = re.match(r"^ {0,3}(\x60{3,}|~{3,})(.*)$", visible.rstrip("\r\n"))
+        if marker:
+            sequence = marker.group(1)
+            fence_char, fence_length = sequence[0], len(sequence)
+            offset += len(line)
+            continue
+        heading = re.match(r"^ {0,3}##[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$", visible.rstrip("\r\n"))
+        if heading:
+            ranges.append(("## " + heading.group(1).strip(), offset, offset + len(line)))
         offset += len(line)
     return ranges
 
@@ -98,11 +130,13 @@ def section_ranges(text: str) -> list[SectionRange]:
 
 
 def find_section(text: str, heading: str) -> SectionRange:
-    wanted = f"## {heading}" if not heading.startswith("## ") else heading
-    for section in section_ranges(text):
-        if section.heading == wanted:
-            return section
-    raise RepoctlError(f"section missing: {wanted}", code="missing_section")
+    wanted = heading if heading.startswith("## ") else f"## {heading}"
+    matches = [section for section in section_ranges(text) if section.heading == wanted]
+    if not matches:
+        raise RepoctlError(f"section missing: {wanted}", code="missing_section")
+    if len(matches) > 1:
+        raise RepoctlError(f"duplicate section: {wanted}", code="duplicate_section")
+    return matches[0]
 
 
 def has_section(text: str, heading: str) -> bool:
@@ -115,62 +149,23 @@ def has_section(text: str, heading: str) -> bool:
     return True
 
 
-def parse_labeled_list_section(text: str, heading: str, labels: tuple[str, ...]) -> dict[str, list[str]]:
-    section = find_section(text, heading)
-    body = text[section.body_start : section.end]
-    allowed = set(labels)
-    parsed: dict[str, list[str]] = {}
-    current = ""
-    in_fence = False
-    fence_marker = ""
-    for raw_line in body.splitlines():
-        stripped = raw_line.strip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            marker = stripped[:3]
-            if not in_fence:
-                in_fence = True
-                fence_marker = marker
-            elif marker == fence_marker:
-                in_fence = False
-                fence_marker = ""
-            current = ""
-            continue
-        if in_fence:
-            continue
-        if not stripped or stripped.startswith("<!--"):
-            continue
-        indentation = len(raw_line) - len(raw_line.lstrip(" "))
-        if indentation == 0 and stripped.startswith("- "):
-            label, separator, value = stripped[2:].partition(":")
-            current = label if separator and label in allowed else ""
-            if current:
-                parsed.setdefault(current, [])
-                if value.strip():
-                    parsed[current].append(value.strip())
-            continue
-        if current and indentation >= 2 and stripped.startswith("- "):
-            value = stripped[2:].strip()
-            if value:
-                parsed[current].append(value)
-            continue
-        current = ""
-    return parsed
 
 
-def replace_section(text: str, heading: str, body: str) -> str:
-    section = find_section(text, heading)
-    normalized = body if body.endswith("\n") else body + "\n"
-    suffix = text[section.end :]
-    if suffix and not normalized.endswith("\n\n"):
-        normalized += "\n"
-    return text[: section.body_start] + "\n" + normalized + suffix
+
+
 
 
 def append_section_entry(text: str, heading: str, entry: str) -> str:
-    section = find_section(text, heading)
-    body = text[section.body_start : section.end].rstrip()
-    suffix = "\n" if body else ""
-    entry_text = body + suffix + entry.rstrip() + "\n"
-    if text[section.end :] and not entry_text.endswith("\n\n"):
-        entry_text += "\n"
-    return text[: section.body_start] + entry_text + text[section.end :]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    entry = entry.replace("\r\n", "\n").replace("\n", newline).rstrip("\r\n") + newline
+    try:
+        section = find_section(text, heading)
+    except RepoctlError as exc:
+        if exc.code != "missing_section":
+            raise
+        separator = "" if text.endswith(newline * 2) else newline if text.endswith(newline) else newline * 2
+        return text + separator + f"## {heading}{newline}{newline}" + entry
+    prefix, suffix = text[:section.end], text[section.end:]
+    if not prefix.endswith(newline):
+        prefix += newline
+    return prefix + entry + (newline if suffix else "") + suffix

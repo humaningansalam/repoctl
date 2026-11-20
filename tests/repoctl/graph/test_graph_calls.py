@@ -11,7 +11,6 @@ from tools.repoctl.graph_typescript_provider import build_typescript_semantics
 from tools.repoctl.repositories import RepoTarget
 from tests.repoctl.graph.test_graph_build import _materialize, _snapshot
 from tests.repoctl.workspace.test_check import write_workspace
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 
 def test_typescript_provider_rejects_malformed_success_payload(
@@ -24,17 +23,7 @@ def test_typescript_provider_rejects_malformed_success_payload(
     source = repo / "src/app.ts"
     source.parent.mkdir()
     source.write_text("export const value = 1;\n", encoding="utf-8")
-    entry = CodeIndexEntry(
-        path="src/app.ts",
-        workspace_path="repos/src/app.ts",
-        language="typescript",
-        classification="source",
-        symbols=[],
-        imports=[],
-        calls=[],
-        deps=[],
-        observed_effects=[],
-    )
+    entry = CodeIndexEntry(path='src/app.ts', workspace_path='repos/src/app.ts', language='typescript', classification='source', symbols=[], imports=[], calls=[])
     compiler = tmp_path / "typescript.js"
     symbol = {
         "provider_symbol_id": "src/app.ts:value",
@@ -106,13 +95,12 @@ def test_graph_resolves_same_file_python_calls(tmp_path: Path, monkeypatch, caps
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "auth").mkdir()
     (repo / "auth/flow.py").write_text(
         'def validate_token(token: str) -> bool:\n    return token == "ok"\n\n\ncheck_token = validate_token\n\n\ndef login(token: str) -> str:\n    if check_token(token):\n        return "ok"\n    return "denied"\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -128,13 +116,12 @@ def test_graph_resolves_same_class_python_method_calls(tmp_path: Path, monkeypat
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "auth").mkdir()
     (repo / "auth/method_flow.py").write_text(
         'class TokenFlow:\n    def validate(self, token: str) -> bool:\n        return token == "ok"\n\n    def login(self, token: str) -> str:\n        if self.validate(token):\n            return "ok"\n        return "denied"\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -148,7 +135,6 @@ def test_graph_resolves_cross_file_python_imported_function_calls(tmp_path: Path
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "p_audit").mkdir()
@@ -237,7 +223,7 @@ def test_graph_resolves_cross_file_python_imported_function_calls(tmp_path: Path
         "    return sub()\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -271,7 +257,6 @@ def test_graph_resolves_python_module_qualified_calls_without_overstating_comple
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "services/token_service.py").write_text(
@@ -282,7 +267,7 @@ def test_graph_resolves_python_module_qualified_calls_without_overstating_comple
         "import services.token_service as tokens\n\n\ndef login(user_id: str) -> str:\n    return tokens.issue_token(user_id)\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -300,7 +285,6 @@ def test_graph_resolves_python_callable_reexports(tmp_path: Path, monkeypatch, c
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "origin.py").write_text("def target():\n    return 1\n", encoding="utf-8")
     (repo / "reexport.py").write_text("from origin import target\n", encoding="utf-8")
     (repo / "aliased.py").write_text("from origin import target as public_target\n", encoding="utf-8")
@@ -319,7 +303,7 @@ def test_graph_resolves_python_callable_reexports(tmp_path: Path, monkeypatch, c
         "    return wildpkg.target()\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -338,7 +322,6 @@ def test_graph_skips_shadowed_cross_file_python_imported_function_calls(tmp_path
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "services/token_service.py").write_text(
@@ -349,7 +332,7 @@ def test_graph_skips_shadowed_cross_file_python_imported_function_calls(tmp_path
         "from services.token_service import issue_token\n\n\ndef login(issue_token) -> str:\n    return issue_token()\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -363,7 +346,6 @@ def test_graph_python_calls_follow_lexical_scopes(tmp_path: Path, monkeypatch, c
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "scope.py").write_text(
         "def target():\n"
         "    return 1\n\n"
@@ -605,7 +587,7 @@ def test_graph_python_calls_follow_lexical_scopes(tmp_path: Path, monkeypatch, c
         "    from dependency import remote_target\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -654,7 +636,6 @@ def test_graph_query_symbol_callers_and_callees(tmp_path: Path, monkeypatch, cap
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "auth").mkdir()
     callers = "\n\n".join(
         f"def caller_{index:02d}(token: str) -> bool:\n    return validate_token(token)"
@@ -665,7 +646,7 @@ def test_graph_query_symbol_callers_and_callees(tmp_path: Path, monkeypatch, cap
         encoding="utf-8",
     )
     _materialize(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "query", "--symbol", "validate_token", "--json"]) == 0
     symbol_result = json.loads(capsys.readouterr().out)["data"]["result"]
@@ -674,34 +655,14 @@ def test_graph_query_symbol_callers_and_callees(tmp_path: Path, monkeypatch, cap
     assert symbol_result["matches"][0]["path"] == "auth/flow.py"
     assert symbol_result["paths"][0]["edge"] == "CALLS"
     assert any(path["edge"] == "CALLS" for path in symbol_result["paths"])
-    direct_selector = {"kind": "symbol", "value": "validate_token", "in_file": "auth/flow.py"}
-    assert all(item["selector"] != direct_selector for item in symbol_result["continuations"])
-
-    assert main(["graph", "query", "--callers-of", direct_selector["value"], "--in-file", direct_selector["in_file"], "--json"]) == 0
+    assert main(["graph", "query", "--callers-of", "validate_token", "--in-file", "auth/flow.py", "--json"]) == 0
     callers_result = json.loads(capsys.readouterr().out)["data"]["result"]
-    assert callers_result["query"] == {"type": "callers_of", "symbol": "validate_token", "in_file": "auth/flow.py"}
-    assert 1 <= len(callers_result["paths"]) <= 3
-    assert len(callers_result["continuations"]) <= 3
-    continuation_selectors = {
-        (item["selector"]["kind"], item["selector"]["value"], item["selector"].get("in_file", ""))
-        for item in callers_result["continuations"]
-    }
-    assert ("symbol", "validate_token", "auth/flow.py") not in continuation_selectors
+    assert len(callers_result["paths"]) == 10
+    assert {path["from"]["qualified_name"] for path in callers_result["paths"]} == {f"caller_{index:02d}" for index in range(10)}
     for path in callers_result["paths"]:
         assert path["edge"] == "CALLS"
-        for endpoint in (path["from"], path["to"]):
-            assert endpoint["path"] == "auth/flow.py"
-        assert set(path["evidence"]) == {"type", "assertion", "provider", "confidence", "completeness", "freshness"}
-
-    caller_selector = next(
-        item["selector"]
-        for item in callers_result["continuations"]
-        if item["selector"].get("value", "").startswith("caller_")
-    )
-    assert main(["graph", "query", "--symbol", direct_selector["value"], "--in-file", direct_selector["in_file"], "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["data"]["query_status"] == "found"
-    assert main(["graph", "query", "--symbol", caller_selector["value"], "--in-file", caller_selector["in_file"], "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["data"]["query_status"] == "found"
+        assert path["from"]["path"] == path["to"]["path"] == "auth/flow.py"
+        assert path["source"]["provider"] == "python_ast"
 
     assert main(["graph", "query", "--callees-of", "caller_00", "--in-file", "auth/flow.py", "--json"]) == 0
     callees_result = json.loads(capsys.readouterr().out)["data"]["result"]
@@ -718,13 +679,12 @@ def test_graph_query_symbol_ambiguity_fails_closed(tmp_path: Path, monkeypatch, 
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "web").mkdir()
     (repo / "api").mkdir()
     (repo / "web/auth.py").write_text("def login():\n    return 'web'\n", encoding="utf-8")
     (repo / "api/auth.py").write_text("def login():\n    return 'api'\n", encoding="utf-8")
     _materialize(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "query", "--symbol", "login", "--json"]) == 1
 
@@ -742,7 +702,6 @@ def test_graph_query_impact_file_uses_import_and_call_edges(tmp_path: Path, monk
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "services").mkdir()
     (repo / "handlers").mkdir()
     (repo / "services/token_service.py").write_text("def issue_token(user_id: str) -> str:\n    return f'token:{user_id}'\n", encoding="utf-8")
@@ -751,7 +710,7 @@ def test_graph_query_impact_file_uses_import_and_call_edges(tmp_path: Path, monk
         encoding="utf-8",
     )
     _materialize(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "query", "--impact-file", "services/token_service.py", "--depth", "2", "--json"]) == 0
 
@@ -762,9 +721,6 @@ def test_graph_query_impact_file_uses_import_and_call_edges(tmp_path: Path, monk
     assert not any(path["edge"] in {"DEFINES", "ANCHORS"} for path in result["paths"])
     assert "edge_counts" not in result
     assert "display" not in result
-    assert len(result["paths"]) <= 3
-    assert len(result["continuations"]) <= 3
-    assert all(set(path["evidence"]) == {"type", "assertion", "provider", "confidence", "completeness", "freshness"} for path in result["paths"])
     path_edges = [
         (path["edge"], json.dumps(path["from"], sort_keys=True), json.dumps(path["to"], sort_keys=True))
         for path in result["paths"]
@@ -776,12 +732,11 @@ def test_graph_query_js_ts_impact_is_file_level(tmp_path: Path, monkeypatch, cap
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "frontend/src/api").mkdir(parents=True)
     (repo / "frontend/src/client.ts").write_text("import { issueToken } from './api/tokens';\nexport const login = () => issueToken();\n", encoding="utf-8")
     (repo / "frontend/src/api/tokens.ts").write_text("export const issueToken = () => 'token';\n", encoding="utf-8")
     _materialize(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "query", "--impact-file", "frontend/src/api/tokens.ts", "--json"]) == 0
 
@@ -790,7 +745,7 @@ def test_graph_query_js_ts_impact_is_file_level(tmp_path: Path, monkeypatch, cap
     assert not any(path["edge"] == "CALLS" for path in result["paths"])
 
 
-def test_graph_and_context_follow_typescript_barrel_calls_inside_anonymous_callbacks(
+def test_graph_follows_typescript_barrel_calls_inside_anonymous_callbacks(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -798,7 +753,6 @@ def test_graph_and_context_follow_typescript_barrel_calls_inside_anonymous_callb
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "src").mkdir()
     (repo / "test").mkdir()
     (repo / "tsconfig.json").write_text(
@@ -845,7 +799,7 @@ def test_graph_and_context_follow_typescript_barrel_calls_inside_anonymous_callb
         "loadProjection();\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -861,34 +815,11 @@ def test_graph_and_context_follow_typescript_barrel_calls_inside_anonymous_callb
     assert direct_test_edges[0]["source"] == "typescript_compiler"
     assert direct_test_edges[0]["facts"]["evidence_type"] == "direct_test_call"
 
-    assert main(
-        [
-            "graph", "search",
-            "atomic event batch projection invalid rollback no partial state",
-            "--repo-id",
-            "main",
-            "--json",
-        ]
-    ) == 0
-    bundle = json.loads(capsys.readouterr().out)["data"]["result"]
-    assert bundle["groups"]["likely_change_surface"][0]["source_ref"]["path"] == (
-        "repos/src/projections.ts"
-    )
-    assert bundle["groups"]["tests_and_verification"][0]["source_ref"]["path"] == (
-        "repos/test/replay-envelope.test.ts"
-    )
-    assert not any(
-        section.get("section_kind") == "provider_symbol"
-        and section.get("section") == "test/replay-envelope.test.ts"
-        for section in bundle["groups"]["tests_and_verification"][0]["sections"]
-    )
 
-
-def test_graph_and_context_prioritize_owner_source_and_direct_test(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_graph_file_query_returns_direct_test_relation(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "tests").mkdir()
     (repo / "auth.py").write_text(
         "def validate_token(token: str) -> bool:\n    return token == 'ok'\n",
@@ -899,56 +830,11 @@ def test_graph_and_context_prioritize_owner_source_and_direct_test(tmp_path: Pat
         encoding="utf-8",
     )
     _materialize(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "query", "--file", "repos/auth.py", "--json"]) == 0
     graph_result = json.loads(capsys.readouterr().out)["data"]["result"]
     direct_test = next(path for path in graph_result["paths"] if path["edge"] == "TESTS_FILE")
     assert direct_test["from"]["path"] == "tests/test_auth.py"
     assert direct_test["to"]["path"] == "auth.py"
-    assert direct_test["evidence"]["type"] == "direct_test_import"
-    assert direct_test["evidence"]["confidence"] == "medium"
-    assert not any(
-        path["edge"] == "IMPORTS_FILE"
-        and path["from"] == direct_test["from"]
-        and path["to"] == direct_test["to"]
-        for path in graph_result["paths"]
-    )
-    assert any(item["selector"] == {"kind": "file", "value": "tests/test_auth.py"} for item in graph_result["continuations"])
-
-    assert main(["graph", "search", "validate_token", "--repo-id", "main", "--json"]) == 0
-    bundle = json.loads(capsys.readouterr().out)["data"]["result"]
-    assert bundle["groups"]["likely_change_surface"][0]["source_ref"]["path"] == "repos/auth.py"
-    assert bundle["groups"]["tests_and_verification"][0]["source_ref"]["path"] == "repos/tests/test_auth.py"
-    assert sum(len(items) for group, items in bundle["groups"].items() if group != "warnings_and_completeness") <= 8
-    assert "selection" not in bundle
-    assert "provider_coverage" not in bundle["completeness"]
-
-
-def test_compact_graph_paths_and_continuations_share_one_budget(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    repo = tmp_path / "repos"
-    init_repo(repo)
-    write_repometa(repo)
-    (repo / "target.py").write_text("def run() -> int:\n    return 1\n", encoding="utf-8")
-    for name in ("alpha", "beta", "gamma"):
-        (repo / f"{name}.py").write_text("from target import run\n", encoding="utf-8")
-    _materialize(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-
-    assert main(["graph", "query", "--file", "target.py", "--json"]) == 0
-
-    result = json.loads(capsys.readouterr().out)["data"]["result"]
-    assert len(result["paths"]) == 3
-    continuation_files = {
-        item["selector"]["value"]
-        for item in result["continuations"]
-        if item["selector"].get("kind") == "file"
-    }
-    related_files = {
-        endpoint["path"]
-        for path in result["paths"]
-        for endpoint in (path["from"], path["to"])
-        if endpoint.get("path") != "target.py"
-    }
-    assert continuation_files == related_files == {"alpha.py", "beta.py", "gamma.py"}
+    assert direct_test["source"]["facts"]["evidence_type"] == "direct_test_import"

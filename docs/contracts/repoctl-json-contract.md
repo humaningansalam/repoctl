@@ -1,242 +1,51 @@
-# repoctl JSON Contract
+# JSON interface
 
-`repoctl --json` is the stable machine-facing interface for agents and future adapters. This contract freezes the common envelope and the meaning of key cross-command fields; command-specific payloads may add fields under `data`.
-
-## Envelope
-
-Success:
+Pass `--json` to receive a command result as one object:
 
 ```json
 {
   "ok": true,
-  "command": "task.finish",
-  "data": {},
+  "command": "task.list",
+  "data": {"tasks": []},
   "warnings": [],
-  "problems": [],
-  "next_actions": []
+  "problems": []
 }
 ```
 
-Failure:
+`command` identifies the operation. `data` contains its result. Each diagnostic has a `code` and `message`, with `severity` and a source `path` where relevant. Warnings provide context; problems describe errors and set `ok` to `false`.
 
-```json
-{
-  "ok": false,
-  "command": "task.finish",
-  "data": {
-    "action_inputs": {
-      "unchosen_actual_paths": ["src/extra.py"]
-    }
-  },
-  "warnings": [],
-  "problems": [
-    {
-      "severity": "error",
-      "code": "actual_changes_outside_chosen",
-      "message": "repository changes fall outside the task Chosen scope",
-      "path": "src/extra.py"
-    }
-  ],
-  "next_actions": [
-    {
-      "label": "Review changed paths outside Chosen scope",
-      "kind": "task_scope_review",
-      "target_ref": "data.action_inputs.unchosen_actual_paths",
-      "choices": ["add_to_chosen", "revert_change", "move_to_follow_up"]
-    }
-  ]
-}
-```
+Successful commands exit with status 0. A result containing problems exits with status 1. Rejected arguments and command failures exit with status 2.
 
-- `ok` is true when no error-severity problem exists.
-- `command` is a stable dotted command identity such as `task.finish` or `meta.check`.
-- `data` is the command-specific object.
-- `warnings` contains advisory problem objects.
-- `problems` contains command-blocking problem objects.
-- `next_actions` contains read-only recovery guidance.
+## Task results
 
-Every next action carries `priority: required | recommended | conditional`. Required source inspection and recovery actions lead; optional Graph builds, repeat searches, and Handoff rebinding are conditional when current source evidence does not warrant them. A source continuation can lead to the next matching exact path rather than a generic search.
+Task identity includes `id`, `title`, `status`, `path`, `repo_id`, `parent` and `archived`. Task paths are relative to the workspace.
 
-Command payload fields appear only under `data`. Serialization rejects a missing command, non-object data, or unknown top-level fields rather than relocating them.
+| Command | Result |
+| --- | --- |
+| `task list` | `data.tasks`, with status and repository filters available |
+| `task show` | Task identity, parsed `frontmatter` and authored `body` |
+| `task show --summary` | Task identity |
+| `task show --section <HEADING>` | `task`, `section` and that section's `body` |
+| `task resume <ID>` | `task` and authored `handoff`; `--full` includes body and frontmatter |
+| `task resume` | The single live Task, or `task: null` and a `candidates` list |
+| `task create`, `start`, `block`, `finish`, `cancel` | `task_id`, resulting `path` and `status` |
 
-## Problems and repository identity
+Task statuses are `todo`, `doing`, `blocked`, `done` and `canceled`. Finishing and canceling move the selected document to `docs/archive/tasks/`. Parent and dependency fields describe relationships; each Task changes status independently.
 
-A problem has stable `severity`, `code`, and `message`; `path` and `cause_code` are optional.
+`task create --body-file` reads an authored UTF-8 Markdown body. Lifecycle commands update the Task metadata and retain its body. Explicit finish summaries and block/cancel reasons are appended as authored notes.
 
-```json
-{
-  "severity": "error",
-  "code": "annotation_required",
-  "message": "file matches coverage rule: matched coverage pattern src/**",
-  "path": "repos/src/service.py"
-}
-```
+## Knowledge results
 
-Repo-aware payloads carry explicit repository context:
+Knowledge records contain an ID, repository association and claim. Optional fields hold a kind, reason, source references, applicability paths, replaced record IDs and author.
 
-```json
-{
-  "repository": {
-    "id": "main",
-    "path": "repos",
-    "identity_source": "reserved"
-  },
-  "files": [
-    {
-      "path": "src/service.py",
-      "workspace_path": "repos/src/service.py"
-    }
-  ]
-}
-```
+Workspace notes use an empty `repo_id`. `--repo-id <ID>` selects records associated with that ID. A cited source is an existing workspace-relative file; its saved reference contains a `content_sha256`.
 
-File-entry `path` is repo-relative. `workspace_path` is workspace-root-relative. A suggested repository ID is not stable until `repo adopt` pins it.
+`knowledge add` returns `record` and `record_path`. Query entries include `exact_match` and `matched_terms` for the match. Queries select active records by default; `--include-superseded` also returns replaced records. A negative `--limit` returns all matches; zero returns counts only.
 
-## Task and Handoff fields
+Record `status` is `active` or `superseded`. `source_statuses` independently observes each cited file as `unchanged`, `changed`, `missing` or `unavailable`. An unavailable source could not be read. The saved source hash identifies the cited content. Applicability in `applies_to.paths` is relative to the associated repository, or to the workspace for workspace records.
 
-Bare `task resume` reports `no_live | single_live | ambiguous`. `task resume <TASK_ID>` selects one returned live Task for that response and never persists a current-task pointer or selects archive history.
+## Source navigation
 
-Task list records and `task resume` ambiguous candidates include bounded `title`, `title_truncated`, `area`, `repo_id`, `status`, `id` and `path` so a chooser can distinguish tasks without opening each file. Candidate data is a compact projection, not a second Task authority.
+Source-operation paths are relative to the selected repository, or to the workspace when `--workspace` is selected. `graph search` returns matching source snippets. Typed Graph queries include relationship resolution and analysis coverage.
 
-Handoff freshness and lifecycle health are independent:
-
-- `data.resume_guidance.status` is `current | inactive | historical`.
-- `task show` exposes lifecycle health at `data.health`.
-- `task resume` exposes it at `data.resume_guidance.health`.
-- `readable_handoff` is null in the default response; the complete current Task section is available by explicit `task show --section Handoff` when inspection is necessary.
-- `blocked_by_health` is true when lifecycle state is not executable.
-- `executable_handoff` is non-null only when a current binding and lifecycle health both permit execution.
-
-`task resume` includes `task_context` with the exact Goal and Context Docs bodies, bounded Chosen paths and repository delta, and source section names/line locations. The scope includes total/truncation and the exact Discovery section command for all paths and Notes; `--full` keeps complete scope/delta arrays. It is navigation, not an inferred summary or executable authority. `task show --section "<heading>"` reads an existing named Task section, including project-specific current work or remaining AC, without returning the Handoff body again.
-
-`task resume` always emits the single current-state view, not separate default/compact representations. A valid `executable_handoff` is exactly the four user-authored canonical fields and their values; it is non-null only when binding and repository health are current. Older operational prose is not echoed as another instruction. `handoff_source` names the precise source file/section. Constraints remain in the live Task and linked current authority, not in generated summaries. An invalid, unbound or stale Handoff does not gain executable instructions. `--full` changes health diagnostics only, never the restart field contract.
-
-`task handoff bind` returns binding freshness and the source location without echoing the just-reviewed body; `--full` includes it. The binding, invalidation inputs and execution rules are unchanged.
-
-Explicit Context Docs references participate in Handoff freshness by path, role, existence and content digest. Changes appear at `data.resume_guidance.handoff.context_doc_changes`, with `task_context_docs_changed` warning and a required `context_doc_review` next action before trusting or rebinding an inactive Handoff. V6 and earlier resume bindings are historical and must be rebound after review.
-
-`task discovery add` returns current `chosen_files`, `notes`, per-input update details, and counts. It does not return a query episode, Reviewed/Excluded disposition, selected result, or structured check state.
-
-`task doctor` and `task finish` share hard closure checks for repository identity, baseline ownership, actual paths outside Chosen, committed-range validity, and changed-file metadata. They do not expose a verification status or decide whether optional `## Verification` prose is complete. `finish_ready` means repoctl's lifecycle checks pass; it is not a claim that product behavior is correct.
-
-A Chosen-scope decision action owns the complete path list at `data.action_inputs.unchosen_actual_paths` and uses `add_to_chosen | revert_change | move_to_follow_up` choices. A baseline decision similarly owns its complete list under `data.action_inputs.baseline_conflicts` and offers `task | preexisting | delta | external`. `delta` attributes only the reviewed transition from the immutable dirty start state to the current state, without adopting inherited changes. Its stored `reviewed_fingerprint` must still match at finish; later same-path edits require a new ownership review. Delta completion uses the existing working-tree before/after receipt, so finish before committing that mixed path. These actions omit a command because repoctl cannot make the decision.
-
-`task baseline resolve T-... --resolution PATH=external --preview --json` reviews an explicitly identified external pending path, including a path first changed after task start. Applying the same resolution stores its exact current fingerprint in the existing Task state, leaving the initial baseline, files and Git index unchanged. Doctor/finish preserve that state without claiming its working-tree change or path transition in the completion receipt; the receipt retains the external disposition and fingerprints. Any later drift still blocks closure. Previously task-owned or delta-owned paths cannot be reclassified as external, and an external disposition does not exempt unreviewed paths or infer who wrote the change.
-
-`task block` and `task cancel` require exactly one of `--reason` or `--reason-file`. Their normalized intent appears under `data.reason` with `data.reason_source: argument | file`. They append one Execution Log entry and preserve optional Verification prose.
-
-`task.finish` reports `closure_scope: "task"` and `product_readiness: "not_evaluated"`. Product correctness, release readiness, commit, push, PR, and deployment remain outside the command's claim.
-
-### Completed-Task acknowledgements
-
-When an acknowledgement is accepted, both `task doctor` and `task finish` return `data.acknowledged_completions`. Each entry identifies the original completion receipt:
-
-```json
-{
-  "task_id": "T-sibling",
-  "receipt_path": "docs/tasks/.repoctl-state/completions/T-sibling.json",
-  "receipt_sha256": "sha256:...",
-  "selected_paths": ["docs/RELEASE.md"]
-}
-```
-
-`selected_paths` appears only for path-scoped `--acknowledge-completed TASK_ID:PATH` selections. It is a canonical, sorted, unique array of repo-relative mutation paths; repeated options for the same Task are combined. `receipt_sha256` always hashes the complete original receipt bytes, never an in-memory selected projection. Whole-task entries omit `selected_paths`; whole-task and path-scoped selectors cannot be mixed in one invocation, even for different Task IDs.
-
-Product sibling selections require a done Task with the same non-empty parent and exact stable repository target. The full receipt, recorded baseline, current committed range, and each selected path transition must verify. Selected paths must be disjoint from current Chosen and have no pending worktree edits; rename old/new endpoints must be selected together. Missing evidence, history rewrite, and prior/later changes that break the sibling lineage fail closed.
-
-`completion_acknowledgement_invalid` is an error for invalid selection syntax, eligibility, scope, or selected-path evidence; receipt-integrity and repository-lineage failures may retain their existing more specific error codes. A rejected acknowledgement never becomes a warning or weakens closure checks.
-
-Finish records the selected paths and original receipt identity in the current Task's Execution Log, without rewriting sibling Task/receipt/catalogue history, current scope/baseline/ownership, or product Git. The current completion receipt excludes acknowledged sibling mutations from its `changed_entries`.
-
-### Live Chosen overlap warnings
-
-`task discovery add`, exact or selected single-live `task resume`, and `task doctor` expose advisory overlap through the conventional `warnings` problem shape:
-
-```json
-{
-  "severity": "warning",
-  "code": "task_chosen_overlap",
-  "message": "Chosen overlaps live task T-other in repository main: src/shared.py",
-  "path": "docs/tasks/T-current--work.md"
-}
-```
-
-The structured companion is `data.chosen_overlaps`, with one entry per conflicting live Task:
-
-```json
-{
-  "current_task_id": "T-current",
-  "other_task_id": "T-other",
-  "other_task_status": "doing",
-  "repo_id": "main",
-  "overlapping_paths": ["src/shared.py"],
-  "overlapping_path_count": 1,
-  "overlapping_paths_truncated": false
-}
-```
-
-Entries are sorted by `other_task_id`; `overlapping_paths` are sorted canonical repo-relative paths. The existing compact projection limits each displayed path list to 20, including with `--full`; `overlapping_path_count` retains the total and `overlapping_paths_truncated` reports omission. The standard problem object does not gain a `details` field or an unbounded path inventory.
-
-Both Tasks must be live (`todo | doing | blocked`) and resolve to the same stable repository target. Self, root-only, different-repository, done, canceled, and archived Tasks are excluded. Invalid Chosen projections do not create overlap claims; existing path-validation errors remain authoritative.
-
-Discovery evaluates the resulting appended or replaced scope. Resume also detects directly authored Chosen entries, but ambiguous bare resume retains its candidates without selecting one. These warnings do not alter `ok`, `finish_ready`, Handoff freshness, or lifecycle health by themselves; `actual_changes_outside_chosen` remains an independent error. Evaluating overlap writes no Task, Board, state, receipt, ownership, dependency, product file, or Git index.
-
-## Completion receipt v5
-
-New completion receipts use schema v5. They retain stable Task/artifact identity, repository identity, changed entries, verified start/completion event timestamps, explicit path transitions (an empty list for no changes), and metadata-gate history. A missing or unverifiable start transition blocks finish rather than creating a partial v5 receipt. They omit `verification` and `discovery_outcome`.
-
-Receipt and task-artifact hashes protect lifecycle-history identity. They do not assert that a command ran, a file state was tested, or a result passed. Normal receipt readers and descendant attribution accept **v5 only**. An explicit one-time `task migrate-receipts [TASK_ID] --apply` converts eligible older receipts to v5 while preserving byte-identical originals and their recorded Task hashes under `docs/archive/task-evidence/receipts/`. Conversion is not a new completion or verification.
-
-An original v2 receipt that never recorded start/completion events or path transitions may become v5 with `historical_transition_evidence.status = "not_recorded"`. This identifies an unrecorded historical interval; migration does not invent timestamps, path changes or verification. Partially populated or contradictory recorded event/transition evidence remains unresolved. An actual Task source hash mismatch is a separate blocking integrity finding, never a historical-gap marker or a reason to rehash the Task. If current Knowledge cites an old receipt digest, the cited source must first be handled by the explicitly reviewed, one-Task `--relink-knowledge` transition after v1 Knowledge finalization. Normal runtime reads do not implicitly support or convert old receipt schemas.
-
-Closed v3 start baselines may be retired by explicit `task migrate-states [TASK_ID] --apply` after their completion receipts are current. The exact original state and proof are preserved under `docs/archive/task-evidence/start-baselines/`. A live v3 baseline is unresolved: no synthetic start event, stable dirty state, or new Task baseline is inferred. Normal Task state readers accept v4 only. Rebuild the derived completion catalogue by the exact repository selectors returned by the receipt migration after source integrity issues have been reviewed. These migration commands are not permanent format aliases.
-
-## Graph evidence and Knowledge output
-
-`graph search` and `graph query` return their evidence directly. Repeating either command creates no persistent result-receipt cache or selectable-result state. Stable source refs, typed relations, repository identity, completeness, freshness, and continuations remain in the command payload.
-
-An explicit `resume [TASK_ID]` or `task resume [TASK_ID]` query (optionally followed by a colon and the question) routes to the existing read-only current Task resume projection before repository candidate retrieval. `data.result` is null and `data.task_resume` contains that projection; selection, freshness, lifecycle errors and warnings are preserved. An explicit conflicting repository selector is rejected. General implementation searches use Graph source navigation.
-
-Default `graph search` JSON is a bounded, source-linked navigation result under `data.result`. `--full` adds evidence and diagnostics without changing source identity. `graph query --full` adds underlying nodes, edges and provider diagnostics. Neither command registers an export or creates a separate persistent user layer.
-
-
-## Knowledge output
-
-Knowledge commands select `--repo-id ID` or `--workspace`. Workspace records use explicit `repo_id: ""` and retain root Task/document provenance without registering a product repository. Root-only `task finish --knowledge-*` saves in the same scope.
-
-`knowledge add` saves a durable record in one operation and returns the record path plus derived projection status. A projection or Graph synchronization failure is a warning after the record is safely stored, with an explicit maintenance action.
-
-Knowledge queries may report source drift while continuing to return the saved conclusion. The projection contains current direct records only. `knowledge check` and upgrade postflight report every v1 still in active records, including staged but not finalized ones; explicit one-time conversion retains original bytes in historical archive and verifies current v2 references.
-
-Default Knowledge queries retain claims, reasons, applicability and one source view: `source_refs` carries the declared path, kind, current status, and a different resolved path when relocated. `--full` retains all source digests and resolution diagnostics; `--explain` retains ranking details. Query selection and source-drift warnings are identical across views. Source-drift warnings cover returned records only; `lifecycle.source_changed_count` still counts all examined records. Use `knowledge check` for catalog-wide diagnostics.
-
-## Compact projections
-
-Compact task responses retain authoritative counts while bounding large presentation arrays. A bounded array has a matching count and truncation field when callers need to know that details were omitted. Complete decision inputs stay untruncated under `data.action_inputs`.
-
-Compact task repository state uses typed values:
-
-- `repo_head_state`: `commit | unborn | unavailable | not_applicable`
-- `observed_since_baseline`: `observed | baseline_missing | unavailable | not_applicable`
-
-`field-gate run repoctl-release --json` returns a compact gate summary by default. `--full` adds child commands and diagnostics. `--output` writes the full digest-verifiable gate artifact even when stdout is compact.
-
-## `next_actions`
-
-- Actions never perform recovery automatically.
-- They never infer task scope from prose.
-- `command` is exact and copy-paste-safe or absent. It contains no placeholders, invented evidence files, redirection, or unresolved IDs.
-- Decision actions use stable `kind`, `target_ref`, and enum `choices` rather than pretending to be executable.
-- Every `target_ref` resolves to a non-empty untruncated string list in the same envelope.
-- Problems remain authoritative when recovery needs a human or agent decision.
-- Each action carries `priority: required | recommended | conditional`. Required recovery blocks the immediate action; recommended actions improve optional evidence; conditional actions matter only for the stated pause, transfer, or deeper analysis.
-- When source-linked Graph evidence already identifies a file, source inspection precedes optional Graph maintenance. Repeating the same query after maintenance is conditional, not an immediate prerequisite.
-- A `task.doctor` response with `finish_ready: true` may offer `task_finish` (after external product acceptance). Handoff binding is conditional on pause or transfer, not a finish gate.
-
-## Upgrade status
-
-Upgrade postflight separates authoritative readiness from derived maintenance. Invalid repository identity, source authority, or durable state can fail the command. Stale or invalid derived state, or a projection required by durable records, produces maintenance warnings while the overall status may be `ready_with_maintenance` with exit 0. An unused missing Graph and empty Knowledge store remain `ready` without initialization work.
-
-## Adapter implication
-
-Future adapters must call repoctl handlers or consume this JSON contract. They must not parse human stdout, mutate `.repometa` directly, or bypass Task, Board, baseline, archive, and repository-selection gates.
+The [Graph contract](repoctl-graph-contract.md) defines the source-search and relationship results. Use each command's `--help` for its selectors and optional fields.

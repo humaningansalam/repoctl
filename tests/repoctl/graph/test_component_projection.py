@@ -13,7 +13,6 @@ from tools.repoctl.graph import query_graph
 from tools.repoctl.graph_model import GraphEdge, GraphNode, GraphSnapshot, file_id, repository_id
 from tools.repoctl.graph_store import materialize_graph
 from tools.repoctl.repositories import require_repo_target
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 from tests.repoctl.workspace.test_check import write_workspace
 
@@ -193,11 +192,10 @@ def test_shipped_manifest_providers_project_declared_field_components() -> None:
     }
 
 
-def test_graph_result_digest_is_pinned_until_explicit_rebuild(tmp_path: Path) -> None:
+def test_component_membership_uses_the_stored_snapshot(tmp_path: Path) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "apps/web/src").mkdir(parents=True)
     (repo / "apps/web/package.json").write_text('{"name":"web"}\n', encoding="utf-8")
     path = "apps/web/src/client.ts"
@@ -210,14 +208,12 @@ def test_graph_result_digest_is_pinned_until_explicit_rebuild(tmp_path: Path) ->
     payload, problems = query_graph(snapshot, file=path)
     assert problems == []
     assert payload is not None
-    original_digest = payload["result_digest"]
     (repo / "apps/web/package.json").write_text('{"name":"web-renamed"}\n', encoding="utf-8")
 
     replay, replay_problems = query_graph(snapshot, file=path)
     assert replay_problems == []
     assert replay is not None
     assert replay["matches"][0]["component_ids"] == payload["matches"][0]["component_ids"]
-    assert replay["result_digest"] == original_digest
 
     rebuilt, rebuild_problems, _meta = materialize_graph(tmp_path, target=target, rebuild=True)
     assert rebuilt is not None
@@ -226,14 +222,12 @@ def test_graph_result_digest_is_pinned_until_explicit_rebuild(tmp_path: Path) ->
     assert refreshed_problems == []
     assert refreshed is not None
     assert refreshed["matches"][0]["component_ids"] != payload["matches"][0]["component_ids"]
-    assert refreshed["result_digest"] != original_digest
 
 
 def test_component_registry_identity_invalidates_a_reused_graph(tmp_path: Path) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     (repo / "features/search/src").mkdir(parents=True)
     (repo / "features/search/module.component").write_text(
         "component = discovery\n",

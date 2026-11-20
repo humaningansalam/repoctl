@@ -8,6 +8,7 @@ import pytest
 
 from tools.repoctl.code_index import CodeIndexEntry
 from tools.repoctl.cli import main
+from tools.repoctl.graph import query_graph
 from tools.repoctl.graph_dart_provider import _dart_executable, _helper_executable, _rpc_invocations, build_dart_semantics
 from tools.repoctl.graph_semantic_model import (
     RpcInvocationContract,
@@ -26,7 +27,6 @@ from tools.repoctl.graph_semantic_model import (
 from tools.repoctl.graph_store import _provider_result_from_dict, _provider_result_to_dict, graph_materialization_freshness, materialize_graph
 from tools.repoctl.graph_structured_relations import build_structured_file_relations
 from tools.repoctl.repositories import RepoTarget, require_repo_target
-from tests.repoctl.meta.test_meta_check import write_repometa
 from tests.repoctl.repository.test_repositories import init_repo
 from tests.repoctl.workspace.test_check import write_workspace
 
@@ -102,17 +102,7 @@ def _write_dart_package(repo: Path, dependency_root: Path, source: str) -> None:
 
 
 def _entry() -> CodeIndexEntry:
-    return CodeIndexEntry(
-        path="lib/client.dart",
-        workspace_path="repos/lib/client.dart",
-        language="dart",
-        classification="source",
-        symbols=[],
-        imports=["package:supabase/supabase.dart"],
-        calls=["rpc"],
-        deps=[],
-        observed_effects=[],
-    )
+    return CodeIndexEntry(path='lib/client.dart', workspace_path='repos/lib/client.dart', language='dart', classification='source', symbols=[], imports=['package:supabase/supabase.dart'], calls=['rpc'])
 
 
 def _target(repo: Path) -> RepoTarget:
@@ -368,17 +358,7 @@ def test_unmatched_drop_signature_fails_closed_instead_of_linking_stale_function
     )
     entries = [
         _entry(),
-        CodeIndexEntry(
-            path="sql/functions.sql",
-            workspace_path="repos/sql/functions.sql",
-            language="sql",
-            classification="source",
-            symbols=[],
-            imports=[],
-            calls=[],
-            deps=[],
-            observed_effects=[],
-        ),
+        CodeIndexEntry(path='sql/functions.sql', workspace_path='repos/sql/functions.sql', language='sql', classification='source', symbols=[], imports=[], calls=[]),
     ]
     fact = RpcInvocationFact(
         fact_id="rpc:alias-drop",
@@ -434,28 +414,8 @@ def test_dart_rpc_links_only_when_schema_evidence_selects_the_target(tmp_path: P
     )
     entries = [
         _entry(),
-        CodeIndexEntry(
-            path="sql/public.sql",
-            workspace_path="repos/sql/public.sql",
-            language="sql",
-            classification="source",
-            symbols=[],
-            imports=[],
-            calls=[],
-            deps=[],
-            observed_effects=[],
-        ),
-        CodeIndexEntry(
-            path="sql/private.sql",
-            workspace_path="repos/sql/private.sql",
-            language="sql",
-            classification="source",
-            symbols=[],
-            imports=[],
-            calls=[],
-            deps=[],
-            observed_effects=[],
-        ),
+        CodeIndexEntry(path='sql/public.sql', workspace_path='repos/sql/public.sql', language='sql', classification='source', symbols=[], imports=[], calls=[]),
+        CodeIndexEntry(path='sql/private.sql', workspace_path='repos/sql/private.sql', language='sql', classification='source', symbols=[], imports=[], calls=[]),
     ]
     fact = RpcInvocationFact(
         fact_id="rpc:known-schema",
@@ -497,11 +457,10 @@ def test_dart_rpc_links_only_when_schema_evidence_selects_the_target(tmp_path: P
     assert rpc_relations[0].to_path == "sql/public.sql"
 
 
-def test_graph_preserves_every_dart_rpc_outcome_and_projects_only_linked_facts(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_graph_preserves_dart_rpc_uncertainty_without_claiming_links(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
     source = (
         "import 'package:supabase/supabase.dart';\n"
         "class LocalBus {}\n"
@@ -599,271 +558,18 @@ def test_graph_preserves_every_dart_rpc_outcome_and_projects_only_linked_facts(t
     ]
     assert rpc_edges == []
 
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-    assert main(["graph", "query", "--file", "lib/client.dart", "--json"]) == 0
-    graph_payload = json.loads(capsys.readouterr().out)
-    graph_result = graph_payload["data"]["result"]
-    assert graph_result["result_digest"].startswith("sha256:")
-    assert graph_result["relationship_candidate_count"] == 4
-    assert len(graph_result["relationship_candidates"]) == 3
-    assert graph_result["relationship_candidates_truncated"] is True
-    linked_candidate = next(
-        item
-        for item in graph_result["relationship_candidates"]
-        if item["source"]["runtime_identity"]["value"] == "linked"
-    )
-    assert linked_candidate["authoritative"] is False
-    assert linked_candidate["status"] == "non_authoritative"
-    assert linked_candidate["resolution"] == {
-        "outcome": "incomplete",
-        "reason_code": "schema_not_observed",
-    }
-    assert linked_candidate["source"]["location"]["start_line"] > 0
-    assert linked_candidate["targets"] == [
-        {
-            "identity": {"kind": "sql_routine", "value": "public.linked"},
-            "path": "supabase/migrations/20240201000000_active.sql",
-            "location": {"line": 2},
-            "parameter_names": ["id", "note"],
-            "parameter_types": ["bigint", "text"],
-            "required_parameter_names": ["id"],
-        }
-    ]
-    assert linked_candidate["continuations"][0]["selector"] == {
-        "kind": "file",
-        "value": "supabase/migrations/20240201000000_active.sql",
-    }
-    assert not any(
-        item["source"]["runtime_identity"]["value"] == "empty_key"
-        for item in graph_result["relationship_candidates"]
-    )
-
-    assert main(["graph", "query", "--file", "lib/client.dart", "--full", "--json"]) == 0
-    full_graph_payload = json.loads(capsys.readouterr().out)
-    full_graph_result = full_graph_payload["data"]["result"]
-    assert full_graph_result["result_digest"] == graph_result["result_digest"]
-    assert full_graph_result["relationship_candidate_count"] == 4
-    assert len(full_graph_result["relationship_candidates"]) == 4
-    assert full_graph_result["relationship_candidates_truncated"] is False
-
-    assert main(["graph", "search", "linked rpc", "--mode", "code-location", "--json"]) == 0
-    context_payload = json.loads(capsys.readouterr().out)
-    context_bundle = context_payload["data"]["result"]
-    assert context_bundle["relationship_candidate_count"] == 1
-    graph_anchor = context_bundle["completeness"]["graph_anchor"]
-    assert graph_anchor["status"] == "resolved"
-    assert graph_anchor["code"] == "graph_source_anchor_resolved"
-    assert graph_anchor["seed_paths"] == ["lib/client.dart"]
-    assert graph_anchor["candidate_paths"] == [
-        "lib/client.dart",
-        "supabase/migrations/20240201000000_active.sql",
-        "supabase/migrations/20240101000000_functions.sql",
-    ]
-    assert graph_anchor["selection_coverage"]["status"] == "complete"
-    assert graph_anchor["selection_coverage"]["omitted_paths"] == [
-        "supabase/migrations/20240201000000_active.sql",
-        "supabase/migrations/20240101000000_functions.sql",
-    ]
-    assert graph_anchor["seed_anchors"] == [
-        {
-            "path": "lib/client.dart",
-            "provenance": "lexical_file",
-            "anchor_strength": "weak",
-            "kind": "file",
-            "retrieval_lane": "product_source",
-            "lexical_rank": 1,
-            "component_ids": ["component:pubspec.yaml:.:rpc_fixture"],
-        }
-    ]
-    context_candidate = next(
-        item
-        for item in context_bundle["relationship_candidates"]
-        if item["source"]["runtime_identity"]["value"] == "linked"
-    )
-    assert context_candidate["targets"][0]["path"] == "supabase/migrations/20240201000000_active.sql"
-    assert context_candidate["resolution"]["reason_code"] == "schema_not_observed"
-    assert {
-        item["source_ref"]["path"]
-        for item in context_bundle["groups"]["likely_change_surface"]
-    } == {"repos/lib/client.dart"}
-
-    provider_path = tmp_path / ".repoctl-state/graph/main/providers/dart_analyzer.json"
-    provider_data = json.loads(provider_path.read_text(encoding="utf-8"))
-    assert len(provider_data["rpc_invocations"]) == 12
-    assert provider_data["rpc_analyzed_paths"] == ["lib/client.dart"]
-
-    reused, reused_problems, reused_meta = materialize_graph(tmp_path, target=target)
-    assert reused is not None
-    assert not [problem for problem in reused_problems if problem.severity == "error"]
-    assert reused_meta["materialization"]["status"] == "reused"
-    assert reused.snapshot_digest == first.snapshot_digest
-
-    package_config = repo / ".dart_tool/package_config.json"
-    original_config = json.loads(package_config.read_text(encoding="utf-8"))
-    config = {
-        **original_config,
-        "generator": "rpc-fixture-broken-resolution",
-        "packages": [
-            package
-            for package in original_config["packages"]
-            if package["name"] != "supabase"
-        ],
-    }
-    package_config.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    freshness, freshness_problems = graph_materialization_freshness(tmp_path, target=target)
-    assert freshness_problems == []
-    assert freshness["status"] == "stale"
-    assert freshness["changed_paths"] == []
-    assert freshness["changed_provider_configs"] == {
-        "dart_analyzer": [".dart_tool/package_config.json"]
-    }
-    assert freshness["provider_stale_paths"] == {
-        "dart_analyzer": ["lib/client.dart"]
-    }
-    assert freshness["semantic_stale_paths"] == ["lib/client.dart"]
-    assert freshness["stale_paths"] == ["lib/client.dart"]
-
-    assert main(["graph", "query", "--file", "lib/client.dart", "--json"]) == 0
-    provider_stale_graph_payload = json.loads(capsys.readouterr().out)
-    assert provider_stale_graph_payload["data"]["result"]["relationship_candidates"] == []
-    assert provider_stale_graph_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(action["kind"] == "graph_refresh" for action in provider_stale_graph_payload["next_actions"])
-
-    assert main(["graph", "search", "linked rpc", "--mode", "code-location", "--json"]) == 0
-    provider_stale_context_payload = json.loads(capsys.readouterr().out)
-    assert provider_stale_context_payload["data"]["result"]["relationship_candidates"] == []
-    assert provider_stale_context_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(
-        item["code"] == "context_graph_stale"
-        for item in provider_stale_context_payload["data"]["result"]["groups"]["warnings_and_completeness"]
-    )
-
-    restored_config = {**original_config, "generator": "rpc-fixture-update"}
-    package_config.write_text(json.dumps(restored_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    refreshed, refresh_problems, refresh_meta = materialize_graph(tmp_path, target=target)
-    assert refreshed is not None
-    assert not [problem for problem in refresh_problems if problem.severity == "error"]
-    assert refresh_meta["materialization"]["updated_paths"]["dart_analyzer"] == ["lib/client.dart"]
-    assert len(_client_rpc(_snapshot_data(tmp_path))["source_facts"]) == 12
-
-    active_migration.write_text(active_migration.read_text(encoding="utf-8") + "-- target changed\n", encoding="utf-8")
-    assert main(["graph", "query", "--file", "lib/client.dart", "--json"]) == 0
-    target_stale_payload = json.loads(capsys.readouterr().out)
-    target_stale_candidates = target_stale_payload["data"]["result"]["relationship_candidates"]
-    assert "linked" not in {
-        item["source"]["runtime_identity"]["value"]
-        for item in target_stale_candidates
-    }
-    assert "another" in {
-        item["source"]["runtime_identity"]["value"]
-        for item in target_stale_candidates
-    }
-    assert any(action["kind"] == "graph_refresh" for action in target_stale_payload["next_actions"])
-
-    target_refreshed, target_refresh_problems, _target_refresh_meta = materialize_graph(tmp_path, target=target)
-    assert target_refreshed is not None
-    assert not [problem for problem in target_refresh_problems if problem.severity == "error"]
-
-    reduced_source = (
-        "import 'package:supabase/supabase.dart';\n"
-        "final client = SupabaseClient();\n"
-        "Future<void> run() => client.rpc('linked', params: {'id': 1});\n"
-    )
-    (repo / "lib/client.dart").write_text(reduced_source, encoding="utf-8")
-    assert main(["graph", "query", "--file", "lib/client.dart", "--json"]) == 0
-    source_stale_payload = json.loads(capsys.readouterr().out)
-    assert source_stale_payload["data"]["result"]["relationship_candidates"] == []
-    assert source_stale_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(action["kind"] == "graph_refresh" for action in source_stale_payload["next_actions"])
-
-    assert main(["graph", "search", "linked rpc", "--mode", "code-location", "--json"]) == 0
-    stale_context_payload = json.loads(capsys.readouterr().out)
-    assert stale_context_payload["data"]["result"]["relationship_candidates"] == []
-    assert stale_context_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(
-        item["code"] == "context_graph_stale"
-        for item in stale_context_payload["data"]["result"]["groups"]["warnings_and_completeness"]
-    )
-
-    reduced, reduced_problems, reduced_meta = materialize_graph(tmp_path, target=target)
-    assert reduced is not None
-    assert not [problem for problem in reduced_problems if problem.severity == "error"]
-    assert reduced_meta["materialization"]["updated_paths"]["dart_analyzer"] == ["lib/client.dart"]
-    reduced_data = _snapshot_data(tmp_path)
-    assert reduced_data["completeness"]["capabilities"]["rpc_resolution"] == "partial"
-    reduced_rpc = _client_rpc(reduced_data)
-    assert len(reduced_rpc["source_facts"]) == 1
-    assert len(reduced_rpc["resolutions"]) == 1
-    assert reduced_rpc["resolutions"][0]["outcome"] == "incomplete"
-    assert reduced_rpc["resolutions"][0]["reason_code"] == "schema_not_observed"
-    assert len(reduced_rpc["resolutions"][0]["candidates"]) == 1
+    result, query_problems = query_graph(first, file="lib/client.dart")
+    assert query_problems == []
+    node = next(node for node in result["nodes"] if node["kind"] == "file" and node["identity"]["path"] == "lib/client.dart")
+    assert node["facts"]["rpc"]["resolutions"] == rpc["resolutions"]
 
 
-def test_repometa_eligibility_change_invalidates_materialized_rpc_evidence(tmp_path: Path, monkeypatch, capsys) -> None:
+
+
+def test_graph_distinguishes_rpc_calls_on_the_same_source_line(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
-    write_repometa(repo)
-    _write_dart_package(
-        repo,
-        tmp_path / "pub-cache/supabase",
-        (
-            "import 'package:supabase/supabase.dart';\n"
-            "final client = SupabaseClient();\n"
-            "Future<void> run() => client.rpc('linked');\n"
-        ),
-    )
-    migration = repo / "supabase/migrations/20240201000000_linked.sql"
-    migration.parent.mkdir(parents=True)
-    migration.write_text(
-        "CREATE FUNCTION public.linked() RETURNS void LANGUAGE sql AS $$ SELECT 1; $$;\n",
-        encoding="utf-8",
-    )
-    _require_dart_analyzer(tmp_path)
-    target = require_repo_target(tmp_path, repo_id="main")
-
-    snapshot, problems, _meta = materialize_graph(tmp_path, target=target)
-    assert snapshot is not None
-    assert not [problem for problem in problems if problem.severity == "error"]
-
-    policy_path = repo / ".repometa/policy.json"
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
-    policy["indexing"]["exclude"].append("lib/client.dart")
-    policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    freshness, freshness_problems = graph_materialization_freshness(tmp_path, target=target)
-    assert freshness_problems == []
-    assert freshness["changed_paths"] == []
-    assert freshness["inventory_stale_paths"] == ["lib/client.dart"]
-    assert freshness["stale_paths"] == ["lib/client.dart"]
-    assert freshness["stale_path_classifications"] == {"lib/client.dart": "excluded"}
-
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-    assert main(["graph", "query", "--file", "lib/client.dart", "--json"]) == 0
-    graph_payload = json.loads(capsys.readouterr().out)
-    assert graph_payload["data"]["result"]["relationship_candidates"] == []
-    assert graph_payload["data"]["result"]["relationship_candidate_count"] == 0
-    assert any(action["kind"] == "graph_refresh" for action in graph_payload["next_actions"])
-
-    assert main(["graph", "search", "linked rpc", "--mode", "code-location", "--json"]) == 0
-    context_payload = json.loads(capsys.readouterr().out)
-    bundle = context_payload["data"]["result"]
-    assert bundle["relationship_candidates"] == []
-    assert bundle["relationship_candidate_count"] == 0
-    assert not [
-        item
-        for group in bundle["groups"].values()
-        for item in group
-        if item.get("source_ref", {}).get("path") == "repos/lib/client.dart"
-    ]
-    assert any(action["kind"] == "graph_refresh" for action in context_payload["next_actions"])
-
-
-def test_context_exact_rpc_identity_selects_one_same_line_source_fact(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    repo = tmp_path / "repos"
-    init_repo(repo)
-    write_repometa(repo)
     source = (
         "import 'package:supabase/supabase.dart';\n"
         "final client = SupabaseClient();\n"
@@ -898,25 +604,3 @@ def test_context_exact_rpc_identity_selects_one_same_line_source_fact(tmp_path: 
         if edge["kind"] == "USES_FILE"
         and any(item.get("relation") == "sql_rpc_dependency" for item in edge.get("facts", {}).get("relations", []))
     ]
-
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-    for routine in ("alpha", "beta"):
-        assert main(["graph", "search", routine, "--mode", "code-location", "--full", "--json"]) == 0
-        bundle = json.loads(capsys.readouterr().out)["data"]["result"]
-        assert bundle["relationship_candidate_count"] == 1
-        assert [item["source"]["runtime_identity"]["value"] for item in bundle["relationship_candidates"]] == [routine]
-        exact_source = next(
-            item
-            for item in bundle["evidence"]
-            if item["source_ref"].get("section_kind") == "provider_relationship"
-            and "exact_relationship" in item["evidence_kinds"]
-        )
-        assert exact_source["source_ref"]["source_fact_id"] == bundle["relationship_candidates"][0]["candidate_id"]
-
-    assert main(["graph", "search", "lib/client.dart", "--mode", "code-location", "--json"]) == 0
-    file_bundle = json.loads(capsys.readouterr().out)["data"]["result"]
-    assert file_bundle["relationship_candidate_count"] == 2
-    assert {
-        item["source"]["runtime_identity"]["value"]
-        for item in file_bundle["relationship_candidates"]
-    } == {"alpha", "beta"}

@@ -17,27 +17,18 @@ from .code_index import (
     build_code_index_from_inventory,
     semantic_provider_entries,
 )
-from .context_sources import context_document_paths
-from .completion_catalogue import (
-    CompletionGraphInput,
-    CompletionCatalogueStatus,
-    CompletionCatalogueUnavailable,
-    CompletionCatalogueUnavailableReason,
-    completion_catalogue_status,
-    ingest_completion_catalogue_tail,
-    completion_graph_inputs,
-    unavailable_completion_catalogue_status,
-)
 from .component_projection import (
     DEFAULT_COMPONENT_MANIFEST_REGISTRY,
     ComponentManifestRegistry,
 )
-from .evidence_store import evidence_index_binding_problems, load_evidence_index_metadata, materialize_evidence_index
+from .source_index import materialize_source_index
 from .graph import build_graph
 from .graph_import_resolver import ImportResolution, resolve_code_imports
 from .graph_model import GraphEdge, GraphNode, GraphSnapshot, digest_data
 from .graph_semantic_model import (
     CapabilityEvidence,
+    ProviderOutputError,
+    parse_provider_imports,
     PreciseCall,
     PreciseSymbol,
     ProviderFailure,
@@ -54,19 +45,17 @@ from .graph_semantic_model import (
 from .graph_semantic_provider import PROVIDER_INPUT_VERSIONS, PROVIDER_LANGUAGES, build_semantic_provider
 from .graph_structured_relations import STRUCTURED_RELATION_INPUT_VERSION
 from .git import repo_file_state_records
-from .io import atomic_write
+from .io import Problem, atomic_write
 from .language_profiles import language_for_path
-from .knowledge_projection import knowledge_projection_path, load_knowledge_projection
-from .meta import meta_inventory, without_absent_repometa
+from .knowledge_records import knowledge_records_for_graph
+from .inventory import file_inventory
 from .repositories import RepoTarget
-from .tasks import Problem, collect_completion_receipt_collection
 
 
 GRAPH_STATE_SCHEMA = "repoctl.graph.materialization"
-GRAPH_STATE_SCHEMA_VERSION = 3
-COMPLETION_RECEIPT_INPUT_VERSION = 2
+GRAPH_STATE_SCHEMA_VERSION = 5
 GRAPH_STATE_ROOT = Path(".repoctl-state/graph")
-PROVIDER_RESULT_SCHEMA_VERSION = 3
+PROVIDER_RESULT_SCHEMA_VERSION = 4
 PROVIDER_CONFIG_PATTERNS = {
     "python_ast": ("pyproject.toml",),
     "typescript_compiler": (
@@ -102,68 +91,10 @@ class _MaterializedGraph:
     manifest: dict[str, Any]
     snapshot: GraphSnapshot
     provider_results: dict[str, SemanticProviderResult]
-    evidence_metadata: dict[str, Any]
 
 
-def _completion_catalogue_status_for_graph(
-    root: Path,
-    *,
-    target: RepoTarget,
-) -> CompletionCatalogueStatus:
-    """Reject a pre-catalogue workspace instead of erasing preserved history."""
-
-    status = completion_catalogue_status(root, target.id)
-    if status.status != "empty":
-        return status
-    legacy_receipts = collect_completion_receipt_collection(root, repo_id=target.id)
-    if legacy_receipts.problems:
-        first_problem = legacy_receipts.problems[0]
-        raise CompletionCatalogueUnavailable(
-            CompletionCatalogueUnavailableReason.SOURCE_AUDIT_FAILED,
-            f"preserved completion receipts cannot be audited: {first_problem.message}",
-            path=first_problem.path or "docs/tasks/.repoctl-state/completions",
-        )
-    if legacy_receipts.artifacts:
-        raise CompletionCatalogueUnavailable(
-            CompletionCatalogueUnavailableReason.MISSING,
-            "preserved completion receipts exist but the completion catalogue has not been rebuilt",
-            path="docs/tasks/.repoctl-state/completions",
-        )
-    return status
 
 
-def _graph_completion_inputs(
-    root: Path,
-    *,
-    target: RepoTarget,
-) -> tuple[tuple[CompletionGraphInput, ...], CompletionCatalogueStatus, list[Problem]]:
-
-    try:
-        status = _completion_catalogue_status_for_graph(root, target=target)
-        if status.tail_pending:
-            ingest_completion_catalogue_tail(root, target.id)
-            status = _completion_catalogue_status_for_graph(root, target=target)
-        records = completion_graph_inputs(root, target.id)
-    except CompletionCatalogueUnavailable as exc:
-        problem = Problem(
-            "warning",
-            exc.code,
-            f"completion history projection is unavailable: {exc}; run repoctl history rebuild",
-            exc.path,
-        )
-        empty_status = unavailable_completion_catalogue_status(
-            target.id,
-            exc.code,
-        )
-        return (), empty_status, [problem]
-    problems = [] if status.history_complete or status.status == "empty" else [
-        Problem(
-            "warning",
-            "completion_catalogue_hot_history_partial",
-            "active Graph task history is bounded by the completion catalogue hot policy; use exact cold lookup for older tasks",
-        )
-    ]
-    return records, status, problems
 
 
 def _file_record_fingerprint(record: dict[str, Any]) -> str:
@@ -207,8 +138,6 @@ def _code_index_entries(snapshot: GraphSnapshot | None) -> list[CodeIndexEntry]:
                 symbols=[str(value) for value in index.get("symbol_names", []) if str(value)],
                 imports=[str(value) for value in index.get("imports", []) if str(value)],
                 calls=[str(value) for value in index.get("call_names", []) if str(value)],
-                deps=[str(value) for value in index.get("dependencies", []) if str(value)],
-                observed_effects=[str(value) for value in index.get("observed_effects", []) if str(value)],
                 parse_status=str(index.get("parse_status") or ""),
                 parse_error=str(index.get("parse_error") or ""),
                 import_occurrences=tuple(
@@ -255,7 +184,7 @@ def _path_record(
     }
     try:
         file_stat = os.lstat(path)
-    except OSError:
+    except FileNotFoundError:
         record.update({"kind": "missing", "mode": ""})
         return record
     mode = f"{stat.S_IMODE(file_stat.st_mode):04o}"
@@ -266,6 +195,8 @@ def _path_record(
         probe = {
             "kind": "file",
             "mode": mode,
+            "device": file_stat.st_dev,
+            "inode": file_stat.st_ino,
             "size": file_stat.st_size,
             "mtime_ns": file_stat.st_mtime_ns,
             "ctime_ns": file_stat.st_ctime_ns,
@@ -273,10 +204,12 @@ def _path_record(
         if previous is not None and previous.get("probe") == probe and previous.get("content_sha256"):
             record.update({"kind": "file", "mode": mode, "content_sha256": previous["content_sha256"], "probe": probe})
             return record
-        try:
-            content = path.read_bytes()
-        except OSError:
-            content = b"<unreadable>"
+        content = path.read_bytes()
+        after = path.stat()
+        if (file_stat.st_dev, file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns, file_stat.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise OSError(f"Graph input changed while being read: {logical_path}")
         record.update({"kind": "file", "mode": mode, "content_sha256": _sha256_bytes(content), "probe": probe})
     else:
         probe = {"kind": "other", "mode": mode}
@@ -284,18 +217,6 @@ def _path_record(
     return record
 
 
-def _tree_records(root: Path, *, prefix: str, previous: dict[str, dict[str, Any]] | None = None) -> list[dict[str, object]]:
-    previous = previous or {}
-    if not root.exists() or root.is_symlink():
-        return [_path_record(root, logical_path=prefix, previous=previous.get(prefix))] if root.exists() else []
-    return [
-        _path_record(
-            path,
-            logical_path=f"{prefix}/{path.relative_to(root).as_posix()}",
-            previous=previous.get(f"{prefix}/{path.relative_to(root).as_posix()}"),
-        )
-        for path in sorted(candidate for candidate in root.rglob("*") if not candidate.is_dir())
-    ]
 
 
 def _config_records(
@@ -351,72 +272,20 @@ def _root_record_fingerprint(record: dict[str, Any]) -> str:
     )
 
 
-def _root_evidence_records(
+def _knowledge_input_records(
     root: Path,
     target: RepoTarget,
     *,
     previous: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, object]]:
     previous = previous or {}
-    records = [
-        *(_tree_records(target.root_path / ".repometa", prefix=f"{target.display_path}/.repometa", previous=previous) if target.id else []),
-    ]
-    projection_path = knowledge_projection_path(root, repo_id=target.id)
-    projection_rel = projection_path.relative_to(root).as_posix()
-    records.append(
-        _path_record(
-            projection_path,
-            logical_path=projection_rel,
-            previous=previous.get(projection_rel),
-        )
-    )
-    knowledge_projection, projection_problems = load_knowledge_projection(
-        root,
-        repo_id=target.id,
-    )
-    if not projection_problems:
-        for record in knowledge_projection.get("heads", []):
-            record = record if isinstance(record, dict) else {}
-            record_id = str(record.get("id") or "") if isinstance(record, dict) else ""
-            if record_id:
-                record_rel = f"docs/knowledge/records/{record_id}.json"
-                records.append(
-                    _path_record(
-                        root / record_rel,
-                        logical_path=record_rel,
-                        previous=previous.get(record_rel),
-                    )
-                )
-            refs = record.get("source_refs") if isinstance(record, dict) else []
-            for ref in refs if isinstance(refs, list) else []:
-                if not isinstance(ref, dict):
-                    continue
-                logical_path = str(ref.get("path") or "")
-                candidate = Path(logical_path)
-                if (
-                    not logical_path
-                    or candidate.is_absolute()
-                    or candidate.as_posix() != logical_path
-                    or any(part in {"", ".", ".."} for part in candidate.parts)
-                ):
-                    continue
-                records.append(
-                    _path_record(
-                        root / candidate,
-                        logical_path=logical_path,
-                        previous=previous.get(logical_path),
-                    )
-                )
-    product_root = target.root_path.resolve()
-    for path in context_document_paths(root, target=target):
-        if target.id and path.resolve().is_relative_to(product_root):
-            continue
-        logical_path = path.relative_to(root).as_posix()
-        records.append(_path_record(path, logical_path=logical_path, previous=previous.get(logical_path)))
-    for relative in ("docs/repoctl.json", "repoctl-upgrade-manifest.json", "pyproject.toml"):
-        path = root / relative
-        if path.is_file():
-            records.append(_path_record(path, logical_path=relative, previous=previous.get(relative)))
+    records: list[dict[str, object]] = []
+    knowledge_records, _problems = knowledge_records_for_graph(root, repo_id=target.id)
+    for record in knowledge_records:
+        record_id = str(record.get("id") or "")
+        if record_id:
+            relative = f"docs/knowledge/records/{record_id}.json"
+            records.append(_path_record(root / relative, logical_path=relative, previous=previous.get(relative)))
     by_path = {str(record.get("path") or ""): record for record in records if str(record.get("path") or "")}
     return [by_path[path] for path in sorted(by_path)]
 
@@ -439,7 +308,6 @@ def collect_graph_inputs(
     target: RepoTarget,
     previous_manifest: dict[str, Any] | None = None,
     previous_snapshot: GraphSnapshot | None = None,
-    catalogue_status: CompletionCatalogueStatus,
     component_manifest_registry: ComponentManifestRegistry = DEFAULT_COMPONENT_MANIFEST_REGISTRY,
     rebuild: bool = False,
 ) -> tuple[
@@ -451,20 +319,15 @@ def collect_graph_inputs(
 ]:
     previous_manifest = previous_manifest or {}
     previous_file_records = previous_manifest.get("file_records") if isinstance(previous_manifest.get("file_records"), dict) else {}
-    if not target.id:
-        inventory, inventory_problems, inventory_meta = [], [], {"summary": {"truncated": False}}
-        file_records = {}
-    else:
-        inventory, inventory_problems, inventory_meta = meta_inventory(root, changed=False, target=target)
-        inventory_problems, _metadata_absent = without_absent_repometa(inventory_problems, repo=target.root_path)
-        file_records, git_state = repo_file_state_records(
-            root,
-            paths=[item.path for item in inventory if item.classification not in {"orphan_annotation", "orphan_exclusion"}],
-            target=target,
-            previous={str(path): value for path, value in previous_file_records.items() if isinstance(value, dict)},
-        )
-        if not git_state.available:
-            inventory_problems = [*inventory_problems, Problem("error", "graph_git_unavailable", git_state.reason, target.display_path)]
+    inventory, inventory_problems, inventory_meta = file_inventory(root, changed=False, target=target)
+    file_records, git_state = repo_file_state_records(
+        root,
+        paths=[item.path for item in inventory],
+        target=target,
+        previous={str(path): value for path, value in previous_file_records.items() if isinstance(value, dict)},
+    )
+    if not git_state.available:
+        inventory_problems = [*inventory_problems, Problem("error", "graph_git_unavailable", git_state.reason, target.display_path)]
     file_fingerprints = {
         path: _file_record_fingerprint(record)
         for path, record in sorted(file_records.items())
@@ -492,7 +355,6 @@ def collect_graph_inputs(
     if full_reindex:
         changed_paths = set(file_fingerprints) | set(previous_by_path)
     index_result = build_code_index_from_inventory(
-        root,
         files=inventory,
         inventory_problems=inventory_problems,
         inventory_meta=inventory_meta,
@@ -538,20 +400,20 @@ def collect_graph_inputs(
             "units": _provider_units(provider, target, paths),
         }
 
-    previous_root_records = previous_manifest.get("root_evidence_records") if isinstance(previous_manifest.get("root_evidence_records"), dict) else {}
-    root_records = _root_evidence_records(
+    previous_root_records = previous_manifest.get("knowledge_input_records") if isinstance(previous_manifest.get("knowledge_input_records"), dict) else {}
+    root_records = _knowledge_input_records(
         root,
         target,
         previous={str(path): value for path, value in previous_root_records.items() if isinstance(value, dict)},
     )
-    root_evidence_records = {
+    knowledge_input_records = {
         str(record.get("path") or ""): record
         for record in root_records
         if str(record.get("path") or "")
     }
-    root_evidence_fingerprints = {
+    knowledge_input_fingerprints = {
         path: _root_record_fingerprint(record)
-        for path, record in root_evidence_records.items()
+        for path, record in knowledge_input_records.items()
     }
     state = {
         "schema": GRAPH_STATE_SCHEMA,
@@ -559,24 +421,20 @@ def collect_graph_inputs(
         "repository": target.to_dict(),
         "code_index_input_version": CODE_INDEX_INPUT_VERSION,
         "structured_relation_input_version": STRUCTURED_RELATION_INPUT_VERSION,
-        "completion_receipt_input_version": COMPLETION_RECEIPT_INPUT_VERSION,
         "component_manifest_registry": component_manifest_registry.identity,
         "file_records": file_records,
         "file_fingerprints": file_fingerprints,
         "inventory_digest": digest_data(inventory_records),
-        "root_evidence_digest": digest_data(root_evidence_fingerprints),
-        "root_evidence_records": root_evidence_records,
-        "root_evidence_fingerprints": root_evidence_fingerprints,
-        "completion_catalogue": catalogue_status.graph_identity(),
-        "completion_receipt_input_digest": digest_data(catalogue_status.graph_identity()),
-        "completion_receipt_input_paths": [],
+        "knowledge_input_digest": digest_data(knowledge_input_fingerprints),
+        "knowledge_input_records": knowledge_input_records,
+        "knowledge_input_fingerprints": knowledge_input_fingerprints,
         "providers": providers,
     }
     state["input_digest"] = digest_data(
         {
             key: value
             for key, value in state.items()
-            if key not in {"file_records", "root_evidence_records"}
+            if key not in {"file_records", "knowledge_input_records"}
         }
     )
     return index_result, provider_entries, import_result, state, {
@@ -586,7 +444,7 @@ def collect_graph_inputs(
 
 
 def _state_dir(root: Path, target: RepoTarget, *, state_root: Path | None = None) -> Path:
-    return (state_root or root / GRAPH_STATE_ROOT) / (target.id or "_workspace")
+    return (state_root or root / GRAPH_STATE_ROOT) / target.id
 
 
 def _state_path_label(root: Path, path: Path) -> str:
@@ -596,12 +454,6 @@ def _state_path_label(root: Path, path: Path) -> str:
         return path.as_posix()
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _read_materialization_json(root: Path, path: Path) -> tuple[dict[str, Any] | None, str, Problem | None]:
@@ -658,6 +510,9 @@ def _provider_result_to_dict(result: SemanticProviderResult) -> dict[str, object
         "languages": list(result.languages),
         "symbols": [symbol.to_dict() for symbol in result.symbols],
         "calls": [call.to_dict() for call in result.calls],
+        "imports": [declaration.to_dict() for declaration in result.imports],
+        "import_analyzed_paths": list(result.import_analyzed_paths),
+        "import_failed_paths": list(result.import_failed_paths),
         "rpc_invocations": [fact.to_dict() for fact in result.rpc_invocations],
         "symbol_analyzed_paths": list(result.symbol_analyzed_paths),
         "call_analyzed_paths": list(result.call_analyzed_paths),
@@ -682,6 +537,9 @@ def _provider_result_from_dict(data: dict[str, Any], *, expected_provider: str) 
         "languages",
         "symbols",
         "calls",
+        "imports",
+        "import_analyzed_paths",
+        "import_failed_paths",
         "symbol_analyzed_paths",
         "call_analyzed_paths",
         "symbol_failed_paths",
@@ -691,6 +549,10 @@ def _provider_result_from_dict(data: dict[str, Any], *, expected_provider: str) 
     if any(not isinstance(data.get(field), list) for field in collection_fields):
         return None
     if not isinstance(data.get("tool"), dict):
+        return None
+    try:
+        imports = parse_provider_imports(data, eligible_paths=set(data["import_analyzed_paths"]))
+    except (ProviderOutputError, TypeError):
         return None
     symbols: list[PreciseSymbol] = []
     for raw in data["symbols"]:
@@ -874,6 +736,9 @@ def _provider_result_from_dict(data: dict[str, Any], *, expected_provider: str) 
     return SemanticProviderResult(
         provider=expected_provider,
         languages=tuple(sorted(str(value) for value in data["languages"] if str(value))),
+        imports=imports,
+        import_analyzed_paths=tuple(sorted(data["import_analyzed_paths"])),
+        import_failed_paths=tuple(sorted(data["import_failed_paths"])),
         symbols=tuple(symbols),
         calls=tuple(calls),
         rpc_invocations=tuple(sorted(rpc_invocations, key=lambda item: item.fact_id)),
@@ -892,7 +757,7 @@ def _provider_result_from_dict(data: dict[str, Any], *, expected_provider: str) 
 
 
 def _snapshot_from_dict(data: dict[str, Any]) -> GraphSnapshot | None:
-    if data.get("schema") != "repoctl.graph.snapshot" or data.get("schema_version") != 1:
+    if data.get("schema") != "repoctl.graph.snapshot" or data.get("schema_version") != 2:
         return None
     repository = data.get("repository")
     sources = data.get("sources")
@@ -935,8 +800,7 @@ def _snapshot_from_dict(data: dict[str, Any]) -> GraphSnapshot | None:
         nodes=nodes,
         edges=edges,
         schema="repoctl.graph.snapshot",
-        schema_version=1,
-        authoritative=bool(data.get("authoritative")),
+        schema_version=2,
         capabilities=[str(value) for value in capabilities],
     ).with_digest()
     return snapshot if snapshot.snapshot_digest == str(data.get("snapshot_digest") or "") else None
@@ -961,7 +825,7 @@ def _validate_materialization_state(
         {
             key: value
             for key, value in manifest.items()
-            if key not in {"file_records", "root_evidence_records", "input_digest", "snapshot_digest", "provider_result_digests"}
+            if key not in {"file_records", "knowledge_input_records", "input_digest", "snapshot_digest", "provider_result_digests"}
         }
     )
     if str(manifest.get("input_digest") or "") != expected_input_digest:
@@ -996,7 +860,6 @@ def _admit_materialization(
     target: RepoTarget,
     state_root: Path | None = None,
     require_provider_results: bool = True,
-    require_evidence_index: bool = True,
 ) -> tuple[_MaterializedGraph | None, list[Problem], str]:
     state_dir = _state_dir(root, target, state_root=state_root)
     manifest_data, manifest_status, manifest_problem = _read_materialization_json(root, state_dir / "manifest.json")
@@ -1076,44 +939,8 @@ def _admit_materialization(
             for problem in provider_problems
         )
 
-    evidence_metadata, evidence_problems = load_evidence_index_metadata(
-        root,
-        target=target,
-        database_path=state_dir / "evidence.sqlite3",
-    )
-    if not evidence_problems:
-        evidence_problems = evidence_index_binding_problems(
-            root,
-            target=target,
-            metadata=evidence_metadata,
-            snapshot_digest=snapshot.snapshot_digest,
-            graph_input_digest=str(manifest_data.get("input_digest") or ""),
-            database_path=state_dir / "evidence.sqlite3",
-        )
-    if evidence_problems:
-        evidence_status = (
-            "unavailable"
-            if any(problem.code == "evidence_index_unavailable" for problem in evidence_problems)
-            else "incomplete"
-            if any(problem.code == "evidence_index_missing" for problem in evidence_problems)
-            else "invalid"
-        )
-        if require_evidence_index:
-            return None, evidence_problems, evidence_status
-        evidence_metadata = {}
-        component_problems.extend(
-            Problem(
-                "warning",
-                "graph_evidence_index_unavailable",
-                "text/evidence index is unavailable; stored Graph relations remain readable",
-                problem.path,
-                cause_code=problem.code,
-            )
-            for problem in evidence_problems
-        )
-
     status = "materialized_degraded" if component_problems else "materialized"
-    return _MaterializedGraph(manifest_data, snapshot, provider_results, evidence_metadata), component_problems, status
+    return _MaterializedGraph(manifest_data, snapshot, provider_results), component_problems, status
 
 
 def load_materialized_graph(
@@ -1128,7 +955,6 @@ def load_materialized_graph(
         target=target,
         state_root=state_root,
         require_provider_results=False,
-        require_evidence_index=False,
     )
     if materialized is None:
         return None, problems, {"repository": target.to_dict(), "materialization": {"status": status}}
@@ -1140,7 +966,6 @@ def load_materialized_graph(
             "components": {
                 "relations": "available",
                 "provider_artifacts": "unavailable" if not materialized.provider_results else "available",
-                "evidence_index": "unavailable" if not materialized.evidence_metadata else "available",
             },
         },
     }
@@ -1168,6 +993,7 @@ def graph_materialization_freshness(
 ) -> tuple[dict[str, Any], list[Problem]]:
     state_dir = _state_dir(root, target, state_root=state_root)
     provider_results: dict[str, SemanticProviderResult]
+    provider_advisories: list[Problem] = []
     if snapshot is None:
         materialized, admission_problems, status = _admit_materialization(root, target=target, state_root=state_root)
         if materialized is None:
@@ -1222,10 +1048,26 @@ def graph_materialization_freshness(
         provider_results=provider_results,
         component_manifest_registry=component_manifest_registry,
     )
-    return freshness, [*locals().get("provider_advisories", []), *observed_problems]
+    return freshness, [*provider_advisories, *observed_problems]
 
 
 def _observed_graph_freshness(
+    root: Path, *, target: RepoTarget, snapshot: GraphSnapshot,
+    manifest: dict[str, Any], provider_results: dict[str, SemanticProviderResult],
+    component_manifest_registry: ComponentManifestRegistry,
+) -> tuple[dict[str, Any], list[Problem]]:
+    try:
+        return _collect_graph_freshness(
+            root, target=target, snapshot=snapshot, manifest=manifest,
+            provider_results=provider_results, component_manifest_registry=component_manifest_registry,
+        )
+    except OSError as exc:
+        return {"status": "unavailable"}, [
+            Problem("warning", "graph_input_unreadable", str(exc), str(exc.filename or target.display_path))
+        ]
+
+
+def _collect_graph_freshness(
     root: Path,
     *,
     target: RepoTarget,
@@ -1237,25 +1079,19 @@ def _observed_graph_freshness(
     """Check live inputs against artifacts admitted once in this observation.
 
     This is invocation-local reuse, never a cache across queries. Admission
-    still validates repository/schema/digests/providers/index before entry.
+    still validates repository/schema/digests/providers before entry.
     """
-    if not target.id:
-        inventory, current_records, problems = [], {}, []
-    else:
-        inventory, inventory_problems, _inventory_meta = meta_inventory(root, changed=False, target=target)
-        inventory_problems, metadata_absent = without_absent_repometa(inventory_problems, repo=target.root_path)
-        previous_records = manifest.get("file_records") if isinstance(manifest.get("file_records"), dict) else {}
-        current_records, git_state = repo_file_state_records(
-            root,
-            paths=[item.path for item in inventory if item.classification not in {"orphan_annotation", "orphan_exclusion"}],
-            target=target,
-            previous={str(path): value for path, value in previous_records.items() if isinstance(value, dict)},
-        )
-        problems = list(inventory_problems)
-        if metadata_absent:
-            problems.append(Problem("warning", "graph_metadata_unavailable", "repository metadata is not initialized; Graph source relations remain available without metadata enrichment", f"{target.display_path}/.repometa/policy.json", "missing_repometa_policy"))
-        if not git_state.available:
-            problems.append(Problem("error", "graph_git_unavailable", git_state.reason, target.display_path))
+    inventory, inventory_problems, _inventory_meta = file_inventory(root, changed=False, target=target)
+    previous_records = manifest.get("file_records") if isinstance(manifest.get("file_records"), dict) else {}
+    current_records, git_state = repo_file_state_records(
+        root,
+        paths=[item.path for item in inventory],
+        target=target,
+        previous={str(path): value for path, value in previous_records.items() if isinstance(value, dict)},
+    )
+    problems = list(inventory_problems)
+    if not git_state.available:
+        problems.append(Problem("error", "graph_git_unavailable", git_state.reason, target.display_path))
     current_fingerprints = {
         path: _file_record_fingerprint(record)
         for path, record in sorted(current_records.items())
@@ -1337,7 +1173,6 @@ def _observed_graph_freshness(
     graph_input_version_changed = (
         manifest.get("code_index_input_version") != CODE_INDEX_INPUT_VERSION
         or manifest.get("structured_relation_input_version") != STRUCTURED_RELATION_INPUT_VERSION
-        or manifest.get("completion_receipt_input_version") != COMPLETION_RECEIPT_INPUT_VERSION
         or manifest.get("component_manifest_registry") != component_manifest_registry.identity
     )
     semantic_stale_paths = sorted(
@@ -1362,8 +1197,8 @@ def _observed_graph_freshness(
         for path in stale_paths
         if path in current_classifications
     }
-    previous_root_records = manifest.get("root_evidence_records") if isinstance(manifest.get("root_evidence_records"), dict) else {}
-    root_records = _root_evidence_records(
+    previous_root_records = manifest.get("knowledge_input_records") if isinstance(manifest.get("knowledge_input_records"), dict) else {}
+    root_records = _knowledge_input_records(
         root,
         target,
         previous={str(path): value for path, value in previous_root_records.items() if isinstance(value, dict)},
@@ -1373,25 +1208,7 @@ def _observed_graph_freshness(
         for record in root_records
         if str(record.get("path") or "")
     }
-    previous_root_fingerprints = manifest.get("root_evidence_fingerprints") if isinstance(manifest.get("root_evidence_fingerprints"), dict) else {}
-    try:
-        catalogue_status = _completion_catalogue_status_for_graph(root, target=target)
-        current_catalogue = catalogue_status.graph_identity()
-        catalogue_problem: Problem | None = None
-    except CompletionCatalogueUnavailable as exc:
-        current_catalogue = unavailable_completion_catalogue_status(
-            target.id,
-            exc.code,
-        ).graph_identity()
-        catalogue_problem = Problem(
-            "warning",
-            exc.code,
-            f"completion history projection is unavailable: {exc}; run repoctl history rebuild",
-            exc.path,
-        )
-        problems.append(catalogue_problem)
-    previous_catalogue = manifest.get("completion_catalogue") if isinstance(manifest.get("completion_catalogue"), dict) else {}
-    completion_receipt_input_changed = current_catalogue != previous_catalogue
+    previous_root_fingerprints = manifest.get("knowledge_input_fingerprints") if isinstance(manifest.get("knowledge_input_fingerprints"), dict) else {}
     changed_root_paths = sorted(
         {
             path
@@ -1399,16 +1216,15 @@ def _observed_graph_freshness(
             if str(current_root_fingerprints.get(path) or "") != str(previous_root_fingerprints.get(path) or "")
         }
     )
-    root_evidence_digest = digest_data(current_root_fingerprints)
-    root_evidence_changed = (
-        root_evidence_digest != str(manifest.get("root_evidence_digest") or "")
-        or completion_receipt_input_changed
+    knowledge_input_digest = digest_data(current_root_fingerprints)
+    knowledge_input_changed = (
+        knowledge_input_digest != str(manifest.get("knowledge_input_digest") or "")
     )
     status = (
         "current"
         if not changed_paths
         and not inventory_stale_paths
-        and not root_evidence_changed
+        and not knowledge_input_changed
         and not provider_state_changed
         and not graph_input_version_changed
         and not any(problem.severity == "error" for problem in problems)
@@ -1424,9 +1240,7 @@ def _observed_graph_freshness(
             if item.path in changed_paths
         },
         "inventory_stale_paths": inventory_stale_paths,
-        "root_evidence_changed": root_evidence_changed,
-        "completion_receipt_input_changed": completion_receipt_input_changed,
-        "completion_catalogue": current_catalogue,
+        "knowledge_input_changed": knowledge_input_changed,
         "changed_root_paths": changed_root_paths,
         "changed_root_path_count": len(changed_root_paths),
         "provider_state_changed": provider_state_changed,
@@ -1444,28 +1258,8 @@ def _observed_graph_freshness(
     }, problems
 
 
-def graph_stale_paths(freshness: Any) -> set[str]:
-    """Return the canonical repo-relative paths whose Graph evidence is stale."""
-    if not isinstance(freshness, dict):
-        return set()
-    raw_paths = freshness.get("stale_paths")
-    if not isinstance(raw_paths, list):
-        raw_paths = freshness.get("changed_paths", [])
-    return {str(path) for path in raw_paths if str(path)}
 
 
-def compact_graph_freshness(freshness: Any) -> dict[str, Any]:
-    """Project the bounded freshness fields used by default agent-facing views."""
-    if not isinstance(freshness, dict):
-        return {}
-    return {
-        key: freshness[key]
-        for key in (
-            "status",
-            "root_evidence_changed",
-        )
-        if key in freshness
-    }
 
 
 def _previous_import_pairs(snapshot: GraphSnapshot | None) -> set[tuple[str, str]]:
@@ -1604,6 +1398,13 @@ def _merge_provider_result(
     replace_paths: set[str],
     current_paths: set[str],
 ) -> SemanticProviderResult:
+    imports = tuple(sorted(
+        {
+            *[item for item in previous.imports if item.path not in replace_paths and item.path in current_paths],
+            *[item for item in update.imports if item.path in current_paths],
+        },
+        key=lambda item: (item.path, item.module, item.anchor.start_line, item.anchor.start_col),
+    ))
     symbols = {
         symbol.provider_symbol_id: symbol
         for symbol in previous.symbols
@@ -1647,6 +1448,9 @@ def _merge_provider_result(
     return SemanticProviderResult(
         provider=previous.provider,
         languages=previous.languages or update.languages,
+        imports=imports,
+        import_analyzed_paths=merged_paths(previous.import_analyzed_paths, update.import_analyzed_paths),
+        import_failed_paths=merged_paths(previous.import_failed_paths, update.import_failed_paths),
         symbols=tuple(symbols[key] for key in sorted(symbols)),
         calls=tuple(calls[key] for key in sorted(calls)),
         rpc_invocations=tuple(rpc_invocations[key] for key in sorted(rpc_invocations)),
@@ -1757,45 +1561,33 @@ def materialize_graph(
             previous_manifest = materialized.manifest
             previous_snapshot = materialized.snapshot
             previous_provider_results = materialized.provider_results
-    completion_inputs, catalogue_state, catalogue_problems = _graph_completion_inputs(
-        root,
-        target=target,
-    )
-    index_result, provider_entries, import_result, current, index_update = collect_graph_inputs(
-        root,
-        target=target,
-        previous_manifest=previous_manifest,
-        previous_snapshot=previous_snapshot,
-        catalogue_status=catalogue_state,
-        component_manifest_registry=component_manifest_registry,
-        rebuild=rebuild,
-    )
+    try:
+        index_result, provider_entries, import_result, current, index_update = collect_graph_inputs(
+            root,
+            target=target,
+            previous_manifest=previous_manifest,
+            previous_snapshot=previous_snapshot,
+            component_manifest_registry=component_manifest_registry,
+            rebuild=rebuild,
+        )
+    except OSError as exc:
+        return None, [Problem("error", "graph_input_unreadable", str(exc), str(exc.filename or target.display_path))], {
+            "repository": target.to_dict(), "materialization": {"status": "unavailable"},
+        }
     if any(problem.severity == "error" for problem in index_result[1]):
         return None, index_result[1], {"repository": target.to_dict(), "materialization": {"status": "unavailable"}}
     import_resolutions, _import_meta = import_result
     if not rebuild and previous_snapshot is not None and str(previous_manifest.get("input_digest") or "") == current["input_digest"]:
-        evidence, evidence_problems = materialize_evidence_index(
-            root,
-            target=target,
-            snapshot=previous_snapshot,
-            entries=index_result[0],
-            file_fingerprints=current["file_fingerprints"],
-            changed_paths=set(index_update["changed_paths"]),
-            graph_input_digest=current["input_digest"],
-            database_path=state_dir / "evidence.sqlite3",
+        source_index, source_problems = materialize_source_index(
+            root, target=target, database_path=state_dir / "source-index.sqlite3",
         )
-        if any(problem.severity == "error" for problem in evidence_problems):
-            return previous_snapshot, evidence_problems, {
-                "repository": target.to_dict(),
-                "materialization": {"status": "failed", "input_digest": current["input_digest"], "evidence": evidence},
-            }
         reused_manifest = {
             **current,
             "snapshot_digest": previous_snapshot.snapshot_digest,
             "provider_result_digests": previous_manifest.get("provider_result_digests", {}),
         }
         atomic_write(state_dir / "manifest.json", json.dumps(reused_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        return previous_snapshot, [*catalogue_problems, *evidence_problems], {
+        return previous_snapshot, source_problems, {
             "repository": target.to_dict(),
             "materialization": {
                 "status": "reused",
@@ -1804,7 +1596,7 @@ def materialize_graph(
                 "updated_providers": [],
                 "updated_paths": {},
                 "code_index": index_update,
-                "evidence": evidence,
+                "source_index": source_index,
             },
         }
 
@@ -1879,34 +1671,15 @@ def materialize_graph(
         target=target,
         code_index_result=index_result,
         cached_semantic_results=results,
-        completion_inputs=completion_inputs,
-        completion_problems=tuple(catalogue_problems),
         component_manifest_registry=component_manifest_registry,
     )
     if snapshot is None or any(problem.severity == "error" for problem in problems):
         return snapshot, problems, {**meta, "materialization": {"status": "failed", "input_digest": current["input_digest"]}}
 
-    evidence_update_paths = set(index_update["changed_paths"])
-    for paths in updated_paths.values():
-        evidence_update_paths.update(paths)
-    evidence, evidence_problems = materialize_evidence_index(
-        root,
-        target=target,
-        snapshot=snapshot,
-        entries=index_result[0],
-        file_fingerprints=current["file_fingerprints"],
-        changed_paths=evidence_update_paths,
-        graph_input_digest=current["input_digest"],
-        rebuild=bool(index_update["full_reindex"]),
-        allow_reset=rebuild,
-        database_path=state_dir / "evidence.sqlite3",
+    source_index, source_problems = materialize_source_index(
+        root, target=target, database_path=state_dir / "source-index.sqlite3", rebuild=rebuild,
     )
-    problems.extend(evidence_problems)
-    if any(problem.severity == "error" for problem in evidence_problems):
-        return snapshot, problems, {
-            **meta,
-            "materialization": {"status": "failed", "input_digest": current["input_digest"], "evidence": evidence},
-        }
+    problems.extend(source_problems)
 
     provider_result_digests: dict[str, str] = {}
     for result in results:
@@ -1932,6 +1705,6 @@ def materialize_graph(
             "updated_providers": updated_providers,
             "updated_paths": updated_paths,
             "code_index": index_update,
-            "evidence": evidence,
+            "source_index": source_index,
         },
     }

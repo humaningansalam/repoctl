@@ -4,94 +4,197 @@ import json
 import subprocess
 from pathlib import Path
 
-from tools.repoctl.cli import main
+import pytest
+
 from tools.repoctl.io import RepoctlError
-from tools.repoctl.repositories import repo_layout
-from tests.repoctl.workspace.test_check import init_repo, write_workspace
-from tests.repoctl.meta.test_meta_check import commit_all, write_repometa
+from tools.repoctl.inventory import file_inventory
+from tools.repoctl.repositories import (
+    adopt_repositories,
+    repo_layout,
+    require_repo_target,
+    resolve_repo_selector_path,
+    RepoSelectorStatus,
+)
+
+
+def init_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Tests"], cwd=repo, check=True)
+
+
+def commit_all(repo: Path) -> None:
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True)
 
 
 def write_settings(root: Path, data: dict) -> None:
     path = root / "docs/repoctl.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(data) + "\n", encoding="utf-8")
 
-def test_single_repos_discovers_main_id(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    init_repo(tmp_path / "repos")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
-    assert main(["repo", "list", "--json"]) == 0
-
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["data"]["placement"] == "direct"
-    assert payload["data"]["registry_ready"] is True
-    assert payload["data"]["targets"] == [{"id": "main", "path": "repos", "identity_source": "reserved"}]
-    assert payload["data"]["candidates"] == []
-
-def test_repos_root_and_child_git_are_ambiguous(tmp_path: Path) -> None:
-    write_workspace(tmp_path)
-    init_repo(tmp_path / "repos")
-    init_repo(tmp_path / "repos/api")
-
-    try:
-        repo_layout(tmp_path)
-    except RepoctlError as exc:
-        assert exc.code == "repository_topology_invalid"
-    else:
-        raise AssertionError("repos/.git and repos/*/.git together should be ambiguous")
-
-def test_gitfile_worktree_is_detected_as_repo_root(tmp_path: Path) -> None:
-    write_workspace(tmp_path)
-    source = tmp_path / "source-repo"
+def test_single_direct_repository_and_git_worktree(tmp_path: Path) -> None:
+    source = tmp_path / "source"
     init_repo(source)
-    (source / "app.py").write_text("print('source')\n", encoding="utf-8")
+    (source / "app.py").write_text("answer = 42\n")
     commit_all(source)
-    subprocess.run(["git", "worktree", "add", str(tmp_path / "repos"), "HEAD"], cwd=source, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(tmp_path / "repos"), "HEAD"],
+        cwd=source,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    selected = require_repo_target(tmp_path)
+    assert (selected.id, selected.display_path) == ("main", "repos")
+    assert (selected.root_path / ".git").is_file()
 
-    layout = repo_layout(tmp_path)
 
-    assert layout.placement == "direct"
-    assert layout.targets[0].display_path == "repos"
-    assert (tmp_path / "repos/.git").is_file()
+def test_explicit_paths_do_not_require_a_repos_directory(tmp_path: Path) -> None:
+    init_repo(tmp_path / "git/product")
+    selected = adopt_repositories(
+        tmp_path, path="git/product", repo_id="product"
+    ).targets[0]
+    assert selected.display_path == "git/product"
+    assert require_repo_target(tmp_path, repo_id="product") == selected
 
-def test_configured_multi_requires_repo_id_for_meta(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    web = tmp_path / "repos/web"
-    api = tmp_path / "repos/api"
-    init_repo(web)
-    init_repo(api)
-    write_repometa(web)
-    write_repometa(api)
-    (web / "app.py").write_text("print('web')\n", encoding="utf-8")
-    (api / "app.py").write_text("print('api')\n", encoding="utf-8")
-    write_settings(tmp_path, {"repositories": [{"id": "web", "path": "repos/web"}, {"id": "api", "path": "repos/api"}]})
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
 
-    assert main(["meta", "status", "--verbose", "--json"]) == 2
-    missing_selector = json.loads(capsys.readouterr().out)
-    assert missing_selector["problems"][0]["code"] == "repository_selector_required"
+def test_registered_repo_remains_usable_when_an_unregistered_repo_exists(
+    tmp_path: Path,
+) -> None:
+    init_repo(tmp_path / "repos/web")
+    init_repo(tmp_path / "repos/api")
+    adopt_repositories(tmp_path, path="repos/web", repo_id="web")
+    assert require_repo_target(tmp_path, repo_id="web").display_path == "repos/web"
+    assert [item.display_path for item in repo_layout(tmp_path).candidates] == [
+        "repos/api"
+    ]
 
-    assert main(["meta", "status", "--verbose", "--repo-id", "web", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["data"]["repository"] == {"id": "web", "path": "repos/web", "identity_source": "pinned"}
-    assert payload["data"]["files"][0]["path"] == "app.py"
-    assert payload["data"]["files"][0]["workspace_path"] == "repos/web/app.py"
 
-def test_repo_check_fails_when_repos_directory_is_not_git(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    (tmp_path / "repos").mkdir()
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+def test_multiple_registered_repositories_require_an_explicit_selector(
+    tmp_path: Path,
+) -> None:
+    for name in ("web", "api"):
+        init_repo(tmp_path / "repos" / name)
+    adopt_repositories(tmp_path, all_candidates=True)
+    with pytest.raises(RepoctlError, match="repo-id"):
+        require_repo_target(tmp_path)
+    assert require_repo_target(tmp_path, repo_id="api").display_path == "repos/api"
 
-    assert main(["repo", "check", "--json"]) == 1
 
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["problems"][0]["code"] == "repository_git_unavailable"
-    assert payload["data"]["registry_ready"] is False
-    assert payload["data"]["targets"] == []
+@pytest.mark.parametrize("relative", ["../elsewhere", "/elsewhere"])
+def test_repository_paths_cannot_escape_workspace(
+    tmp_path: Path, relative: str
+) -> None:
+    write_settings(tmp_path, {"repositories": [{"id": "app", "path": relative}]})
+    with pytest.raises(RepoctlError):
+        repo_layout(tmp_path)
 
-    assert main(["meta", "init", "--json"]) == 2
 
-    meta_payload = json.loads(capsys.readouterr().out)
-    assert meta_payload["problems"][0]["code"] == "repository_identity_unbound"
-    assert not (tmp_path / "repos/.repometa").exists()
+def test_repository_alias_cannot_duplicate_one_real_root(tmp_path: Path) -> None:
+    init_repo(tmp_path / "app")
+    (tmp_path / "alias").symlink_to(tmp_path / "app", target_is_directory=True)
+    write_settings(
+        tmp_path,
+        {
+            "repositories": [
+                {"id": "app", "path": "app"},
+                {"id": "alias", "path": "alias"},
+            ]
+        },
+    )
+    with pytest.raises(RepoctlError, match="duplicate"):
+        repo_layout(tmp_path)
+
+
+def test_explicit_nested_git_repository_is_valid(tmp_path: Path) -> None:
+    init_repo(tmp_path / "app")
+    init_repo(tmp_path / "app/module")
+    write_settings(
+        tmp_path,
+        {
+            "repositories": [
+                {"id": "app", "path": "app"},
+                {"id": "module", "path": "app/module"},
+            ]
+        },
+    )
+    assert (
+        require_repo_target(tmp_path, repo_id="module").root_path
+        == tmp_path / "app/module"
+    )
+
+
+def test_selector_reports_ambiguous_repository_and_workspace_paths() -> None:
+    result = resolve_repo_selector_path(
+        "repos/app.py", repository_path="repos", known_paths={"repos/app.py", "app.py"}
+    )
+    assert result.status == RepoSelectorStatus.AMBIGUOUS
+    assert set(result.candidates) == {"repos/app.py", "app.py"}
+
+
+def test_inventory_uses_git_ignore_and_preserves_unusual_filenames(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repos"
+    init_repo(repo)
+    (repo / ".gitignore").write_text("ignored.py\n")
+    (repo / "ignored.py").write_text("secret = 1\n")
+    name = " leading\n한글.py"
+    (repo / name).write_text("value = 1\n")
+    (repo / "linked.py").symlink_to(tmp_path / "outside.py")
+    files, problems, _ = file_inventory(tmp_path)
+    assert not problems
+    by_path = {item.path: item for item in files}
+    assert name in by_path
+    assert "ignored.py" not in by_path
+    assert by_path["linked.py"].classification == "excluded"
+
+
+def test_plain_git_root_is_a_source_repository_without_task_documents(tmp_path: Path, monkeypatch, capsys) -> None:
+    from tools.repoctl.cli import main
+
+    init_repo(tmp_path)
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("REPOCTL_WORKSPACE_ROOT", raising=False)
+    assert main(["index", "code", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert data["repository"]["path"] == "."
+    assert next(item for item in data["files"] if item["path"] == "app.py")["symbols"] == ["run"]
+    assert not (tmp_path / "docs/tasks").exists()
+
+
+def test_empty_repository_configuration_allows_workspace_documents(tmp_path: Path) -> None:
+    write_settings(tmp_path, {"repositories": []})
+    assert repo_layout(tmp_path).targets == ()
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "changed"])
+def test_working_tree_identity_reports_failed_reads_without_inventing_content(tmp_path: Path, monkeypatch, failure: str) -> None:
+    from tools.repoctl.git import repo_file_state_records
+
+    init_repo(tmp_path / "repos")
+    source = tmp_path / "repos/app.py"
+    source.write_text("value = 1\n")
+    original_read = Path.read_bytes
+
+    def read(path):
+        if path != source:
+            return original_read(path)
+        if failure == "unreadable":
+            raise PermissionError("source cannot be read")
+        content = original_read(path)
+        path.write_text("value = 2\n")
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    records, state = repo_file_state_records(tmp_path, paths=["app.py"])
+    assert records == {}
+    assert not state.available
+    expected = "repository_file_unreadable" if failure == "unreadable" else "repository_file_changed_during_read"
+    assert state.problem_code == expected
+    assert "app.py" in state.reason

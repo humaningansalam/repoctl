@@ -1,59 +1,31 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from .code_index import CodeIndexEntry, build_code_index, semantic_provider_entries
-from .completion_catalogue import CompletionCatalogueUnavailable, CompletionGraphInput, lookup_completion_exact
 from .component_projection import (
     DEFAULT_COMPONENT_MANIFEST_REGISTRY,
     ComponentManifestRegistry,
-    annotate_context_projection_components,
     annotate_graph_query_components,
     component_projection,
     is_current_file_node,
 )
-from .git import normalize_repo_path
 from .graph_import_resolver import IMPORT_RESOLVER_LANGUAGES, resolve_code_imports
-from .graph_model import GRAPH_QUERY_SELECTOR_SCHEMAS, GraphContextAnchor, GraphContextAnchorKind, GraphContinuation, GraphEdge, GraphNode, GraphQuerySelectorKind, GraphSnapshot, ProviderCoverage, anchor_id, artifact_id, canonical_graph_query_selector, change_event_id, digest_data, document_id, file_id, import_ref_id, knowledge_id, repository_id, symbol_id, task_id as graph_task_id, topic_id
+from .graph_model import GRAPH_QUERY_SELECTOR_SCHEMAS, GraphEdge, GraphNode, GraphQuerySelectorKind, GraphSnapshot, ProviderCoverage, anchor_id, canonical_graph_query_selector, digest_data, document_id, file_id, import_ref_id, knowledge_id, repository_id, symbol_id
 from .graph_semantic_model import SemanticProviderResult
 from .graph_semantic_provider import build_semantic_providers
 from .graph_structured_relations import RpcResolutionOutcome, STRUCTURED_EDGE_KIND, build_structured_file_relations
-from .language_profiles import graph_language_capabilities, is_semantic_source_language, language_for_path
-from .knowledge_records import KnowledgeExplicitPathKind, KnowledgeExplicitPathRole, knowledge_records_for_graph
-from .io import RepoctlError
-from .meta import RepoMetadataFacts, read_metadata_facts, without_absent_repometa
+from .language_profiles import is_semantic_source_language, language_for_path
+from .knowledge_records import knowledge_records_for_graph
+from .io import Problem
 from .path_roles import is_test_path
 from .repositories import RepoSelectorResolution, RepoSelectorStatus, RepoTarget, resolve_repo_selector_path
-from .tasks import Problem, completion_receipt_task_path, normalize_task_id
 
 
 def _has_errors(problems: list[Problem]) -> bool:
     return any(problem.severity == "error" for problem in problems)
-
-
-def _annotation_topics(annotation: dict[str, Any] | None) -> list[str]:
-    if not annotation:
-        return []
-    topics = annotation.get("topics")
-    if not isinstance(topics, list):
-        return []
-    return sorted({str(topic) for topic in topics if str(topic).strip()})
-
-
-def _annotation_payload(annotation: dict[str, Any] | None) -> dict[str, Any]:
-    if not annotation:
-        return {}
-    payload: dict[str, Any] = {}
-    for key in ("role", "purpose", "topics", "declared_effects", "caution"):
-        if key in annotation:
-            value = annotation[key]
-            if isinstance(value, list):
-                payload[key] = sorted({str(item) for item in value if str(item).strip()})
-            else:
-                payload[key] = value
-    return payload
 
 
 def _import_provider_coverage(
@@ -166,36 +138,6 @@ def _semantic_provider_coverage(
     )
 
 
-def _language_capabilities(
-    entries: list[CodeIndexEntry],
-    results: list[SemanticProviderResult],
-) -> dict[str, Any]:
-    capabilities = graph_language_capabilities({entry.language for entry in entries})
-    for language, payload in capabilities.items():
-        if not payload.get("semantic_source"):
-            payload.update(
-                {
-                    "provider_defined": False,
-                    "providers": [],
-                    "symbols_status": "unsupported",
-                    "calls_status": "unsupported",
-                    "precise_semantics": False,
-                }
-            )
-            continue
-        language_results = [result for result in results if language in result.languages]
-        symbol_coverage = _semantic_provider_coverage("symbols", entries, results, languages={language})
-        call_coverage = _semantic_provider_coverage("calls", entries, results, languages={language})
-        payload.update(
-            {
-                "provider_defined": bool(language_results),
-                "providers": sorted(result.provider for result in language_results),
-                "symbols_status": symbol_coverage.status,
-                "calls_status": call_coverage.status,
-                "precise_semantics": bool(symbol_coverage.analyzed_paths),
-            }
-        )
-    return capabilities
 
 
 def _index_facts(entry: CodeIndexEntry) -> dict[str, Any]:
@@ -205,8 +147,6 @@ def _index_facts(entry: CodeIndexEntry) -> dict[str, Any]:
         "symbol_names": sorted(entry.symbols),
         "imports": sorted(entry.imports),
         "call_names": sorted(entry.calls),
-        "dependencies": sorted(entry.deps),
-        "observed_effects": sorted(entry.observed_effects),
         "parse_status": entry.parse_status,
         "import_occurrences": [occurrence.to_dict() for occurrence in entry.import_occurrences],
         "module_bindings": list(entry.module_bindings),
@@ -218,26 +158,8 @@ def _index_facts(entry: CodeIndexEntry) -> dict[str, Any]:
     return facts
 
 
-def _file_node(repo_id: str, entry: CodeIndexEntry, metadata: RepoMetadataFacts | None) -> GraphNode:
-    facts: dict[str, Any] = {"index": _index_facts(entry)}
-    if metadata is not None:
-        if metadata.annotation is not None:
-            facts["annotation"] = _annotation_payload(metadata.annotation)
-        if metadata.areas or metadata.policy_topics:
-            facts["policy"] = {
-                "areas": list(metadata.areas),
-                "topics": list(metadata.policy_topics),
-            }
-    return GraphNode(
-        id=file_id(repo_id, entry.path),
-        kind="file",
-        identity={
-            "repo_id": repo_id,
-            "path": entry.path,
-            "workspace_path": entry.workspace_path,
-        },
-        facts=facts,
-    )
+def _file_node(repo_id: str, entry: CodeIndexEntry) -> GraphNode:
+    return GraphNode(id=file_id(repo_id, entry.path), kind="file", identity={"repo_id": repo_id, "path": entry.path, "workspace_path": entry.workspace_path}, facts={"index": _index_facts(entry)})
 
 
 def _materialize_component_manifest(
@@ -297,14 +219,9 @@ def build_graph(
     target: RepoTarget,
     code_index_result: tuple[list[CodeIndexEntry], list[Problem], dict[str, Any]] | None = None,
     cached_semantic_results: list[SemanticProviderResult] | None = None,
-    provider_results_out: list[SemanticProviderResult] | None = None,
-    completion_inputs: tuple[CompletionGraphInput, ...] = (),
-    completion_problems: tuple[Problem, ...] = (),
     component_manifest_registry: ComponentManifestRegistry = DEFAULT_COMPONENT_MANIFEST_REGISTRY,
-    include_historical_receipt_files: bool = False,
-    include_knowledge: bool = True,
 ) -> tuple[GraphSnapshot | None, list[Problem], dict[str, Any]]:
-    entries, index_problems, index_meta = code_index_result or (([], [], {"summary": {}}) if not target.id else build_code_index(root, changed=False, limit=-1, target=target))
+    entries, index_problems, index_meta = code_index_result or build_code_index(root, changed=False, limit=-1, target=target)
     if _has_errors(index_problems):
         return None, index_problems, {"repository": target.to_dict()}
 
@@ -323,29 +240,12 @@ def build_graph(
             {"repository": target.to_dict(), "index": summary},
         )
 
-    if not target.id:
-        metadata_facts, metadata_problems, metadata_meta, metadata_absent = [], [], {}, False
-    else:
-        metadata_facts, metadata_problems, metadata_meta = read_metadata_facts(root, target=target)
-        metadata_problems, metadata_absent = without_absent_repometa(metadata_problems, repo=target.root_path)
-    problems = [*index_problems, *metadata_problems]
-    if metadata_absent:
-        problems.append(Problem("warning", "graph_metadata_unavailable", "repository metadata is not initialized; Graph source relations were materialized without metadata enrichment", f"{target.display_path}/.repometa/policy.json", "missing_repometa_policy"))
-    problems.extend(completion_problems)
-    invalid_completion_problems = tuple(
-        problem
-        for problem in completion_problems
-        if problem.code != "completion_catalogue_hot_history_partial"
-    )
-    if _has_errors(metadata_problems):
-        return None, problems, {"repository": target.to_dict()}
-
+    problems = list(index_problems)
     repo_id = target.id
-    metadata_by_path = {fact.path: fact for fact in metadata_facts}
     nodes: dict[str, GraphNode] = {
         repository_id(repo_id): GraphNode(
             id=repository_id(repo_id),
-            kind="repository" if target.id else "workspace",
+            kind="repository",
             identity=target.to_dict(),
         )
     }
@@ -354,30 +254,10 @@ def build_graph(
     def add_edge(edge: GraphEdge) -> None:
         edges[(edge.kind, edge.from_id, edge.to_id, edge.assertion, edge.source)] = edge
 
-    def receipt_file_node(path: str) -> str | None:
-        node_id = file_id(repo_id, path)
-        if node_id not in nodes and not include_historical_receipt_files:
-            return None
-        nodes.setdefault(
-            node_id,
-            GraphNode(
-                id=node_id,
-                kind="file",
-                identity={"repo_id": repo_id, "path": path, "workspace_path": f"{target.display_path}/{path}"},
-                facts={"receipt": {"present_in_current_inventory": False}},
-            ),
-        )
-        return node_id
-
-    for entry in entries:
-        file_node = _materialize_component_manifest(
-            _file_node(repo_id, entry, metadata_by_path.get(entry.path)),
-            repository_root=target.root_path,
-            registry=component_manifest_registry,
-        )
-        nodes[file_node.id] = file_node
-        add_edge(GraphEdge("CONTAINS", repository_id(repo_id), file_node.id, "observed", "code_index"))
-
+    def add_imports(
+        entry: CodeIndexEntry, *, provider: str,
+        locations: dict[str, list[dict[str, object]]] | None = None,
+    ) -> None:
         for declaration in _import_declarations(entry):
             raw_import = str(declaration["raw_import"])
             import_node_id = import_ref_id(
@@ -407,97 +287,21 @@ def build_graph(
                     },
                 ),
             )
-            add_edge(GraphEdge("DECLARES_IMPORT", file_node.id, import_node_id, "observed", "code_index"))
+            add_edge(GraphEdge("DECLARES_IMPORT", file_id(repo_id, entry.path), import_node_id, "observed", provider, {"locations": (locations or {}).get(raw_import, [])}))
 
-        metadata = metadata_by_path.get(entry.path)
-        if metadata is None:
-            continue
-        for topic in metadata.policy_topics:
-            topic_node_id = topic_id(repo_id, topic)
-            nodes.setdefault(topic_node_id, GraphNode(id=topic_node_id, kind="topic", identity={"repo_id": repo_id, "topic": topic}))
-            add_edge(GraphEdge("HAS_TOPIC", file_node.id, topic_node_id, "default", "repometa_policy"))
-        for topic in _annotation_topics(metadata.annotation):
-            topic_node_id = topic_id(repo_id, topic)
-            nodes.setdefault(topic_node_id, GraphNode(id=topic_node_id, kind="topic", identity={"repo_id": repo_id, "topic": topic}))
-            add_edge(GraphEdge("HAS_TOPIC", file_node.id, topic_node_id, "declared", "repometa_annotation"))
-
-    for completion_input in completion_inputs:
-        receipt = completion_input.receipt
-        receipt_task_id = str(receipt.get("task_id") or "")
-        if not receipt_task_id:
-            continue
-        receipt_task_path = completion_receipt_task_path(receipt)
-        task_node_id = graph_task_id(receipt_task_id)
-        nodes[task_node_id] = GraphNode(
-            id=task_node_id,
-            kind="task",
-            identity={"task_id": receipt_task_id, "repo_id": repo_id},
-            facts={
-                "receipt": {
-                    "status": str(receipt.get("status") or ""),
-                    "task_path_at_completion": receipt_task_path,
-                    "completed_at": str(receipt.get("completed_at") or ""),
-                    "content_sha256": str(receipt.get("content_sha256") or ""),
-                    "repo_evidence": receipt.get("repo_evidence") if isinstance(receipt.get("repo_evidence"), dict) else {},
-                }
-            },
+    for entry in entries:
+        file_node = _materialize_component_manifest(
+            _file_node(repo_id, entry),
+            repository_root=target.root_path,
+            registry=component_manifest_registry,
         )
-        verification = receipt.get("verification") if isinstance(receipt.get("verification"), dict) else {}
-        artifact_path = completion_input.artifact_path
-        if artifact_path:
-            artifact_node_id = artifact_id(receipt_task_id, artifact_path)
-            artifact_receipt = {
-                "content_sha256": str(receipt.get("content_sha256") or "")
-            }
-            if verification:
-                artifact_receipt["verification"] = verification
-            nodes[artifact_node_id] = GraphNode(
-                id=artifact_node_id,
-                kind="artifact",
-                identity={"task_id": receipt_task_id, "path": artifact_path},
-                facts={"receipt": artifact_receipt},
-            )
-            add_edge(GraphEdge("TASK_VERIFIED_BY", task_node_id, artifact_node_id, "recorded", "task_completion"))
-        repo_evidence = receipt.get("repo_evidence") if isinstance(receipt.get("repo_evidence"), dict) else {}
-        attribution = str(repo_evidence.get("attribution") or "none")
-        task_owns_changes = attribution == "task_working_tree"
-        raw_changes = receipt.get("changed_entries") if isinstance(receipt.get("changed_entries"), list) else []
-        for index, raw_change in enumerate(raw_changes):
-            if not isinstance(raw_change, dict):
-                continue
-            change = str(raw_change.get("change") or "")
-            path = str(raw_change.get("path") or "")
-            old_path = str(raw_change.get("old_path") or "")
-            if not change or not path:
-                continue
-            change_node_id = change_event_id(receipt_task_id, index)
-            nodes[change_node_id] = GraphNode(
-                id=change_node_id,
-                kind="change_event",
-                identity={"task_id": receipt_task_id, "index": index},
-                facts={"receipt": {"change": change, "path": path, "old_path": old_path, "attribution": attribution}},
-            )
-            add_edge(GraphEdge("TASK_RECORDED_CHANGE", task_node_id, change_node_id, "recorded", "task_completion", {"attribution": attribution}))
-            affected_file_id = receipt_file_node(path)
-            if affected_file_id is not None:
-                add_edge(GraphEdge("CHANGE_AFFECTED_FILE", change_node_id, affected_file_id, "recorded", "task_completion", {"role": "path"}))
-                if task_owns_changes:
-                    add_edge(GraphEdge("TASK_CHANGED_FILE", task_node_id, affected_file_id, "recorded", "task_completion", {"change": change, "role": "path"}))
-            if old_path:
-                old_file_id = receipt_file_node(old_path)
-                if old_file_id is not None:
-                    add_edge(GraphEdge("CHANGE_AFFECTED_FILE", change_node_id, old_file_id, "recorded", "task_completion", {"role": "old_path"}))
-                    if task_owns_changes:
-                        add_edge(GraphEdge("TASK_CHANGED_FILE", task_node_id, old_file_id, "recorded", "task_completion", {"change": change, "role": "old_path"}))
+        nodes[file_node.id] = file_node
+        add_edge(GraphEdge("CONTAINS", repository_id(repo_id), file_node.id, "observed", "code_index"))
 
-    knowledge_records, knowledge_problems = (
-        knowledge_records_for_graph(
-            root,
-            repo_id=repo_id,
-        )
-        if include_knowledge
-        else ([], [])
-    )
+        if entry.language not in {"javascript", "typescript"}:
+            add_imports(entry, provider="code_index")
+
+    knowledge_records, knowledge_problems = knowledge_records_for_graph(root, repo_id=repo_id)
     problems.extend(
         Problem("warning", "graph_knowledge_unavailable", problem.message, problem.path, problem.code)
         for problem in knowledge_problems
@@ -515,65 +319,34 @@ def build_graph(
             identity={"record_id": record_id, "repo_id": repo_id},
             facts={"record": record},
         )
-        explicit_path_refs = record.get("explicit_path_refs") if isinstance(record.get("explicit_path_refs"), list) else []
-        for path_ref in explicit_path_refs:
-            if record_status != "current":
+        applies_to = record.get("applies_to", {})
+        for raw_path in applies_to.get("paths", []):
+            if record_status != "active":
                 continue
-            if not isinstance(path_ref, dict) or path_ref.get("kind") not in {
-                KnowledgeExplicitPathKind.APPLIES_TO_PATH.value,
-                KnowledgeExplicitPathKind.SOURCE_REF.value,
-            }:
-                continue
-            if path_ref.get("role") != KnowledgeExplicitPathRole.CODE_ANCHOR.value:
-                continue
-            raw_path = str(path_ref.get("path") or "")
             resolution = resolve_repo_selector_path(
                 raw_path,
                 repository_path=target.display_path,
                 known_paths=current_paths,
             )
             if resolution.status == RepoSelectorStatus.RESOLVED:
-                add_edge(
-                    GraphEdge(
-                        "KNOWLEDGE_APPLIES_TO",
-                        record_node_id,
-                        file_id(repo_id, resolution.path),
-                        "current",
-                        "knowledge_record",
-                        {"freshness": record.get("status", "current"), "path_kind": path_ref.get("kind")},
-                    )
-                )
-            elif resolution.status == RepoSelectorStatus.AMBIGUOUS:
-                problems.append(
-                    Problem(
-                        "warning",
-                        "graph_knowledge_path_ambiguous",
-                        f"Knowledge-linked path resolves to multiple current files: {list(resolution.candidates)}",
-                        raw_path,
-                    )
-                )
-            elif resolution.status in {RepoSelectorStatus.INVALID, RepoSelectorStatus.NOT_FOUND}:
-                problems.append(
-                    Problem(
-                        "warning",
-                        "graph_knowledge_path_unresolved",
-                        "Knowledge-linked code path does not resolve to a current file",
-                        raw_path,
-                    )
-                )
-        graph_source_refs = record.get("resolved_source_refs") if isinstance(record.get("resolved_source_refs"), list) else []
-        for ref in graph_source_refs if isinstance(graph_source_refs, list) else []:
+                add_edge(GraphEdge(
+                    "KNOWLEDGE_APPLIES_TO", record_node_id,
+                    file_id(repo_id, resolution.path), "declared", "knowledge_record",
+                ))
+            else:
+                problems.append(Problem(
+                    "warning", "graph_knowledge_path_unresolved",
+                    f"Knowledge applicability path is {resolution.status.value}",
+                    raw_path,
+                ))
+        graph_source_refs = record.get("source_refs", [])
+        for ref in graph_source_refs:
             if not isinstance(ref, dict):
-                continue
-            if str(ref.get("resolution_status") or "") == "invalid_identity":
                 continue
             path = str(ref.get("path") or "")
             if not path:
                 continue
-            source_node_id = next(
-                (node.id for node in nodes.values() if node.kind == "artifact" and node.identity.get("path") == path),
-                document_id(path),
-            ) if not repo_id else document_id(path)
+            source_node_id = document_id(path)
             nodes.setdefault(
                 source_node_id,
                 GraphNode(
@@ -590,7 +363,7 @@ def build_graph(
                     source_node_id,
                     "recorded",
                     "knowledge_record",
-                    {"freshness": record.get("status", "current")},
+                    {"content_sha256": ref.get("content_sha256")},
                 )
             )
     provider_entries = semantic_provider_entries(entries)
@@ -602,8 +375,29 @@ def build_graph(
         import_resolutions=import_resolutions,
         cached_results=cached_semantic_results,
     )
-    if provider_results_out is not None:
-        provider_results_out.extend(semantic_results)
+    typescript = next((result for result in semantic_results if result.provider == "typescript_compiler"), SemanticProviderResult(provider="typescript_compiler", languages=("javascript", "typescript")))
+    import_locations: dict[str, dict[str, list[dict[str, object]]]] = {}
+    for declaration in typescript.imports:
+        import_locations.setdefault(declaration.path, {}).setdefault(declaration.module, []).append(declaration.anchor.to_dict())
+    analyzed_imports = set(typescript.import_analyzed_paths)
+    entries = [
+        replace(
+            entry, imports=sorted(import_locations.get(entry.path, {})),
+            parse_status="ok" if entry.path in analyzed_imports else "skipped",
+            parse_error="" if entry.path in analyzed_imports else "TypeScript import analysis unavailable",
+        )
+        if entry.language in {"javascript", "typescript"} and entry.classification != "excluded"
+        else entry
+        for entry in entries
+    ]
+    for entry in entries:
+        if entry.language not in {"javascript", "typescript"} or entry.classification == "excluded":
+            continue
+        node = nodes[file_id(repo_id, entry.path)]
+        nodes[node.id] = replace(node, facts={**node.facts, "index": _index_facts(entry)})
+        if entry.path in analyzed_imports:
+            add_imports(entry, provider=typescript.provider, locations=import_locations.get(entry.path))
+    import_resolutions, import_meta = resolve_code_imports(semantic_provider_entries(entries), repo=target.root_path)
     dart_semantics = next((result for result in semantic_results if result.provider == "dart_analyzer"), None)
     structured_result = build_structured_file_relations(
         target.root_path,
@@ -879,16 +673,6 @@ def build_graph(
     }
     source_payloads = {
         "code_index": [entry.to_dict() for entry in entries],
-        "repometa_annotation": [
-            {"path": fact.path, "annotation": fact.annotation}
-            for fact in metadata_facts
-            if fact.annotation is not None
-        ],
-        "repometa_policy": [
-            {"path": fact.path, "areas": list(fact.areas), "policy_topics": list(fact.policy_topics)}
-            for fact in metadata_facts
-        ],
-        "task_completion": [item.receipt for item in completion_inputs],
         "knowledge_records": knowledge_records,
         "structured_file_relations": [relation.to_dict() for relation in structured_result.relations],
         "rpc_resolutions": [resolution.to_dict() for resolution in structured_result.rpc_resolutions],
@@ -903,7 +687,6 @@ def build_graph(
         if result.provider == "dart_analyzer":
             semantic_source_payloads[f"{result.provider}_rpc"] = [fact.to_dict() for fact in result.rpc_invocations]
     source_payloads.update(semantic_source_payloads)
-    language_capabilities = _language_capabilities(entries, semantic_results)
     rpc_resolution_status = provider_coverage["rpc"].status
     if rpc_resolution_status == "complete" and any(
         resolution.outcome is RpcResolutionOutcome.INCOMPLETE
@@ -913,13 +696,11 @@ def build_graph(
     capability_completeness = {
         "source_inventory": "complete",
         "file_inventory": "complete",
-        "metadata": "unavailable" if metadata_absent else "complete",
         "imports": provider_coverage["imports"].status,
         "symbols": provider_coverage["symbols"].status,
         "calls": provider_coverage["calls"].status,
         "rpc_resolution": rpc_resolution_status,
         "structured_relations": provider_coverage["structured_relations"].status,
-        "task_history": "partial" if completion_problems else "complete",
         "knowledge": "partial" if knowledge_problems else "complete",
     }
     overall_completeness = "complete" if all(value == "complete" for value in capability_completeness.values()) else "partial"
@@ -927,9 +708,6 @@ def build_graph(
         repository=target.to_dict(),
         sources=[
             {"kind": "code_index", "assertion": "observed", "digest": digest_data(source_payloads["code_index"])},
-            {"kind": "repometa_annotation", "assertion": "declared", "digest": digest_data(source_payloads["repometa_annotation"])},
-            {"kind": "repometa_policy", "assertion": "default", "digest": digest_data(source_payloads["repometa_policy"])},
-            {"kind": "task_completion", "assertion": "recorded", "digest": digest_data(source_payloads["task_completion"])},
             {"kind": "knowledge_records", "assertion": "current", "digest": digest_data(source_payloads["knowledge_records"])},
             {"kind": "structured_file_relations", "assertion": "resolved", "digest": digest_data(source_payloads["structured_file_relations"])},
             {"kind": "rpc_resolutions", "assertion": "resolved", "digest": digest_data(source_payloads["rpc_resolutions"])},
@@ -946,10 +724,6 @@ def build_graph(
             "capabilities": capability_completeness,
             "inventory_complete": True,
             "identity_collisions": 0,
-            "metadata_store_valid": True,
-            "receipt_set_complete": not invalid_completion_problems,
-            "invalid_completion_receipts": len(invalid_completion_problems),
-            "receipt_problems": [problem.to_dict() for problem in invalid_completion_problems],
             "index_truncated": False,
             "code_facts_complete": parse_error_count == 0,
             "parse_error_count": parse_error_count,
@@ -959,21 +733,18 @@ def build_graph(
                 for failure in result.failures
             ],
             "provider_coverage": {name: coverage.to_dict() for name, coverage in sorted(provider_coverage.items())},
-            "language_capabilities": language_capabilities,
         },
         nodes=list(nodes.values()),
         edges=list(edges.values()),
-        capabilities=["repository", "file", "import_ref", "topic", "task", "change_event", "artifact", "document", "knowledge", "symbol", "anchor", "import_resolution", "same_file_calls", "cross_file_import_calls", "direct_tests", "structured_file_relations", "rpc_resolution", "language_capabilities"],
+        capabilities=["repository", "file", "import_ref", "document", "knowledge", "symbol", "anchor", "import_resolution", "same_file_calls", "cross_file_import_calls", "direct_tests", "structured_file_relations", "rpc_resolution"],
     ).with_digest()
     return snapshot, problems, {
         "repository": target.to_dict(),
         "index": summary,
-        "metadata": metadata_meta.get("summary", {}),
         "semantic_providers": [result.to_meta() for result in semantic_results],
         "import_resolvers": import_meta,
         "structured_relations": structured_result.to_meta(),
         "provider_coverage": {name: coverage.to_dict() for name, coverage in sorted(provider_coverage.items())},
-        "language_capabilities": language_capabilities,
     }
 
 
@@ -1007,13 +778,6 @@ def _node_summary(node: GraphNode | None, *, symbol_paths: dict[str, str] | None
         summary["language"] = node.identity.get("language")
         summary["importer_path"] = node.identity.get("importer_path")
         summary["form"] = node.identity.get("form")
-    elif node.kind == "topic":
-        summary["topic"] = node.identity.get("topic")
-    elif node.kind == "task":
-        summary["task_id"] = node.identity.get("task_id")
-    elif node.kind == "artifact":
-        summary["task_id"] = node.identity.get("task_id")
-        summary["path"] = node.identity.get("path")
     elif node.kind == "document":
         summary["path"] = node.identity.get("path")
     elif node.kind == "knowledge":
@@ -1021,187 +785,12 @@ def _node_summary(node: GraphNode | None, *, symbol_paths: dict[str, str] | None
         summary["record_id"] = node.identity.get("record_id")
         summary["knowledge_kind"] = record.get("kind")
         summary["status"] = record.get("status")
-        summary["title"] = record.get("title")
-    elif node.kind == "change_event":
-        summary["task_id"] = node.identity.get("task_id")
-        summary["change_index"] = node.identity.get("index")
+        summary["claim"] = record.get("claim")
     return summary
 
 
-def relationship_candidates_for_paths(
-    snapshot: GraphSnapshot,
-    paths: list[str] | set[str] | tuple[str, ...],
-    *,
-    source_fact_ids: dict[str, set[str]] | None = None,
-    excluded_paths: set[str] | None = None,
-) -> list[dict[str, Any]]:
-    """Project unresolved typed relationships without promoting them to Graph edges."""
-    normalized_excluded_paths = {
-        normalized
-        for path in (excluded_paths or set())
-        if (normalized := normalize_repo_path(path))
-    }
-    wanted_paths = {
-        normalized
-        for path in paths
-        if (normalized := normalize_repo_path(path)) and normalized not in normalized_excluded_paths
-    }
-    normalized_source_fact_ids = (
-        {
-            normalize_repo_path(path): {str(fact_id) for fact_id in fact_ids if str(fact_id)}
-            for path, fact_ids in source_fact_ids.items()
-            if normalize_repo_path(path)
-        }
-        if source_fact_ids is not None
-        else None
-    )
-    candidates: list[dict[str, Any]] = []
-    for node in snapshot.nodes:
-        path = str(node.identity.get("path") or "")
-        if node.kind != "file" or path not in wanted_paths:
-            continue
-        rpc = node.facts.get("rpc") if isinstance(node.facts.get("rpc"), dict) else {}
-        source_facts = rpc.get("source_facts") if isinstance(rpc.get("source_facts"), list) else []
-        facts_by_id = {
-            str(item.get("fact_id") or ""): item
-            for item in source_facts
-            if isinstance(item, dict) and str(item.get("fact_id") or "")
-        }
-        resolutions = rpc.get("resolutions") if isinstance(rpc.get("resolutions"), list) else []
-        for resolution in resolutions:
-            if not isinstance(resolution, dict):
-                continue
-            fact_id_value = str(resolution.get("fact_id") or "")
-            if normalized_source_fact_ids is not None and fact_id_value not in normalized_source_fact_ids.get(path, set()):
-                continue
-            fact = facts_by_id.get(fact_id_value)
-            raw_targets = resolution.get("candidates") if isinstance(resolution.get("candidates"), list) else []
-            if (
-                fact is None
-                or not raw_targets
-                or resolution.get("candidate_compatibility") != "compatible"
-                or resolution.get("outcome") == "linked"
-            ):
-                continue
-            routine = fact.get("routine") if isinstance(fact.get("routine"), dict) else {}
-            runtime_name = str(routine.get("value") or "") if routine.get("status") == "known" else ""
-            if not runtime_name:
-                continue
-            anchor = fact.get("anchor") if isinstance(fact.get("anchor"), dict) else {}
-            targets: list[dict[str, Any]] = []
-            continuations: list[dict[str, Any]] = []
-            seen_paths: set[str] = set()
-            for raw_target in raw_targets:
-                if not isinstance(raw_target, dict):
-                    continue
-                target_path = normalize_repo_path(str(raw_target.get("path") or ""))
-                target_routine = str(raw_target.get("routine") or "")
-                target_line = int(raw_target.get("line") or 0)
-                if (
-                    not target_path
-                    or target_path in normalized_excluded_paths
-                    or not target_routine
-                    or target_line < 1
-                ):
-                    continue
-                targets.append(
-                    {
-                        "identity": {"kind": "sql_routine", "value": target_routine},
-                        "path": target_path,
-                        "location": {"line": target_line},
-                        "parameter_names": [str(value) for value in raw_target.get("parameter_names", []) if isinstance(value, str)],
-                        "parameter_types": [str(value) for value in raw_target.get("parameter_types", []) if isinstance(value, str)],
-                        "required_parameter_names": [
-                            str(value)
-                            for value in raw_target.get("required_parameter_names", [])
-                            if isinstance(value, str)
-                        ],
-                    }
-                )
-                if target_path not in seen_paths and len(continuations) < 4:
-                    seen_paths.add(target_path)
-                    continuations.append(
-                        {
-                            "selector": {"kind": "file", "value": target_path},
-                            "query_types": ["file", "impact_file"],
-                            "actions": ["workspace.open", "graph.file", "graph.impact_file"],
-                        }
-                    )
-            if not targets:
-                continue
-            targets.sort(key=lambda item: (str(item["path"]), int(item["location"]["line"]), str(item["identity"]["value"])))
-            params = fact.get("params") if isinstance(fact.get("params"), dict) else {}
-            candidates.append(
-                {
-                    "candidate_id": fact_id_value,
-                    "kind": "sql_rpc_dependency",
-                    "status": "non_authoritative",
-                    "authoritative": False,
-                    "source": {
-                        "path": path,
-                        "location": {
-                            key: anchor[key]
-                            for key in ("start_line", "start_col", "end_line", "end_col")
-                            if key in anchor
-                        },
-                        "provider": str(fact.get("provider") or ""),
-                        "runtime_identity": {"kind": "rpc_routine", "value": runtime_name},
-                        "parameter_names": [str(value) for value in params.get("known_names", []) if isinstance(value, str)],
-                    },
-                    "resolution": {
-                        "outcome": str(resolution.get("outcome") or "incomplete"),
-                        "reason_code": str(resolution.get("reason_code") or "relationship_evidence_incomplete"),
-                    },
-                    "targets": targets,
-                    "target_count": len(targets),
-                    "targets_truncated": False,
-                    "continuations": continuations,
-                }
-            )
-    return sorted(
-        candidates,
-        key=lambda item: (
-            str((item.get("source") or {}).get("path") or ""),
-            int(((item.get("source") or {}).get("location") or {}).get("start_line") or 0),
-            str(item.get("candidate_id") or ""),
-        ),
-    )
 
 
-def compact_relationship_candidates(
-    candidates: Any,
-    *,
-    candidate_limit: int = 3,
-    target_limit: int = 3,
-) -> dict[str, Any]:
-    values = [item for item in candidates if isinstance(item, dict)] if isinstance(candidates, list) else []
-    items: list[dict[str, Any]] = []
-    for candidate in values[:candidate_limit]:
-        raw_targets = candidate.get("targets") if isinstance(candidate.get("targets"), list) else []
-        targets = [target for target in raw_targets[:target_limit] if isinstance(target, dict)]
-        visible_paths = {str(target.get("path") or "") for target in targets if str(target.get("path") or "")}
-        raw_continuations = candidate.get("continuations") if isinstance(candidate.get("continuations"), list) else []
-        continuations = [
-            continuation
-            for continuation in raw_continuations
-            if isinstance(continuation, dict)
-            and isinstance(continuation.get("selector"), dict)
-            and str(continuation["selector"].get("value") or "") in visible_paths
-        ][:target_limit]
-        items.append(
-            {
-                **candidate,
-                "targets": targets,
-                "target_count": len(raw_targets),
-                "targets_truncated": len(raw_targets) > len(targets),
-                "continuations": continuations,
-            }
-        )
-    return {
-        "items": items,
-        "total_count": len(values),
-        "truncated": len(values) > len(items),
-    }
 
 
 def _symbol_file_id(snapshot: GraphSnapshot, symbol_node_id: str) -> str:
@@ -1269,16 +858,6 @@ def _query_warnings(snapshot: GraphSnapshot) -> list[dict[str, str]]:
                 "message": f"code index has {snapshot.completeness.get('parse_error_count', 0)} parse error(s); query results may be incomplete",
             }
         )
-    for problem in snapshot.completeness.get("receipt_problems", []):
-        if not isinstance(problem, dict):
-            continue
-        warning = {
-            "code": str(problem.get("code") or "invalid_completion_receipt"),
-            "message": str(problem.get("message") or "completion receipt is invalid"),
-        }
-        if problem.get("path"):
-            warning["path"] = str(problem["path"])
-        warnings.append(warning)
     for failure in snapshot.completeness.get("provider_failures", []):
         if isinstance(failure, dict):
             warnings.append(
@@ -1355,7 +934,7 @@ def _file_neighborhood_edges(snapshot: GraphSnapshot, file_node_id: str) -> list
     related_entity_ids = {
         edge.from_id if edge.to_id == file_node_id else edge.to_id
         for edge in direct
-        if edge.kind in {"TASK_CHANGED_FILE", "KNOWLEDGE_APPLIES_TO"}
+        if edge.kind in {"KNOWLEDGE_APPLIES_TO"}
     }
     second_hop = [
         edge
@@ -1373,7 +952,7 @@ def _file_query_path_edges(snapshot: GraphSnapshot, edges: list[GraphEdge], file
         for edge in snapshot.edges
         if edge.kind == "DEFINES" and edge.from_id == file_node_id
     }
-    direct_kinds = {"IMPORTS_FILE", "TESTS_FILE", STRUCTURED_EDGE_KIND, "TASK_CHANGED_FILE", "KNOWLEDGE_APPLIES_TO"}
+    direct_kinds = {"IMPORTS_FILE", "TESTS_FILE", STRUCTURED_EDGE_KIND, "KNOWLEDGE_APPLIES_TO"}
     selected: list[tuple[GraphEdge, str]] = []
     for edge in edges:
         if edge.kind in direct_kinds and file_node_id in {edge.from_id, edge.to_id}:
@@ -1381,695 +960,6 @@ def _file_query_path_edges(snapshot: GraphSnapshot, edges: list[GraphEdge], file
         elif edge.kind == "CALLS" and (edge.from_id in symbol_ids or edge.to_id in symbol_ids):
             selected.append((edge, "call relation involving a symbol defined by selected file"))
     return selected
-
-
-@dataclass(frozen=True)
-class _ContextEdgePolicy:
-    inbound: bool
-    outbound: bool
-    max_depth: int
-
-
-_CONTEXT_GRAPH_MODE_POLICIES: dict[str, dict[str, _ContextEdgePolicy]] = {
-    "auto": {
-        "CALLS": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-        "IMPORTS_FILE": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-        "TESTS_FILE": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-        STRUCTURED_EDGE_KIND: _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-    },
-    "code_location": {
-        "CALLS": _ContextEdgePolicy(inbound=False, outbound=True, max_depth=1),
-        "IMPORTS_FILE": _ContextEdgePolicy(inbound=False, outbound=True, max_depth=1),
-        "TESTS_FILE": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-        STRUCTURED_EDGE_KIND: _ContextEdgePolicy(inbound=False, outbound=True, max_depth=1),
-    },
-    "call_impact": {
-        "CALLS": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=2),
-        "TESTS_FILE": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-    },
-    "file_impact": {
-        "CALLS": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-        "IMPORTS_FILE": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=2),
-        "TESTS_FILE": _ContextEdgePolicy(inbound=True, outbound=True, max_depth=1),
-        STRUCTURED_EDGE_KIND: _ContextEdgePolicy(inbound=True, outbound=True, max_depth=2),
-    },
-}
-
-
-@dataclass(frozen=True)
-class _ContextProjectionIndex:
-    nodes: dict[str, GraphNode]
-    symbols_by_file: dict[str, list[str]]
-    symbol_files: dict[str, str]
-    anchor_nodes_by_symbol: dict[str, GraphNode]
-    file_relations_by_file: dict[str, list[tuple[GraphEdge, str, str, str, str]]]
-    call_relations_by_symbol: dict[str, list[tuple[GraphEdge, str, str, str, str]]]
-    changes_by_file: dict[str, list[str]]
-    tasks_by_change: dict[str, list[tuple[str, GraphEdge]]]
-    changed_files_by_task: dict[str, list[tuple[str, GraphEdge]]]
-    artifact_paths_by_task: dict[str, set[str]]
-
-
-def _build_context_projection_index(snapshot: GraphSnapshot) -> _ContextProjectionIndex:
-    nodes = _node_by_id(snapshot)
-    symbols_by_file: dict[str, list[str]] = {}
-    symbol_files: dict[str, str] = {}
-    anchor_nodes_by_symbol: dict[str, GraphNode] = {}
-    file_relations: list[tuple[GraphEdge, str, str, str, str]] = []
-    call_edges: list[GraphEdge] = []
-    changes_by_file: dict[str, list[str]] = {}
-    tasks_by_change: dict[str, list[tuple[str, GraphEdge]]] = {}
-    changed_files_by_task: dict[str, list[tuple[str, GraphEdge]]] = {}
-    artifact_paths_by_task: dict[str, set[str]] = {}
-
-    for edge in snapshot.edges:
-        if edge.kind == "DEFINES":
-            symbols_by_file.setdefault(edge.from_id, []).append(edge.to_id)
-            symbol_files[edge.to_id] = edge.from_id
-        elif edge.kind == "ANCHORS" and edge.to_id in nodes:
-            anchor_nodes_by_symbol[edge.from_id] = nodes[edge.to_id]
-        elif edge.kind in {"IMPORTS_FILE", "TESTS_FILE", STRUCTURED_EDGE_KIND}:
-            file_relations.append((edge, edge.from_id, edge.to_id, "", ""))
-        elif edge.kind == "CALLS":
-            call_edges.append(edge)
-        elif edge.kind == "CHANGE_AFFECTED_FILE":
-            changes_by_file.setdefault(edge.to_id, []).append(edge.from_id)
-        elif edge.kind == "TASK_RECORDED_CHANGE":
-            tasks_by_change.setdefault(edge.to_id, []).append((edge.from_id, edge))
-        elif edge.kind == "TASK_CHANGED_FILE":
-            changed_files_by_task.setdefault(edge.from_id, []).append((edge.to_id, edge))
-        elif edge.kind == "TASK_VERIFIED_BY":
-            artifact_node = nodes.get(edge.to_id)
-            artifact_path = str(artifact_node.identity.get("path") or "") if artifact_node is not None else ""
-            if artifact_node is not None and artifact_node.kind == "artifact" and artifact_path:
-                artifact_paths_by_task.setdefault(edge.from_id, set()).add(artifact_path)
-
-    for edge in call_edges:
-        from_file_id = symbol_files.get(edge.from_id, "")
-        to_file_id = symbol_files.get(edge.to_id, "")
-        if from_file_id and to_file_id:
-            file_relations.append((edge, from_file_id, to_file_id, edge.from_id, edge.to_id))
-
-    file_relations_by_file: dict[str, list[tuple[GraphEdge, str, str, str, str]]] = {}
-    call_relations_by_symbol: dict[str, list[tuple[GraphEdge, str, str, str, str]]] = {}
-    for relation in file_relations:
-        edge, from_file_id, to_file_id, from_symbol_id, to_symbol_id = relation
-        file_relations_by_file.setdefault(from_file_id, []).append(relation)
-        if to_file_id != from_file_id:
-            file_relations_by_file.setdefault(to_file_id, []).append(relation)
-        if edge.kind == "CALLS" and from_symbol_id and to_symbol_id:
-            call_relations_by_symbol.setdefault(from_symbol_id, []).append(relation)
-            if to_symbol_id != from_symbol_id:
-                call_relations_by_symbol.setdefault(to_symbol_id, []).append(relation)
-    for relations in file_relations_by_file.values():
-        relations.sort(key=lambda item: _edge_key(item[0]))
-    for relations in call_relations_by_symbol.values():
-        relations.sort(key=lambda item: _edge_key(item[0]))
-    for changed_files in changed_files_by_task.values():
-        changed_files.sort(key=lambda item: _edge_key(item[1]))
-
-    return _ContextProjectionIndex(
-        nodes=nodes,
-        symbols_by_file=symbols_by_file,
-        symbol_files=symbol_files,
-        anchor_nodes_by_symbol=anchor_nodes_by_symbol,
-        file_relations_by_file=file_relations_by_file,
-        call_relations_by_symbol=call_relations_by_symbol,
-        changes_by_file=changes_by_file,
-        tasks_by_change=tasks_by_change,
-        changed_files_by_task=changed_files_by_task,
-        artifact_paths_by_task=artifact_paths_by_task,
-    )
-
-
-def build_context_projection_index(snapshot: GraphSnapshot) -> _ContextProjectionIndex:
-    """Build the shared index used by Context support scoring and traversal."""
-    return _build_context_projection_index(snapshot)
-
-
-def context_path_support_profiles(
-    snapshot: GraphSnapshot,
-    *,
-    paths: set[str],
-    excluded_paths: set[str] | None = None,
-    projection_index: _ContextProjectionIndex | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Summarize fresh typed cross-file support without performing Graph traversal."""
-    index = projection_index or build_context_projection_index(snapshot)
-    repo_id = str(snapshot.repository.get("id") or "")
-    excluded = {normalize_repo_path(path) for path in (excluded_paths or set()) if normalize_repo_path(path)}
-    candidate_paths = {
-        path
-        for raw_path in paths
-        if (path := normalize_repo_path(raw_path)) and path not in excluded
-    }
-    profiles: dict[str, dict[str, Any]] = {}
-    for path in sorted(candidate_paths):
-        current_file_id = file_id(repo_id, path)
-        relations: dict[
-            tuple[str, str, str, str, str],
-            tuple[GraphEdge, str, str, str, str],
-        ] = {}
-        for edge, from_file_id, to_file_id, from_symbol_id, to_symbol_id in index.file_relations_by_file.get(current_file_id, []):
-            from_node = index.nodes.get(from_file_id)
-            to_node = index.nodes.get(to_file_id)
-            from_path = normalize_repo_path(str(from_node.identity.get("path") or "")) if from_node is not None else ""
-            to_path = normalize_repo_path(str(to_node.identity.get("path") or "")) if to_node is not None else ""
-            if not from_path or not to_path or from_path == to_path:
-                continue
-            if from_path in excluded or to_path in excluded:
-                continue
-            relations[_edge_key(edge)] = (
-                edge,
-                from_path,
-                to_path,
-                from_symbol_id,
-                to_symbol_id,
-            )
-        if not relations:
-            continue
-        values = list(relations.values())
-        candidate_neighbors = {
-            to_path if from_path == path else from_path
-            for _edge, from_path, to_path, _from_symbol_id, _to_symbol_id in values
-            if (to_path if from_path == path else from_path) in candidate_paths
-        }
-        candidate_connections = [
-            {
-                "edge": edge.kind,
-                "from_path": from_path,
-                "to_path": to_path,
-                **({"from_id": from_symbol_id} if from_symbol_id else {}),
-                **({"to_id": to_symbol_id} if to_symbol_id else {}),
-                "assertion": edge.assertion,
-                "provider": edge.source,
-            }
-            for edge, from_path, to_path, from_symbol_id, to_symbol_id in values
-            if from_path in candidate_paths and to_path in candidate_paths
-        ]
-        profiles[path] = {
-            "direct_relation_count": len(values),
-            "direct_test_count": sum(
-                1
-                for edge, _from_path, _to_path, _from_symbol_id, _to_symbol_id in values
-                if edge.kind == "TESTS_FILE"
-            ),
-            "candidate_neighbor_count": len(candidate_neighbors),
-            "candidate_neighbor_paths": sorted(candidate_neighbors),
-            "candidate_connection_count": len(candidate_connections),
-            "candidate_connections": candidate_connections,
-            "incoming_relation_count": sum(
-                1
-                for _edge, _from_path, to_path, _from_symbol_id, _to_symbol_id in values
-                if to_path == path
-            ),
-            "outgoing_relation_count": sum(
-                1
-                for _edge, from_path, _to_path, _from_symbol_id, _to_symbol_id in values
-                if from_path == path
-            ),
-            "relation_kinds": sorted(
-                {
-                    edge.kind
-                    for edge, _from_path, _to_path, _from_symbol_id, _to_symbol_id in values
-                }
-            ),
-        }
-    return profiles
-
-
-def _context_anchor_symbol_ids(
-    *,
-    repo_id: str,
-    index: _ContextProjectionIndex,
-    anchors: list[GraphContextAnchor],
-) -> dict[tuple[str, str, str, int, int, str, str], set[str]]:
-    resolved: dict[tuple[str, str, str, int, int, str, str], set[str]] = {}
-    for anchor in anchors:
-        if anchor.kind != GraphContextAnchorKind.SYMBOL:
-            continue
-        current_file_id = file_id(repo_id, anchor.path)
-        if anchor.provider and anchor.provider_symbol_id:
-            symbol_node_id = symbol_id(repo_id, anchor.provider, anchor.provider_symbol_id)
-            symbol_node = index.nodes.get(symbol_node_id)
-            source_anchor = index.anchor_nodes_by_symbol.get(symbol_node_id)
-            if (
-                symbol_node is not None
-                and source_anchor is not None
-                and index.symbol_files.get(symbol_node_id) == current_file_id
-                and str(source_anchor.identity.get("path") or "") == anchor.path
-                and (
-                    not anchor.line_start
-                    or int(source_anchor.identity.get("start_line") or 0) == anchor.line_start
-                )
-                and (
-                    not anchor.line_end
-                    or int(source_anchor.identity.get("end_line") or 0) == anchor.line_end
-                )
-            ):
-                resolved[anchor.key()] = {symbol_node_id}
-            continue
-        for symbol_node_id in index.symbols_by_file.get(current_file_id, []):
-            symbol_node = index.nodes.get(symbol_node_id)
-            source_anchor = index.anchor_nodes_by_symbol.get(symbol_node_id)
-            if symbol_node is None or source_anchor is None:
-                continue
-            provider = symbol_node.facts.get("provider") if isinstance(symbol_node.facts.get("provider"), dict) else {}
-            label = str(provider.get("qualified_name") or provider.get("name") or "")
-            if anchor.symbol and label != anchor.symbol:
-                continue
-            if str(source_anchor.identity.get("path") or "") != anchor.path:
-                continue
-            if anchor.line_start and int(source_anchor.identity.get("start_line") or 0) != anchor.line_start:
-                continue
-            if anchor.line_end and int(source_anchor.identity.get("end_line") or 0) != anchor.line_end:
-                continue
-            resolved.setdefault(anchor.key(), set()).add(symbol_node_id)
-    return resolved
-
-
-def project_context_neighborhood(
-    snapshot: GraphSnapshot,
-    *,
-    anchors: list[GraphContextAnchor],
-    mode: str,
-    max_relations: int = 128,
-    max_history: int = 5,
-    excluded_candidate_paths: set[str] | None = None,
-    projection_index: _ContextProjectionIndex | None = None,
-    component_data: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Project bounded, mode-specific relations around typed Context anchors."""
-    repo_id = str(snapshot.repository.get("id") or "")
-    index = projection_index or build_context_projection_index(snapshot)
-    nodes = index.nodes
-    mode_policy = _CONTEXT_GRAPH_MODE_POLICIES.get(mode)
-    if mode_policy is None:
-        raise ValueError(f"unsupported Context Graph projection mode: {mode}")
-    normalized_anchors: list[GraphContextAnchor] = []
-    unresolved_anchors: list[GraphContextAnchor] = []
-    seen_anchor_keys: set[tuple[str, str, str, int, int, str, str]] = set()
-    for raw_anchor in anchors:
-        normalized = normalize_repo_path(raw_anchor.path)
-        anchor = GraphContextAnchor(
-            kind=raw_anchor.kind,
-            path=normalized or raw_anchor.path,
-            symbol=raw_anchor.symbol,
-            line_start=raw_anchor.line_start,
-            line_end=raw_anchor.line_end,
-            provider=raw_anchor.provider,
-            provider_symbol_id=raw_anchor.provider_symbol_id,
-        )
-        if anchor.key() in seen_anchor_keys:
-            continue
-        seen_anchor_keys.add(anchor.key())
-        if not normalized or not is_current_file_node(nodes.get(file_id(repo_id, normalized))):
-            unresolved_anchors.append(anchor)
-            continue
-        normalized_anchors.append(anchor)
-    anchored_symbol_ids = _context_anchor_symbol_ids(
-        repo_id=repo_id,
-        index=index,
-        anchors=normalized_anchors,
-    )
-    resolved_anchors: list[GraphContextAnchor] = []
-    ambiguous_anchors: list[GraphContextAnchor] = []
-    normalized_seeds: list[str] = []
-    for anchor in normalized_anchors:
-        current_file_id = file_id(repo_id, anchor.path)
-        if anchor.kind == GraphContextAnchorKind.SYMBOL:
-            symbol_count = len(anchored_symbol_ids.get(anchor.key(), set()))
-            if symbol_count == 0:
-                unresolved_anchors.append(anchor)
-                continue
-            if symbol_count > 1:
-                ambiguous_anchors.append(anchor)
-                continue
-        resolved_anchors.append(anchor)
-        if anchor.path not in normalized_seeds:
-            normalized_seeds.append(anchor.path)
-    seed_ids = {file_id(repo_id, path) for path in normalized_seeds}
-
-    symbol_paths = {
-        symbol_id_value: str(nodes[file_node_id].identity.get("path") or "")
-        for symbol_id_value, file_node_id in index.symbol_files.items()
-        if file_node_id in nodes and str(nodes[file_node_id].identity.get("path") or "")
-    }
-
-    relations_by_key: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
-    related_paths: set[str] = set()
-
-    def add_relation(
-        *,
-        edge: GraphEdge,
-        from_file_id: str,
-        to_file_id: str,
-        from_symbol_id: str = "",
-        to_symbol_id: str = "",
-        distance: int,
-        origin_file_distances: dict[str, int],
-    ) -> bool:
-        from_node = nodes.get(from_file_id)
-        to_node = nodes.get(to_file_id)
-        if from_node is None or to_node is None:
-            return False
-        from_path = str(from_node.identity.get("path") or "")
-        to_path = str(to_node.identity.get("path") or "")
-        if not from_path or not to_path:
-            return False
-        key = _edge_key(edge)
-        if from_file_id not in seed_ids:
-            related_paths.add(from_path)
-        if to_file_id not in seed_ids:
-            related_paths.add(to_path)
-        origin_distances = {
-            str(nodes[origin_id].identity.get("path") or ""): max(1, int(origin_distance))
-            for origin_id, origin_distance in origin_file_distances.items()
-            if origin_id in nodes and str(nodes[origin_id].identity.get("path") or "")
-        }
-        existing = relations_by_key.get(key)
-        if existing is not None:
-            merged_origin_distances = {
-                str(path): max(1, int(origin_distance))
-                for path, origin_distance in (
-                    existing.get("origin_distances")
-                    if isinstance(existing.get("origin_distances"), dict)
-                    else {}
-                ).items()
-            }
-            for path, origin_distance in origin_distances.items():
-                merged_origin_distances[path] = min(
-                    merged_origin_distances.get(path, origin_distance),
-                    origin_distance,
-                )
-            existing["origin_paths"] = sorted(merged_origin_distances)
-            existing["origin_distances"] = {
-                path: merged_origin_distances[path] for path in sorted(merged_origin_distances)
-            }
-            existing["distance"] = min(int(existing.get("distance") or distance), distance)
-            return True
-        if len(relations_by_key) >= max_relations:
-            return False
-        relation: dict[str, Any] = {
-            "from_path": from_path,
-            "edge": edge.kind,
-            "to_path": to_path,
-            "from_id": edge.from_id,
-            "to_id": edge.to_id,
-            "assertion": edge.assertion,
-            "provider": edge.source,
-            "distance": distance,
-            "origin_paths": sorted(origin_distances),
-            "origin_distances": {
-                path: origin_distances[path] for path in sorted(origin_distances)
-            },
-        }
-        if edge.facts:
-            relation["facts"] = edge.facts
-        if from_symbol_id:
-            relation["from_symbol"] = _node_summary(nodes.get(from_symbol_id), symbol_paths=symbol_paths)
-        if to_symbol_id:
-            relation["to_symbol"] = _node_summary(nodes.get(to_symbol_id), symbol_paths=symbol_paths)
-        relations_by_key[key] = relation
-        return True
-
-    file_seed_ids = {
-        file_id(repo_id, anchor.path)
-        for anchor in resolved_anchors
-        if anchor.kind == GraphContextAnchorKind.FILE
-    }
-    symbol_seed_origins: dict[str, set[str]] = {}
-    for anchor in resolved_anchors:
-        if anchor.kind != GraphContextAnchorKind.SYMBOL:
-            continue
-        origin_file_id = file_id(repo_id, anchor.path)
-        for symbol_node_id in anchored_symbol_ids.get(anchor.key(), set()):
-            symbol_seed_origins.setdefault(symbol_node_id, set()).add(origin_file_id)
-
-    frontier: dict[str, set[str]] = {seed_id: {seed_id} for seed_id in file_seed_ids}
-    seen_origins_by_file: dict[str, set[str]] = {
-        seed_id: {seed_id} for seed_id in file_seed_ids
-    }
-    relation_priority = {"TESTS_FILE": 0, "IMPORTS_FILE": 1, STRUCTURED_EDGE_KIND: 2, "CALLS": 3}
-    max_depth = max((policy.max_depth for policy in mode_policy.values()), default=0)
-    for distance in range(1, max_depth + 1):
-        candidate_relations: dict[
-            tuple[str, str, str, str, str],
-            tuple[GraphEdge, str, str, str, str],
-        ] = {}
-        for frontier_file_id in frontier:
-            for relation in index.file_relations_by_file.get(frontier_file_id, []):
-                candidate_relations.setdefault(_edge_key(relation[0]), relation)
-
-        eligible: list[
-            tuple[GraphEdge, str, str, str, str, set[str], set[str]]
-        ] = []
-        for relation in candidate_relations.values():
-            edge, from_file_id, to_file_id, from_symbol_id, to_symbol_id = relation
-            edge_policy = mode_policy.get(edge.kind)
-            if edge_policy is None or distance > edge_policy.max_depth:
-                continue
-            outbound_origins = (
-                set(frontier.get(from_file_id, set())) if edge_policy.outbound else set()
-            )
-            inbound_origins = (
-                set(frontier.get(to_file_id, set())) if edge_policy.inbound else set()
-            )
-            if outbound_origins or inbound_origins:
-                eligible.append((*relation, outbound_origins, inbound_origins))
-        eligible.sort(
-            key=lambda item: (
-                relation_priority.get(item[0].kind, 9),
-                0 if item[5] else 1,
-                0 if item[1] == item[2] else 1,
-                str(nodes.get(item[1]).identity.get("path") if nodes.get(item[1]) is not None else ""),
-                str(nodes.get(item[2]).identity.get("path") if nodes.get(item[2]) is not None else ""),
-                item[0].from_id,
-                item[0].to_id,
-            )
-        )
-        next_frontier: dict[str, set[str]] = {}
-        for edge, from_file_id, to_file_id, from_symbol_id, to_symbol_id, outbound_origins, inbound_origins in eligible:
-            relation_origins = outbound_origins | inbound_origins
-            accepted = add_relation(
-                edge=edge,
-                from_file_id=from_file_id,
-                to_file_id=to_file_id,
-                from_symbol_id=from_symbol_id,
-                to_symbol_id=to_symbol_id,
-                distance=distance,
-                origin_file_distances={origin_id: distance for origin_id in relation_origins},
-            )
-            if not accepted:
-                continue
-            for destination_file_id, propagating_origins in (
-                (from_file_id, inbound_origins),
-                (to_file_id, outbound_origins),
-            ):
-                seen_origins = seen_origins_by_file.setdefault(destination_file_id, set())
-                new_origins = propagating_origins - seen_origins
-                if not new_origins:
-                    continue
-                seen_origins.update(new_origins)
-                next_frontier.setdefault(destination_file_id, set()).update(new_origins)
-        frontier = next_frontier
-        if not frontier:
-            break
-
-    test_policy = mode_policy.get("TESTS_FILE")
-    if test_policy is not None and test_policy.max_depth >= 1:
-        for symbol_node_id, origin_file_ids in sorted(symbol_seed_origins.items()):
-            symbol_file_id = index.symbol_files.get(symbol_node_id, "")
-            if not symbol_file_id:
-                continue
-            for edge, from_file_id, to_file_id, from_symbol_id, to_symbol_id in index.file_relations_by_file.get(symbol_file_id, []):
-                if edge.kind != "TESTS_FILE" or from_symbol_id or to_symbol_id:
-                    continue
-                traversable = bool(
-                    (test_policy.outbound and from_file_id == symbol_file_id)
-                    or (test_policy.inbound and to_file_id == symbol_file_id)
-                )
-                if not traversable:
-                    continue
-                add_relation(
-                    edge=edge,
-                    from_file_id=from_file_id,
-                    to_file_id=to_file_id,
-                    distance=1,
-                    origin_file_distances={origin_id: 1 for origin_id in origin_file_ids},
-                )
-
-    call_policy = mode_policy.get("CALLS")
-    symbol_frontier = {symbol_node_id: set(origins) for symbol_node_id, origins in symbol_seed_origins.items()}
-    seen_origins_by_symbol = {
-        symbol_node_id: set(origins) for symbol_node_id, origins in symbol_seed_origins.items()
-    }
-    for distance in range(1, (call_policy.max_depth if call_policy is not None else 0) + 1):
-        candidate_relations: dict[
-            tuple[str, str, str, str, str],
-            tuple[GraphEdge, str, str, str, str],
-        ] = {}
-        for frontier_symbol_id in symbol_frontier:
-            for relation in index.call_relations_by_symbol.get(frontier_symbol_id, []):
-                candidate_relations.setdefault(_edge_key(relation[0]), relation)
-
-        eligible_symbol_relations: list[
-            tuple[GraphEdge, str, str, str, str, set[str], set[str]]
-        ] = []
-        for relation in candidate_relations.values():
-            edge, from_file_id, to_file_id, from_symbol_id, to_symbol_id = relation
-            outbound_origins = (
-                set(symbol_frontier.get(from_symbol_id, set()))
-                if call_policy is not None and call_policy.outbound
-                else set()
-            )
-            inbound_origins = (
-                set(symbol_frontier.get(to_symbol_id, set()))
-                if call_policy is not None and call_policy.inbound
-                else set()
-            )
-            if outbound_origins or inbound_origins:
-                eligible_symbol_relations.append(
-                    (*relation, outbound_origins, inbound_origins)
-                )
-        eligible_symbol_relations.sort(
-            key=lambda item: (
-                0 if item[5] else 1,
-                str(nodes.get(item[1]).identity.get("path") if nodes.get(item[1]) is not None else ""),
-                str(nodes.get(item[2]).identity.get("path") if nodes.get(item[2]) is not None else ""),
-                item[0].from_id,
-                item[0].to_id,
-            )
-        )
-        next_symbol_frontier: dict[str, set[str]] = {}
-        for edge, from_file_id, to_file_id, from_symbol_id, to_symbol_id, outbound_origins, inbound_origins in eligible_symbol_relations:
-            relation_origins = outbound_origins | inbound_origins
-            accepted = add_relation(
-                edge=edge,
-                from_file_id=from_file_id,
-                to_file_id=to_file_id,
-                from_symbol_id=from_symbol_id,
-                to_symbol_id=to_symbol_id,
-                distance=distance,
-                origin_file_distances={origin_id: distance for origin_id in relation_origins},
-            )
-            if not accepted:
-                continue
-            for destination_symbol_id, propagating_origins in (
-                (from_symbol_id, inbound_origins),
-                (to_symbol_id, outbound_origins),
-            ):
-                seen_origins = seen_origins_by_symbol.setdefault(destination_symbol_id, set())
-                new_origins = propagating_origins - seen_origins
-                if not new_origins:
-                    continue
-                seen_origins.update(new_origins)
-                next_symbol_frontier.setdefault(destination_symbol_id, set()).update(new_origins)
-        symbol_frontier = next_symbol_frontier
-        if not symbol_frontier:
-            break
-
-    relations = sorted(
-        relations_by_key.values(),
-        key=lambda item: (
-            int(item.get("distance") or 0),
-            relation_priority.get(str(item.get("edge") or ""), 9),
-            0 if item.get("from_path") == item.get("to_path") else 1,
-            str(item.get("from_path") or ""),
-            str(item.get("to_path") or ""),
-            str(item.get("from_id") or ""),
-            str(item.get("to_id") or ""),
-        ),
-    )[:max_relations]
-    visible_paths = set(normalized_seeds)
-    for relation in relations:
-        visible_paths.add(str(relation.get("from_path") or ""))
-        visible_paths.add(str(relation.get("to_path") or ""))
-
-    excluded_paths = {
-        path
-        for raw_path in (excluded_candidate_paths or set())
-        if (path := normalize_repo_path(raw_path))
-    }
-    visible_file_ids = {file_id(repo_id, path) for path in visible_paths if path}
-    changes_by_file = {
-        current_file_id: index.changes_by_file[current_file_id]
-        for current_file_id in visible_file_ids
-        if current_file_id in index.changes_by_file
-    }
-
-    history_by_task: dict[str, list[dict[str, Any]]] = {}
-    seen_history: set[tuple[str, str]] = set()
-    for current_file_id in sorted(changes_by_file):
-        file_node = nodes.get(current_file_id)
-        path = str(file_node.identity.get("path") or "") if file_node is not None else ""
-        if normalize_repo_path(path) in excluded_paths:
-            continue
-        for change_id in sorted(changes_by_file[current_file_id]):
-            change_node = nodes.get(change_id)
-            change_facts = change_node.facts.get("receipt") if change_node is not None and isinstance(change_node.facts.get("receipt"), dict) else {}
-            for task_node_id, task_edge in sorted(index.tasks_by_change.get(change_id, []), key=lambda item: item[0]):
-                task_node = nodes.get(task_node_id)
-                if task_node is None:
-                    continue
-                task_id_value = str(task_node.identity.get("task_id") or "")
-                key = (task_id_value, path)
-                if not task_id_value or not path or key in seen_history:
-                    continue
-                seen_history.add(key)
-                receipt = task_node.facts.get("receipt") if isinstance(task_node.facts.get("receipt"), dict) else {}
-                artifact_paths = index.artifact_paths_by_task.get(task_node_id, set())
-                history_by_task.setdefault(task_id_value, []).append(
-                    {
-                        "task_id": task_id_value,
-                        "path": path,
-                        "change": str(change_facts.get("change") or ""),
-                        "attribution": str(task_edge.facts.get("attribution") or change_facts.get("attribution") or ""),
-                        "completed_at": str(receipt.get("completed_at") or ""),
-                        "task_path": next(iter(artifact_paths)) if len(artifact_paths) == 1 else "",
-                    }
-                )
-    selected_task_ids = sorted(
-        history_by_task,
-        key=lambda task_id: (
-            max(str(item.get("completed_at") or "") for item in history_by_task[task_id]),
-            task_id,
-        ),
-        reverse=True,
-    )[:max_history]
-    history = [
-        item
-        for task_id in selected_task_ids
-        for item in sorted(history_by_task[task_id], key=lambda value: str(value.get("path") or ""))
-    ]
-    projection = {
-        "mode": mode,
-        "policy": {
-            edge_kind: {
-                "inbound": edge_policy.inbound,
-                "outbound": edge_policy.outbound,
-                "max_depth": edge_policy.max_depth,
-            }
-            for edge_kind, edge_policy in sorted(mode_policy.items())
-        },
-        "seed_paths": normalized_seeds,
-        "seed_anchors": [anchor.to_dict() for anchor in resolved_anchors],
-        "unresolved_anchors": [anchor.to_dict() for anchor in unresolved_anchors],
-        "ambiguous_anchors": [anchor.to_dict() for anchor in ambiguous_anchors],
-        "related_paths": sorted(path for path in related_paths if path in visible_paths),
-        "relations": relations,
-        "relationship_candidates": relationship_candidates_for_paths(
-            snapshot,
-            normalized_seeds,
-            excluded_paths=excluded_candidate_paths,
-        ),
-        "history": history,
-    }
-    annotate_context_projection_components(
-        projection,
-        component_data if component_data is not None else component_projection(snapshot),
-    )
-    return projection
 
 
 def _query_payload(
@@ -2083,83 +973,32 @@ def _query_payload(
     warnings: list[dict[str, str]] | None = None,
     candidates: list[dict[str, str]] | None = None,
     query_status: str = "found",
-    excluded_candidate_paths: set[str] | None = None,
-    include_historical_file_continuations: bool = False,
 ) -> dict[str, Any]:
-    canonical_query = canonical_graph_query_selector(query)
     nodes = _node_by_id(snapshot)
     for edge in edges:
         node_ids.add(edge.from_id)
         node_ids.add(edge.to_id)
     sorted_edges = sorted({_edge_key(edge): edge for edge in edges}.values(), key=_edge_key)
-    match_paths = {
-        normalize_repo_path(str(match.get("path") or ""))
-        for match in (matches or [])
-        if isinstance(match, dict) and normalize_repo_path(str(match.get("path") or ""))
-    }
-    relationship_candidates = relationship_candidates_for_paths(
-        snapshot,
-        match_paths,
-        excluded_paths=excluded_candidate_paths,
-    )
-    payload = {
+    return {
         "repository": snapshot.repository,
         "snapshot_digest": snapshot.snapshot_digest,
-        "query": canonical_query,
+        "query": canonical_graph_query_selector(query),
         "query_status": query_status,
         "matches": matches or [],
         "candidates": candidates or [],
-        "relationship_candidates": relationship_candidates,
-        "relationship_candidate_count": len(relationship_candidates),
-        "relationship_candidates_truncated": False,
         "nodes": [nodes[node_id].to_dict() for node_id in sorted(node_ids) if node_id in nodes],
         "edges": [edge.to_dict() for edge in sorted_edges],
         "paths": paths or [],
-        "continuations": _query_continuations(
-            snapshot,
-            node_ids,
-            include_historical_files=include_historical_file_continuations,
-        ),
         "completeness": snapshot.completeness,
-        "warnings": warnings or _query_warnings(snapshot),
+        "warnings": warnings if warnings is not None else _query_warnings(snapshot),
     }
-    payload["result_digest"] = digest_data(
-        {
-            "schema": "repoctl.graph.query-result",
-            "snapshot_digest": snapshot.snapshot_digest,
-            "query": payload["query"],
-            "query_status": payload["query_status"],
-            "matches": payload["matches"],
-            "candidates": payload["candidates"],
-            "relationship_candidates": payload["relationship_candidates"],
-            "paths": payload["paths"],
-        }
-    )
-    return payload
 
 
 def _annotate_query_payload_components(
     payload: dict[str, Any],
     snapshot: GraphSnapshot,
 ) -> dict[str, Any]:
-    annotate_graph_query_components(
-        payload,
-        component_projection(snapshot),
-    )
-    payload["result_digest"] = digest_data(
-        {
-            "schema": "repoctl.graph.query-result",
-            "snapshot_digest": snapshot.snapshot_digest,
-            "query": payload["query"],
-            "query_status": payload["query_status"],
-            "matches": payload["matches"],
-            "candidates": payload["candidates"],
-            "relationship_candidates": payload["relationship_candidates"],
-            "paths": payload["paths"],
-            "component_crossings": payload["component_crossings"],
-        }
-    )
-    return payload
+    return annotate_graph_query_components(payload, component_projection(snapshot))
 
 
 def _provider_capability_status(
@@ -2186,174 +1025,8 @@ def _provider_capability_status(
     return status if status in {"unsupported", "unavailable"} else "found"
 
 
-def graph_anchor_continuation(
-    anchor: GraphContextAnchor,
-    *,
-    completeness: dict[str, Any],
-) -> GraphContinuation | None:
-    if anchor.kind == GraphContextAnchorKind.FILE and anchor.path:
-        return GraphContinuation(
-            kind=GraphContextAnchorKind.FILE,
-            value=anchor.path,
-            query_types=(GraphQuerySelectorKind.FILE, GraphQuerySelectorKind.IMPACT_FILE),
-            actions=("workspace.open", "graph.file", "graph.impact_file"),
-        )
-    if anchor.kind != GraphContextAnchorKind.SYMBOL or not anchor.symbol:
-        return None
-    query_types = [GraphQuerySelectorKind.SYMBOL]
-    if _provider_capability_status(
-        completeness,
-        capability_name="calls",
-        in_file=anchor.path,
-    ) == "found":
-        query_types.extend(
-            (
-                GraphQuerySelectorKind.CALLERS_OF,
-                GraphQuerySelectorKind.CALLEES_OF,
-                GraphQuerySelectorKind.IMPACT_SYMBOL,
-            )
-        )
-    return GraphContinuation(
-        kind=GraphContextAnchorKind.SYMBOL,
-        value=anchor.symbol,
-        in_file=anchor.path,
-        query_types=tuple(query_types),
-        actions=tuple(f"graph.{query_type.value}" for query_type in query_types),
-    )
 
 
-def _query_continuations(
-    snapshot: GraphSnapshot,
-    node_ids: set[str],
-    *,
-    include_historical_files: bool = False,
-) -> list[dict[str, Any]]:
-    nodes = _node_by_id(snapshot)
-    continuations: list[dict[str, Any]] = []
-    for node_id in sorted(node_ids):
-        node = nodes.get(node_id)
-        if node is None:
-            continue
-        selector: dict[str, str] = {}
-        query_types: list[str] = []
-        actions: list[str] = []
-        label = ""
-        if node.kind == "file":
-            if not include_historical_files and not is_current_file_node(node):
-                continue
-            value = str(node.identity.get("path") or "")
-            if not value:
-                continue
-            continuation = graph_anchor_continuation(
-                GraphContextAnchor(kind=GraphContextAnchorKind.FILE, path=value),
-                completeness=snapshot.completeness,
-            )
-            if continuation is None:
-                continue
-            continuation_data = continuation.to_dict()
-            selector = continuation_data["selector"]
-            query_types = continuation_data["query_types"]
-            actions = continuation_data["actions"]
-            label = value
-        elif node.kind == "symbol":
-            match = _symbol_match_dict(snapshot, node)
-            value = str(match.get("qualified_name") or match.get("name") or "")
-            if not value:
-                continue
-            path = str(match.get("path") or "")
-            continuation = graph_anchor_continuation(
-                GraphContextAnchor(kind=GraphContextAnchorKind.SYMBOL, path=path, symbol=value),
-                completeness=snapshot.completeness,
-            )
-            if continuation is None:
-                continue
-            continuation_data = continuation.to_dict()
-            selector = continuation_data["selector"]
-            query_types = continuation_data["query_types"]
-            actions = continuation_data["actions"]
-            label = value
-        elif node.kind == "import_ref":
-            value = str(node.identity.get("raw_import") or "")
-            if not value:
-                continue
-            selector = {"kind": "import", "value": value}
-            query_types = ["import"]
-            actions = ["graph.import"]
-            label = value
-        elif node.kind == "topic":
-            value = str(node.identity.get("topic") or "")
-            if not value:
-                continue
-            selector = {"kind": "topic", "value": value}
-            query_types = ["topic"]
-            actions = ["graph.topic"]
-            label = value
-        elif node.kind == "task":
-            value = str(node.identity.get("task_id") or "")
-            if not value:
-                continue
-            selector = {"kind": "task", "value": value}
-            query_types = ["task"]
-            actions = ["graph.task", "task.show"]
-            label = value
-        elif node.kind == "artifact":
-            value = str(node.identity.get("path") or "")
-            if not value:
-                continue
-            selector = {"kind": "document", "value": value}
-            query_types = ["artifact"]
-            actions = ["graph.artifact", "workspace.open"]
-            label = value
-        elif node.kind == "document":
-            value = str(node.identity.get("path") or "")
-            if not value:
-                continue
-            selector = {"kind": "document", "value": value}
-            query_types = ["document"]
-            actions = ["workspace.open"]
-            label = value
-        elif node.kind == "knowledge":
-            value = str(node.identity.get("record_id") or "")
-            if not value:
-                continue
-            selector = {"kind": "knowledge_record", "value": value}
-            query_types = ["knowledge_record"]
-            actions = ["knowledge.show"]
-            label = value
-        elif node.kind == "change_event":
-            value = str(node.identity.get("task_id") or "")
-            if not value:
-                continue
-            selector = {"kind": "task", "value": value}
-            query_types = ["task"]
-            actions = ["graph.task"]
-            label = value
-        else:
-            continue
-        continuations.append(
-            {
-                "node_id": node.id,
-                "node_kind": node.kind,
-                "label": label,
-                "selector": selector,
-                "query_types": query_types,
-                "actions": actions,
-            }
-        )
-    unique: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for item in continuations:
-        key = (
-            item["selector"]["kind"],
-            item["selector"]["value"],
-            item["selector"].get("in_file", ""),
-        )
-        existing = unique.get(key)
-        if existing is None:
-            unique[key] = item
-            continue
-        existing["query_types"] = sorted(set(existing["query_types"]) | set(item["query_types"]))
-        existing["actions"] = sorted(set(existing["actions"]) | set(item["actions"]))
-    return [unique[key] for key in sorted(unique)]
 
 
 def _empty_query_payload(
@@ -2363,7 +1036,6 @@ def _empty_query_payload(
     query_status: str,
     warning: dict[str, str] | None = None,
     candidates: list[dict[str, str]] | None = None,
-    excluded_candidate_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     warnings = _query_warnings(snapshot)
     if warning is not None:
@@ -2376,7 +1048,6 @@ def _empty_query_payload(
         warnings=warnings,
         candidates=candidates,
         query_status=query_status,
-        excluded_candidate_paths=excluded_candidate_paths,
     )
 
 
@@ -2475,7 +1146,7 @@ def _semantic_query_status(snapshot: GraphSnapshot, *, capability_name: str, in_
         if index.get("classification") == "excluded":
             return "unsupported", {
                 "code": "graph_query_unsupported",
-                "message": f"semantic analysis is excluded by policy for {in_file}",
+                "message": f"source indexing is unavailable for {in_file}",
             }
         status = _provider_capability_status(
             snapshot.completeness,
@@ -2521,32 +1192,24 @@ def _semantic_query_status(snapshot: GraphSnapshot, *, capability_name: str, in_
 def query_graph(
     snapshot: GraphSnapshot,
     *,
-    root: Path | None = None,
     file: str = "",
-    topic: str = "",
     import_ref: str = "",
     symbol: str = "",
     callers_of: str = "",
     callees_of: str = "",
     impact_file: str = "",
     impact_symbol: str = "",
-    task: str = "",
-    artifact: str = "",
     in_file: str = "",
     depth: int = 1,
-    stale_paths: set[str] | None = None,
 ) -> tuple[dict[str, Any] | None, list[Problem]]:
     selector_inputs = {
         GraphQuerySelectorKind.FILE: file,
-        GraphQuerySelectorKind.TOPIC: topic,
         GraphQuerySelectorKind.IMPORT: import_ref,
         GraphQuerySelectorKind.SYMBOL: symbol,
         GraphQuerySelectorKind.CALLERS_OF: callers_of,
         GraphQuerySelectorKind.CALLEES_OF: callees_of,
         GraphQuerySelectorKind.IMPACT_FILE: impact_file,
         GraphQuerySelectorKind.IMPACT_SYMBOL: impact_symbol,
-        GraphQuerySelectorKind.TASK: task,
-        GraphQuerySelectorKind.ARTIFACT: artifact,
     }
     selectors = [
         (kind, selector_inputs[kind])
@@ -2558,7 +1221,7 @@ def query_graph(
             Problem(
                 "error",
                 "graph_query_selector_required",
-                "pass exactly one graph query selector: --file, --topic, --import, --symbol, --callers-of, --callees-of, --impact-file, --impact-symbol, --task, or --artifact",
+                "pass exactly one graph query selector: --file, --import, --symbol, --callers-of, --callees-of, --impact-file, or --impact-symbol",
             )
         ]
     if len(selectors) > 1:
@@ -2566,16 +1229,9 @@ def query_graph(
     if depth < 1:
         return None, [Problem("error", "graph_query_invalid_depth", "graph query depth must be at least 1")]
 
-    normalized_stale_paths = {
-        normalized
-        for path in (stale_paths or set())
-        if (normalized := normalize_repo_path(path))
-    }
-
     def query_payload(**kwargs: Any) -> dict[str, Any]:
         payload = _query_payload(
             snapshot,
-            excluded_candidate_paths=normalized_stale_paths,
             **kwargs,
         )
         return _annotate_query_payload_components(
@@ -2587,7 +1243,6 @@ def query_graph(
         return _annotate_query_payload_components(
             _empty_query_payload(
                 snapshot,
-                excluded_candidate_paths=normalized_stale_paths,
                 **kwargs,
             ),
             snapshot,
@@ -2611,130 +1266,6 @@ def query_graph(
         and str(nodes[edge.from_id].identity.get("path") or "")
     }
 
-    def exact_history_snapshot(task_id: str) -> tuple[GraphSnapshot | None, list[Problem]]:
-        if root is None:
-            return None, []
-        try:
-            record = lookup_completion_exact(root, repo_id, task_id)
-        except ValueError as exc:
-            return None, [
-                Problem(
-                    "error",
-                    "invalid_task_id",
-                    str(exc),
-                    task_id,
-                )
-            ]
-        except CompletionCatalogueUnavailable as exc:
-            return None, [
-                Problem(
-                    "error",
-                    exc.code,
-                    f"exact completion history is unavailable: {exc}",
-                    exc.path,
-                )
-            ]
-        if record is None:
-            return None, []
-        completion_input = CompletionGraphInput(
-            event_id=str(record.event.get("event_id") or ""),
-            sequence=int(record.event.get("sequence") or 0),
-            receipt=record.receipt,
-            receipt_path=record.receipt_path,
-            receipt_sha256=str(record.event.get("receipt_sha256") or ""),
-            artifact_path=record.artifact_path,
-            artifact_sha256=str(record.event.get("artifact_sha256") or ""),
-        )
-        history_snapshot, history_problems, _meta = build_graph(
-            root,
-            target=RepoTarget(
-                id=repo_id,
-                root_path=Path(root) / repository_path,
-                display_path=repository_path,
-                identity_source=str(
-                    snapshot.repository.get("identity_source") or "reserved"
-                ),
-            ),
-            code_index_result=([], [], {"summary": {"truncated": False}}),
-            cached_semantic_results=[],
-            completion_inputs=(completion_input,),
-            include_historical_receipt_files=True,
-            include_knowledge=not repo_id,
-        )
-        return history_snapshot, [
-            problem
-            for problem in history_problems
-            if problem.code != "graph_knowledge_unavailable"
-        ]
-
-    def exact_history_query(
-        history_snapshot: GraphSnapshot,
-        *,
-        task_id: str,
-        artifact_path: str = "",
-    ) -> tuple[dict[str, Any], list[Problem]]:
-        history_nodes = _node_by_id(history_snapshot)
-        history_symbol_paths = {
-            edge.to_id: str(history_nodes[edge.from_id].identity.get("path") or "")
-            for edge in history_snapshot.edges
-            if edge.kind == "DEFINES"
-            and edge.from_id in history_nodes
-            and str(history_nodes[edge.from_id].identity.get("path") or "")
-        }
-        task_node_id = graph_task_id(task_id)
-        artifact_nodes = [
-            node
-            for node in history_snapshot.nodes
-            if node.kind == "artifact"
-            and (not artifact_path or str(node.identity.get("path") or "") == artifact_path)
-        ]
-        match_nodes = artifact_nodes if artifact_path else [history_nodes[task_node_id]]
-        direct = [
-            edge
-            for edge in history_snapshot.edges
-            if edge.from_id == task_node_id or edge.to_id == task_node_id
-        ]
-        change_ids = {
-            edge.to_id
-            for edge in direct
-            if edge.kind == "TASK_RECORDED_CHANGE" and edge.from_id == task_node_id
-        }
-        artifact_ids = {edge.to_id for edge in direct if edge.kind == "TASK_VERIFIED_BY"}
-        evidence_edges = [
-            *direct,
-            *[edge for edge in history_snapshot.edges if edge.kind == "KNOWLEDGE_SOURCED_FROM" and edge.to_id in artifact_ids],
-            *[
-                edge
-                for edge in history_snapshot.edges
-                if edge.kind == "CHANGE_AFFECTED_FILE" and edge.from_id in change_ids
-            ],
-        ]
-        paths = [
-            _path_from_edge(
-                history_nodes,
-                edge,
-                reason="recorded artifact evidence" if artifact_path else "recorded task evidence",
-                symbol_paths=history_symbol_paths,
-            )
-            for edge in sorted(evidence_edges, key=_edge_key)
-        ]
-        payload = _query_payload(
-            history_snapshot,
-            query=(
-                {"type": "artifact", "path": artifact_path}
-                if artifact_path
-                else {"type": "task", "task_id": task_id}
-            ),
-            node_ids={node.id for node in match_nodes},
-            edges=evidence_edges,
-            matches=[
-                _node_summary(node, symbol_paths=history_symbol_paths)
-                for node in match_nodes
-            ],
-            paths=paths,
-            include_historical_file_continuations=True,
-        )
-        return _annotate_query_payload_components(payload, history_snapshot), []
     if selector_kind is GraphQuerySelectorKind.FILE:
         normalized, resolution_result, resolution_problems = _resolve_graph_query_path(
             snapshot,
@@ -2756,13 +1287,6 @@ def query_graph(
         ]
         return query_payload(query={"type": "file", "path": normalized}, node_ids={wanted}, edges=matched_edges, matches=[_node_summary(nodes[wanted], symbol_paths=symbol_paths)], paths=paths), []
 
-    if selector_kind is GraphQuerySelectorKind.TOPIC:
-        wanted = topic_id(repo_id, value)
-        if wanted not in nodes:
-            return empty_query_payload(query={"type": "topic", "topic": value}, query_status="not_found"), []
-        matched_edges = [edge for edge in snapshot.edges if edge.kind == "HAS_TOPIC" and edge.to_id == wanted]
-        return query_payload(query={"type": "topic", "topic": value}, node_ids={wanted}, edges=matched_edges, matches=[_node_summary(nodes[wanted], symbol_paths=symbol_paths)]), []
-
     if selector_kind is GraphQuerySelectorKind.IMPORT:
         matched_import_nodes = [
             node
@@ -2774,106 +1298,6 @@ def query_graph(
             return empty_query_payload(query={"type": "import", "raw_import": value}, query_status="not_found"), []
         matched_edges = [edge for edge in snapshot.edges if edge.kind in {"DECLARES_IMPORT", "RESOLVES_TO"} and (edge.to_id in matched_ids or edge.from_id in matched_ids)]
         return query_payload(query={"type": "import", "raw_import": value}, node_ids=set(matched_ids), edges=matched_edges, matches=[_node_summary(node, symbol_paths=symbol_paths) for node in matched_import_nodes]), []
-
-    def task_evidence_edges(task_node_ids: set[str]) -> list[GraphEdge]:
-        direct = [
-            edge
-            for edge in snapshot.edges
-            if edge.from_id in task_node_ids or edge.to_id in task_node_ids
-        ]
-        change_ids = {
-            edge.to_id
-            for edge in direct
-            if edge.kind == "TASK_RECORDED_CHANGE" and edge.from_id in task_node_ids
-        }
-        affected = [
-            edge
-            for edge in snapshot.edges
-            if edge.kind == "CHANGE_AFFECTED_FILE" and edge.from_id in change_ids
-        ]
-        artifact_ids = {edge.to_id for edge in direct if edge.kind == "TASK_VERIFIED_BY"}
-        knowledge = [edge for edge in snapshot.edges if edge.kind == "KNOWLEDGE_SOURCED_FROM" and edge.to_id in artifact_ids]
-        return [*direct, *affected, *knowledge]
-
-    if selector_kind is GraphQuerySelectorKind.TASK:
-        try:
-            normalized_task = normalize_task_id(value)
-        except RepoctlError as exc:
-            return None, [Problem("error", exc.code, str(exc), value)]
-        wanted = graph_task_id(normalized_task)
-        history_snapshot, history_problems = exact_history_snapshot(normalized_task)
-        if history_problems:
-            return None, history_problems
-        if history_snapshot is not None:
-            return exact_history_query(history_snapshot, task_id=normalized_task)
-        if wanted not in nodes:
-            return empty_query_payload(query={"type": "task", "task_id": normalized_task}, query_status="not_found"), []
-        matched_edges = task_evidence_edges({wanted})
-        paths = [_path_from_edge(nodes, edge, reason="recorded task evidence", symbol_paths=symbol_paths) for edge in sorted(matched_edges, key=_edge_key)]
-        return query_payload(
-            query={"type": "task", "task_id": normalized_task},
-            node_ids={wanted},
-            edges=matched_edges,
-            matches=[_node_summary(nodes[wanted], symbol_paths=symbol_paths)],
-            paths=paths,
-        ), []
-
-    if selector_kind is GraphQuerySelectorKind.ARTIFACT:
-        matched_artifacts = [
-            node
-            for node in snapshot.nodes
-            if node.kind == "artifact" and str(node.identity.get("path") or "") == value
-        ]
-        artifact_ids = {node.id for node in matched_artifacts}
-        normalized_artifact = normalize_repo_path(value)
-        artifact_name = Path(normalized_artifact).name if normalized_artifact else ""
-        normalized_task = ""
-        if artifact_name:
-            try:
-                normalized_task = normalize_task_id(artifact_name)
-            except RepoctlError:
-                normalized_task = ""
-        if normalized_task and root is not None:
-            history_snapshot, history_problems = exact_history_snapshot(normalized_task)
-            if history_problems:
-                return None, history_problems
-            if history_snapshot is not None:
-                history_artifacts = [
-                    node
-                    for node in history_snapshot.nodes
-                    if node.kind == "artifact"
-                    and str(node.identity.get("path") or "") == normalized_artifact
-                ]
-                if history_artifacts:
-                    return exact_history_query(
-                        history_snapshot,
-                        task_id=normalized_task,
-                        artifact_path=normalized_artifact,
-                    )
-                return empty_query_payload(query={"type": "artifact", "path": value}, query_status="not_found"), []
-        if not artifact_ids:
-            return empty_query_payload(query={"type": "artifact", "path": value}, query_status="not_found"), []
-        task_ids = {
-            edge.from_id
-            for edge in snapshot.edges
-            if edge.kind == "TASK_VERIFIED_BY" and edge.to_id in artifact_ids
-        }
-        matched_edge_map = {
-            _edge_key(edge): edge
-            for edge in [
-                *[edge for edge in snapshot.edges if edge.kind == "TASK_VERIFIED_BY" and edge.to_id in artifact_ids],
-                *task_evidence_edges(task_ids),
-            ]
-        }
-        matched_edges = list(matched_edge_map.values())
-        paths = [_path_from_edge(nodes, edge, reason="recorded artifact evidence", symbol_paths=symbol_paths) for edge in sorted(matched_edges, key=_edge_key)]
-        return query_payload(
-            query={"type": "artifact", "path": value},
-            node_ids=set(artifact_ids),
-            edges=matched_edges,
-            matches=[_node_summary(node, symbol_paths=symbol_paths) for node in matched_artifacts],
-            paths=paths,
-        ), []
 
     symbol_selector_kinds = {
         GraphQuerySelectorKind.SYMBOL,

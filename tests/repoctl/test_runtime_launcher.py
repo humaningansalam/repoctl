@@ -12,7 +12,7 @@ import pytest
 
 
 def _fake_runtime(tmp_path: Path) -> Path:
-    runtime = tmp_path / "release"
+    runtime = tmp_path / "runtime"
     (runtime / "scripts").mkdir(parents=True)
     (runtime / "tools/repoctl").mkdir(parents=True)
     source_root = Path(__file__).resolve().parents[2]

@@ -1,291 +1,151 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import shutil
-import socket
-import subprocess
 from pathlib import Path
 
-from tools.repoctl.board import render_board
-from tools.repoctl.cli import main
-from tools.repoctl.io import RepoctlError, repoctl_lock
-from tools.repoctl.markdown import find_section, replace_frontmatter_line
-from tools.repoctl.tasks import create_task_file
-from tests.repoctl.io_audit import reject_directory_enumeration
+import pytest
+
+from tests.repoctl.task_lifecycle_helpers import add_task, init_repo, task_text, write_workspace
+from tools.repoctl import cli
+from tools.repoctl.io import RepoctlError
+from tools.repoctl.markdown import parse_frontmatter
+from tools.repoctl.tasks import prepare_task_finish
 
 
+def run_json(root: Path, capsys, *args: str) -> tuple[int, dict]:
+    result = cli.main(["--workspace-root", str(root), "--json", *args])
+    return result, json.loads(capsys.readouterr().out)
 
-def write_workspace(root: Path) -> None:
-    (root / "docs/tasks").mkdir(parents=True)
-    (root / "docs/archive/tasks").mkdir(parents=True)
-    (root / "docs/BOARD.md").write_text(
-        "# BOARD\n\nintro\n\n## Board\n\n## Backlog\n\n<!-- backlog -->\n",
-        encoding="utf-8",
-    )
-    (root / "AGENTS.md").write_text("rules\n", encoding="utf-8")
-    source_root = Path(__file__).resolve().parents[2] / "fixtures/template-contract-1.0.0"
-    (root / "docs/tasks/TEMPLATE.md").write_text((source_root / "docs/tasks/TEMPLATE.md").read_text(encoding="utf-8"), encoding="utf-8")
-    (root / "docs/tasks/PARENT_TEMPLATE.md").write_text((source_root / "docs/tasks/PARENT_TEMPLATE.md").read_text(encoding="utf-8"), encoding="utf-8")
 
-def init_repo(repo: Path) -> None:
-    repo.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(["git", "config", "user.email", "a@example.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "A"], cwd=repo, check=True)
+def snapshot(root: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*") if path.is_file()
+            and not path.is_relative_to(root / ".repoctl-state/locks")}
 
-def task_text(task_id: str, *, status: str = "todo", parent: str = "") -> str:
-    return f'''---
-id: {task_id}
-title: "Task {task_id}"
-status: {status}
-owner: "unassigned"
-repo_id: ""
-repo_ref: ""
-created: 20260609T184046Z
-area: ""
-parent: "{parent}"
-depends_on: []
----
 
-# {task_id} - Task
-
-## Discovery
-
-- Chosen files: none yet
-- Notes: none yet
-
-## Execution Log
-
-- created
-
-```text
-## Handoff
-inside fence
-```
-
-## Verification
-
-- pending
-
-## Handoff
-
-- Next exact step: test
-- First file to open: `docs/BOARD.md`
-- First command to run: `repoctl check`
-- Done when: done
-'''
-
-def add_task(root: Path, name: str, text: str) -> Path:
-    path = root / "docs/tasks" / name
-    path.write_text(text, encoding="utf-8")
-    return path
-
-def test_section_scanner_ignores_code_fence_heading() -> None:
-    text = task_text("T-20260609184046Z")
-    section = find_section(text, "Handoff")
-    assert text[section.start : section.body_start].strip() == "## Handoff"
-    assert "inside fence" not in text[section.body_start : section.end]
-
-def test_repoctl_lock_uses_repoctl_lock_dir_and_times_out(tmp_path: Path) -> None:
+def test_cli_create_start_and_finish_in_minimal_workspace(tmp_path: Path, capsys) -> None:
     write_workspace(tmp_path)
-    try:
-        create_task_file(tmp_path, title="No Lock", slug="no-lock")
-        raise AssertionError("task creation should require the repoctl lock")
-    except RepoctlError as error:
-        assert error.code == "task_lock_required"
+    authored = "\r\n## 조사\r\n\r\n작성한 내용을 보존한다.\r\n".encode("utf-8")
+    (tmp_path / "task-body.md").write_bytes(authored)
+    code, created = run_json(tmp_path, capsys, "task", "create", "한글 제목 그대로", "--area", "product research", "--body-file", "task-body.md", "--start")
+    assert code == 0
+    path = tmp_path / created["data"]["path"]
+    frontmatter, original_body = parse_frontmatter(path.read_bytes().decode("utf-8"))
+    assert frontmatter["title"] == "한글 제목 그대로"
+    assert frontmatter["area"] == "product research"
+    assert frontmatter["status"] == "doing"
+    assert frontmatter["started_at"]
+    assert original_body.encode("utf-8") == authored
 
-    lock_dir = tmp_path / "docs/tasks/.repoctl.lock.d"
-    lock_dir.mkdir()
-
-    try:
-        with repoctl_lock(tmp_path, timeout=0.0, interval=0.0):
-            raise AssertionError("lock should not be acquired while the lock directory exists")
-    except RepoctlError as error:
-        assert error.code == "stale_lock"
-        assert error.path == "docs/tasks/.repoctl.lock.d"
-
-def test_frontmatter_replace_preserves_other_lines() -> None:
-    text = task_text("T-20260609184046Z", status="todo")
-    replaced = replace_frontmatter_line(text, "status", "doing")
-    assert "status: doing" in replaced
-    assert "owner: \"unassigned\"" in replaced
-    assert "```text\n## Handoff\ninside fence" in replaced
+    code, finished = run_json(tmp_path, capsys, "task", "finish", created["data"]["task_id"])
+    assert code == 0
+    assert not path.exists()
+    archive = tmp_path / finished["data"]["path"]
+    final_frontmatter, final_body = parse_frontmatter(archive.read_bytes().decode("utf-8"))
+    assert final_frontmatter["status"] == "done"
+    assert final_frontmatter["completed_at"]
+    assert final_body == original_body
+    assert set(snapshot(tmp_path)) == {"task-body.md", str(archive.relative_to(tmp_path))}
 
 
-def test_check_does_not_require_repo_ref_for_repository_task(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_cli_parent_and_child_finish_independently(tmp_path: Path, capsys) -> None:
     write_workspace(tmp_path)
-    init_repo(tmp_path / "repos")
-    text = task_text("T-20260609184046Z").replace('area: ""', 'area: "backend"').replace('repo_id: ""', 'repo_id: "main"')
-    add_task(tmp_path, "T-20260609184046Z--alpha.md", text)
-    (tmp_path / "docs/BOARD.md").write_text("# BOARD\n\n## Board\n\n- docs/tasks/T-20260609184046Z--alpha.md\n\n## Backlog\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    parent = add_task(tmp_path, "parent.md", task_text("parent", status="doing"))
+    child = add_task(tmp_path, "child.md", task_text("child", status="doing", parent="parent"))
+    child_original = child.read_bytes()
 
-    assert main(["check", "--json"]) == 0
+    assert run_json(tmp_path, capsys, "task", "finish", "parent")[0] == 0
+    parent_archive = tmp_path / "docs/archive/tasks/parent.md"
+    parent_original = parent_archive.read_bytes()
+    assert not parent.exists()
+    assert child.read_bytes() == child_original
 
-    payload = json.loads(capsys.readouterr().out)
-    assert not any(problem["code"] == "missing_repo_ref" for problem in payload["problems"])
-    assert not any(warning["code"] == "missing_repo_ref" for warning in payload["warnings"])
-
-    assert main(["task", "list", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert not any(warning["code"] == "missing_repo_ref" for warning in payload["warnings"])
-
-    receipt = tmp_path / "docs/tasks/.repoctl-state/completions/T-20260609184046Z.json"
-    receipt.parent.mkdir(parents=True)
-    receipt.write_text("not json\n", encoding="utf-8")
-    archive = tmp_path / "docs/archive/tasks"
-    (archive / "T-20260609184047Z--cold.md").write_text("not a task\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-
-    with monkeypatch.context() as audit_patch:
-        with reject_directory_enumeration(audit_patch, receipt.parent, archive) as cold_reads:
-            assert main(["check", "--json"]) == 0
-
-    assert cold_reads == []
-    bounded = json.loads(capsys.readouterr().out)
-    assert bounded["data"]["completion_history"] == {
-        "mode": "bounded_catalogue",
-        "catalogues": [],
-    }
-
-    assert main(["check", "--audit-history", "--json"]) == 1
-    audited = json.loads(capsys.readouterr().out)
-    assert audited["data"]["completion_history"]["mode"] == "full_archive_audit"
-    assert "invalid_completion_receipt" in {problem["code"] for problem in audited["problems"]}
+    assert run_json(tmp_path, capsys, "task", "cancel", "child", "--reason", "This branch is no longer needed.")[0] == 0
+    assert not child.exists()
+    assert parent_archive.read_bytes() == parent_original
+    child_frontmatter, _ = parse_frontmatter((tmp_path / "docs/archive/tasks/child.md").read_text())
+    assert child_frontmatter["status"] == "canceled"
+    assert child_frontmatter["parent"] == "parent"
 
 
-def test_render_board_replaces_only_board_section() -> None:
-    text = "# BOARD\n\n## Board\n\n- docs/tasks/T-20260609184046Z--old.md\n\n## Backlog\n\n- keep\n"
-    rendered = render_board(text, ["docs/tasks/T-20260609184047Z--new.md"])
-    assert "- docs/tasks/T-20260609184047Z--new.md" in rendered
-    assert "- docs/tasks/T-20260609184046Z--old.md" not in rendered
-    assert "## Backlog\n\n- keep" in rendered
-
-def test_repoctl_script_uses_system_python_without_workspace_residue(tmp_path: Path) -> None:
-    source_root = next(parent for parent in Path(__file__).resolve().parents if (parent / "scripts/repoctl").is_file())
-    root = tmp_path / "workspace"
-    write_workspace(root)
-    (root / "scripts").mkdir()
-    shutil.copy2(source_root / "scripts/repoctl", root / "scripts/repoctl")
-    (root / "tools").mkdir()
-    shutil.copy2(source_root / "tools/__init__.py", root / "tools/__init__.py")
-    shutil.copytree(
-        source_root / "tools/repoctl",
-        root / "tools/repoctl",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
-
-    def tree_snapshot() -> list[tuple[str, str, int, str]]:
-        entries: list[tuple[str, str, int, str]] = []
-        for path in sorted(root.rglob("*")):
-            rel = path.relative_to(root)
-            if ".git" in rel.parts:
-                continue
-            mode = path.lstat().st_mode & 0o7777
-            if path.is_symlink():
-                entries.append((rel.as_posix(), "symlink", mode, os.readlink(path)))
-            elif path.is_dir():
-                entries.append((rel.as_posix(), "directory", mode, ""))
-            elif path.is_file():
-                entries.append((rel.as_posix(), "file", mode, hashlib.sha256(path.read_bytes()).hexdigest()))
-        return entries
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    for name in ["bash", "dirname", "python3"]:
-        target = Path("/usr/bin") / name
-        if not target.exists():
-            target = Path("/bin") / name
-        (fake_bin / name).symlink_to(target)
-    hostile_package = tmp_path / "tools/repoctl"
-    hostile_package.mkdir(parents=True)
-    (hostile_package.parent / "__init__.py").write_text("", encoding="utf-8")
-    (hostile_package / "__init__.py").write_text("", encoding="utf-8")
-    (hostile_package / "__main__.py").write_text("raise SystemExit('hostile cwd import')\n", encoding="utf-8")
-    before = tree_snapshot()
-    for path_value, cwd in (
-        (os.environ.get("PATH", ""), root),
-        (str(fake_bin), root),
-        (os.environ.get("PATH", ""), tmp_path),
-    ):
-        env = os.environ.copy()
-        env["PATH"] = path_value
-        env["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
-        env.pop("VIRTUAL_ENV", None)
-        result = subprocess.run(
-            [str(root / "scripts/repoctl"), "check", "--json"],
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)["ok"] is True
-
-    assert tree_snapshot() == before
-    assert not (tmp_path / "uv-cache").exists()
-
-
-def test_task_doctor_is_read_only_and_reports_advisory_next_actions(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_cli_finish_preserves_existing_archive(tmp_path: Path, capsys) -> None:
     write_workspace(tmp_path)
-    init_repo(tmp_path / "repos")
-    text = task_text("T-20260609184046Z", status="todo").replace('area: ""', 'area: "repo"').replace('repo_id: ""', 'repo_id: "main"')
-    add_task(tmp_path, "T-20260609184046Z--alpha.md", text)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-    assert main(["task", "start", "T-20260609184046Z", "--json"]) == 0
-    capsys.readouterr()
-    before = (tmp_path / "docs/tasks/T-20260609184046Z--alpha.md").read_text(encoding="utf-8")
+    source = add_task(tmp_path, "task.md", task_text("one", status="doing"))
+    archive = tmp_path / "docs/archive/tasks/task.md"
+    archive.write_text("existing historical content", encoding="utf-8")
+    before = snapshot(tmp_path)
 
-    assert main(["task", "doctor", "T-20260609184046Z", "--json"]) == 0
+    finish_code, finish = run_json(tmp_path, capsys, "task", "finish", "one")
 
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["command"] == "task.doctor"
-    assert payload["data"]["finish_ready"] is True
-    assert "verification" not in payload["data"]
-    assert "missing_discovery_evidence" in payload["data"]["advisory"]
-    assert any(action["label"] == "Record the task's Chosen scope" for action in payload["next_actions"])
-    after = (tmp_path / "docs/tasks/T-20260609184046Z--alpha.md").read_text(encoding="utf-8")
-    assert after == before
+    assert finish_code == 2
+    assert finish["problems"][0]["code"] == "archive_task_conflict"
+    assert source.exists()
+    assert snapshot(tmp_path) == before
 
 
-def test_task_doctor_does_not_materialize_finish_writes(tmp_path: Path, monkeypatch, capsys) -> None:
+@pytest.mark.parametrize("failure", ["stage", "publish", "remove_source"])
+def test_archive_failure_keeps_original_task_and_removes_partial_archive(tmp_path: Path, monkeypatch, capsys, failure: str) -> None:
     write_workspace(tmp_path)
-    text = task_text("T-20260609184046Z", status="doing")
-    add_task(tmp_path, "T-20260609184046Z--alpha.md", text)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    source = add_task(tmp_path, "task.md", task_text("one", status="doing"))
+    archive = tmp_path / "docs/archive/tasks/task.md"
+    before = snapshot(tmp_path)
 
-    before = {
-        path.relative_to(tmp_path).as_posix(): path.read_bytes()
-        for path in tmp_path.rglob("*")
-        if path.is_file()
-    }
+    if failure == "stage":
+        def fail_stage(*args, **kwargs):
+            raise OSError("simulated disk write failure")
+        monkeypatch.setattr(cli, "write_temporary_text", fail_stage)
+    elif failure == "publish":
+        replace = os.replace
+        def fail_publish(old, new):
+            if Path(new) == archive:
+                raise OSError("simulated archive publish failure")
+            return replace(old, new)
+        monkeypatch.setattr(cli.os, "replace", fail_publish)
+    else:
+        unlink = Path.unlink
+        def fail_remove(path, *args, **kwargs):
+            if path == source:
+                raise OSError("simulated live document removal failure")
+            return unlink(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "unlink", fail_remove)
 
-    assert main(["task", "doctor", "T-20260609184046Z", "--json"]) == 1
-
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["data"]["finish_ready"] is False
-    assert "transition_evidence_incomplete" in payload["data"]["blocked_by"]
-    after = {
-        path.relative_to(tmp_path).as_posix(): path.read_bytes()
-        for path in tmp_path.rglob("*")
-        if path.is_file()
-    }
-    assert after == before
-    assert not (tmp_path / "docs/tasks/.repoctl-state/completions/T-20260609184046Z.json").exists()
-    assert not (tmp_path / "docs/archive/tasks/T-20260609184046Z--alpha.md").exists()
+    code, payload = run_json(tmp_path, capsys, "task", "finish", "one")
+    assert code == 2
+    assert payload["problems"][0]["code"] == "io_error"
+    assert snapshot(tmp_path) == before
 
 
-def test_repoctl_lock_recovers_dead_owner_on_same_host(tmp_path: Path) -> None:
+def test_prepared_finish_does_not_overwrite_concurrent_document_edit(tmp_path: Path) -> None:
     write_workspace(tmp_path)
-    lock_dir = tmp_path / "docs/tasks/.repoctl.lock.d"
-    lock_dir.mkdir()
-    (lock_dir / "owner.json").write_text(json.dumps({"pid": 999999999, "hostname": socket.gethostname(), "created_at": "2026-06-22T00:00:00Z"}) + "\n", encoding="utf-8")
+    source = add_task(tmp_path, "task.md", task_text("one", status="doing"))
+    result = prepare_task_finish(tmp_path, "one")
+    edited = source.read_text(encoding="utf-8") + "\nA human added this after preparation.\n"
+    source.write_text(edited, encoding="utf-8")
 
-    with repoctl_lock(tmp_path, timeout=0.1, interval=0.01):
-        assert lock_dir.exists()
+    with pytest.raises(RepoctlError) as caught:
+        cli.apply_task_result(tmp_path, result)
+    assert caught.value.code == "task_changed"
+    assert source.read_text(encoding="utf-8") == edited
+    assert not (tmp_path / result["new_path"]).exists()
 
-    assert not lock_dir.exists()
+
+@pytest.mark.parametrize("create", [False, True])
+def test_task_publish_failure_preserves_workspace(tmp_path: Path, monkeypatch, capsys, create: bool) -> None:
+    write_workspace(tmp_path)
+    if not create:
+        add_task(tmp_path, "task.md", task_text("one"))
+    before = snapshot(tmp_path)
+    replace = os.replace
+
+    def fail_task_publish(old, new):
+        if Path(new).parent == tmp_path / "docs/tasks":
+            raise OSError("simulated Task publish failure")
+        return replace(old, new)
+
+    monkeypatch.setattr(cli.os, "replace", fail_task_publish)
+    command = ["task", "create", "New Task", "--start"] if create else ["task", "start", "one"]
+    code, payload = run_json(tmp_path, capsys, *command)
+    assert code == 2
+    assert payload["problems"][0]["code"] == "io_error"
+    assert snapshot(tmp_path) == before
