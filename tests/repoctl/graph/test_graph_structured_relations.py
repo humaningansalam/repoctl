@@ -68,7 +68,7 @@ def test_graph_resolves_structured_file_relations_from_explicit_syntax(tmp_path:
         encoding="utf-8",
     )
     _materialize(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     expected_pairs = {
         ("Dockerfile", "package.json"),
@@ -112,30 +112,10 @@ def test_graph_resolves_structured_file_relations_from_explicit_syntax(tmp_path:
     assert main(["graph", "query", "--file", "supabase/seed.sql", "--json"]) == 0
     compact = json.loads(capsys.readouterr().out)["data"]["result"]
     path = next(item for item in compact["paths"] if item["edge"] == "USES_FILE")
-    assert path["evidence"] == {
-        "type": "structured_file_relation",
-        "assertion": "resolved",
-        "provider": "structured_file_relations",
-        "confidence": "high",
-        "completeness": "complete",
-        "freshness": "current",
-    }
-    assert any(item["selector"] == {"kind": "file", "value": "supabase/migrations/20240101000000_initial.sql"} for item in compact["continuations"])
-
-    assert main(["graph", "search", "src/jobs.ts", "--repo-id", "main", "--json"]) == 0
-    bundle = json.loads(capsys.readouterr().out)["data"]["result"]
-    visible_paths = {
-        item.get("source_ref", {}).get("path")
-        for items in bundle["groups"].values()
-        for item in items
-        if isinstance(item, dict)
-    }
-    assert "repos/src/jobs.ts" in visible_paths
-    assert "repos/supabase/migrations/20240201000000_claim_job.sql" in visible_paths
-    assert any(
-        item.get("source_ref", {}).get("kind") == "graph_relation" and "--USES_FILE-->" in item.get("excerpt", "")
-        for item in bundle["groups"]["callers_and_dependents"]
-    )
+    assert path["source"]["assertion"] == "resolved"
+    assert path["source"]["provider"] == "structured_file_relations"
+    assert path["source"]["facts"]["evidence_type"] == "structured_file_relation"
+    assert path["to"]["path"] == "supabase/migrations/20240101000000_initial.sql"
 
 
 def test_structured_rpc_analysis_skips_sources_without_supported_client_imports(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from collections import Counter
 from pathlib import Path
 import subprocess
@@ -33,7 +34,7 @@ def _snapshot(files: list[str], symbols=(), edges=()) -> GraphSnapshot:
 
 def _query(repo: Path, snapshot: GraphSnapshot, **selector) -> dict:
     return workflow.query_graph_workflow(
-        snapshot, root=repo.parent, target=_target(repo),
+        snapshot, target=_target(repo),
         freshness=selector.pop("freshness", {"status": "current"}), **selector,
     )
 
@@ -61,15 +62,15 @@ def test_route_navigation_uses_provider_calls_and_exact_http_requests(tmp_path) 
     })
     result = _query(repo, snapshot, route="/run")
     assert result["stages"]["entrypoints"][0]["path"] == "api.py"
-    assert any(item["path"] == "service.py" and item["relation"] == "confirmed"
+    assert any(item["path"] == "service.py" and item["relation"] == "resolved"
                and item["evidence"] == "CALLS" for item in result["stages"]["implementation"])
-    assert any(item["path"] == "consumer.py" and item["relation"] == "confirmed"
+    assert any(item["path"] == "consumer.py" and item["relation"] == "resolved"
                for item in result["stages"]["callers_or_dependents"])
     tests = {item["path"]: item for item in result["stages"]["tests"]}
-    assert tests["tests/test_service.py"]["relation"] == "confirmed"
-    assert tests["tests/test_http.py"]["verification"] == "python_literal_http_test"
+    assert tests["tests/test_service.py"]["relation"] == "resolved"
+    assert tests["tests/test_http.py"]["reference_kind"] == "python_literal_http_test"
     assert "tests/test_other.py" not in tests
-    assert result["status"] == "partial"
+    assert result["status"] == "found"
 
 
 def test_dynamic_attribute_targets_remain_candidates_despite_factory_assignments(tmp_path) -> None:
@@ -115,38 +116,19 @@ def test_ambiguous_routes_require_an_exact_file(tmp_path) -> None:
     assert [item["path"] for item in selected["stages"]["entrypoints"]] == ["second.py"]
 
 
-def test_exact_file_is_prioritized_before_the_inventory_limit(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(workflow, "MAX_WORKFLOW_SOURCE_FILES", 2)
-    sources = {
-        "a.py": "value = 1\n",
-        "b.py": "value = 2\n",
-        "z.py": "@router.get('/run')\ndef handler():\n    return 42\n",
-    }
-    for path, source in sources.items():
-        _write(tmp_path, path, source)
-    result = _query(tmp_path, _snapshot(list(sources)), route="/run", in_file="z.py")
-    assert result["stages"]["entrypoints"][0]["path"] == "z.py"
-    assert result["status"] == "partial"
-    completeness = result["completeness"]
-    assert completeness["files_scanned"] == 1
-    assert completeness["source_bytes_scanned"] == len(sources["z.py"].encode())
-    assert completeness["skipped_sources"] == [{"path": "b.py", "reason": "file_budget"}]
-    assert completeness["source_scan_bounded"] is False
 
 
 @pytest.mark.parametrize(
-    ("source", "limit", "reason", "files_read", "bytes_read"),
+    ("source", "reason", "files_read", "bytes_read"),
     [
-        (b"# larger than the permitted file\n", 8, "file_too_large", 0, 0),
-        (b"\xff", 512, "decode_error", 1, 1),
-        (b"def invalid(:\n", 512, "parse_error", 1, 14),
+        (b"\xff", "decode_error", 1, 1),
+        (b"def invalid(:\n", "parse_error", 1, 14),
     ],
 )
 def test_uninspected_sources_are_partial_with_reasons_and_actual_read_counts(
-    tmp_path, monkeypatch, source, limit, reason, files_read, bytes_read,
+    tmp_path, source, reason, files_read, bytes_read,
 ) -> None:
     (tmp_path / "source.py").write_bytes(source)
-    monkeypatch.setattr(workflow, "MAX_WORKFLOW_FILE_BYTES", limit)
     result = _query(tmp_path, _snapshot(["source.py"]), route="/missing")
     assert result["status"] == "partial"
     assert result["stages"]["entrypoints"] == []
@@ -154,7 +136,7 @@ def test_uninspected_sources_are_partial_with_reasons_and_actual_read_counts(
     assert completeness["skipped_sources"] == [{"path": "source.py", "reason": reason}]
     assert completeness["files_scanned"] == files_read
     assert completeness["source_bytes_scanned"] == bytes_read
-    assert completeness["source_scan_bounded"] is False
+    assert completeness["source_scan_complete"] is False
 
 
 def test_read_error_is_not_reported_as_an_empty_file(tmp_path, monkeypatch) -> None:
@@ -175,16 +157,6 @@ def test_read_error_is_not_reported_as_an_empty_file(tmp_path, monkeypatch) -> N
     assert result["completeness"]["source_bytes_scanned"] == 0
 
 
-def test_exhausted_byte_budget_cannot_produce_not_found(tmp_path, monkeypatch) -> None:
-    first = "value = '한국'\n"
-    _write(tmp_path, "a.py", first)
-    _write(tmp_path, "b.py", "@router.get('/missing')\ndef handler():\n    return 42\n")
-    monkeypatch.setattr(workflow, "MAX_WORKFLOW_TOTAL_SOURCE_BYTES", len(first.encode()))
-    result = _query(tmp_path, _snapshot(["a.py", "b.py"]), route="/missing")
-    assert result["status"] == "partial"
-    assert result["completeness"]["files_scanned"] == 1
-    assert result["completeness"]["source_bytes_scanned"] == len(first.encode())
-    assert result["completeness"]["skipped_sources"] == [{"path": "b.py", "reason": "byte_budget"}]
 
 
 def test_successfully_read_empty_source_can_report_not_found(tmp_path) -> None:
@@ -219,7 +191,7 @@ def test_python_tree_is_shared_by_route_candidates_and_test_inspection(tmp_path,
     monkeypatch.setattr(workflow.ast, "parse", count_parse)
     result = _query(tmp_path, snapshot, route="/run")
     assert result["stages"]["implementation"][0]["relation"] == "candidate"
-    assert result["stages"]["tests"][0]["verification"] == "python_literal_http_test"
+    assert result["stages"]["tests"][0]["reference_kind"] == "python_literal_http_test"
     assert parsed == Counter({source: 1 for source in sources.values()})
     assert result["completeness"]["files_scanned"] == len(sources)
     assert result["completeness"]["source_bytes_scanned"] == sum(len(s.encode()) for s in sources.values())
@@ -234,9 +206,9 @@ def test_dart_library_and_part_navigation_uses_structured_provider_relations(tmp
         "lib/comment.dart": "/*\nimport 'authority_part.dart';\n*/\nclass Unrelated {}\n",
     })
     result = _query(repo, snapshot, symbol="AuthorityPart", in_file="lib/authority_part.dart")
-    assert any(item["path"] == "lib/authority.dart" and item["relation"] == "confirmed"
+    assert any(item["path"] == "lib/authority.dart" and item["relation"] == "resolved"
                for item in result["stages"]["callers_or_dependents"])
-    assert any(item["path"] == "test/authority_test.dart" and item["relation"] == "confirmed"
+    assert any(item["path"] == "test/authority_test.dart" and item["relation"] == "resolved"
                for item in result["stages"]["tests"])
     assert not any(item["path"] == "lib/comment.dart" for item in result["stages"]["callers_or_dependents"])
 
@@ -267,10 +239,10 @@ def test_rust_module_navigation_keeps_owned_test_evidence(tmp_path) -> None:
         "crates/other/src/lib.rs": "#[test]\nfn audio_clock_contract() { assert!(true); }\n",
     })
     result = _query(repo, snapshot, symbol="audio_clock")
-    assert any(item["path"] == "crates/daemon/src/audio_clock.rs" and item["relation"] == "confirmed"
+    assert any(item["path"] == "crates/daemon/src/audio_clock.rs" and item["relation"] == "resolved"
                for item in result["stages"]["implementation"])
     assert any(item["path"] == "crates/daemon/src/audio_clock.rs"
-               and item.get("verification") == "rust_embedded_test_decl"
+               and item.get("reference_kind") == "rust_embedded_test_decl"
                for item in result["stages"]["tests"])
     assert not any(item["path"] == "crates/other/src/lib.rs" for item in result["stages"]["tests"])
 
@@ -296,7 +268,20 @@ def test_workflow_cli_discloses_provider_failure_without_demoting_local_relation
     assert coverage["status"] == "partial"
     result = data["result"]
     assert result["status"] == "found"
-    assert any(item["path"] == "service.py" and item["relation"] == "confirmed"
+    assert any(item["path"] == "service.py" and item["relation"] == "resolved"
                for item in result["stages"]["implementation"])
-    assert any(item["path"] == "tests/test_service.py" and item["relation"] == "confirmed"
+    assert any(item["path"] == "tests/test_service.py" and item["relation"] == "resolved"
                for item in result["stages"]["tests"])
+
+def test_handler_return_dependencies_follow_assignments_and_terminate_cycles() -> None:
+    assignments = ["    response0 = manager.load()"]
+    assignments.extend(f"    response{i} = response{i - 1}" for i in range(1, 180))
+    source = "\n".join([
+        "def handler():", *assignments,
+        "    ignored = logger.record('observed')",
+        "    return serialize(response179)",
+    ])
+    function = ast.parse(source).body[0]
+    assert workflow.collect_route_value_flow(function) == {("load", "manager")}
+    cycle = ast.parse("def handler():\n    first = second\n    second = first\n    return first\n").body[0]
+    assert workflow.collect_route_value_flow(cycle) == set()

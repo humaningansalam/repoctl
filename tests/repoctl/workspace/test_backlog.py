@@ -22,7 +22,7 @@ def test_backlog_list_returns_freeform_items_without_interpreting_fields(tmp_pat
         "  - Validation: `cd repos && python -m unittest tests/test_pricing.py`\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["backlog", "list", "--json"]) == 0
 
@@ -50,7 +50,7 @@ def test_backlog_add_show_remove_manage_raw_blocks(tmp_path: Path, monkeypatch, 
     (tmp_path / "docs/BOARD.md").write_text("# BOARD\n\n## Board\n\n- docs/tasks/T-20260609184046Z--alpha.md\n\n## Backlog\n\n<!-- backlog -->\n", encoding="utf-8")
     body = tmp_path / "backlog.md"
     body.write_text("Area: backend\nLikely files: free text only\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["backlog", "add", "Add discount support", "--body-file", str(body), "--json"]) == 0
     added = json.loads(capsys.readouterr().out)["data"]["item"]
@@ -70,7 +70,7 @@ def test_backlog_add_show_remove_manage_raw_blocks(tmp_path: Path, monkeypatch, 
 
 def test_backlog_add_rejects_multiline_title(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["backlog", "add", "Bad\nTitle", "--json"]) == 2
 
@@ -82,7 +82,7 @@ def test_backlog_add_body_file_keeps_bullets_inside_raw_block(tmp_path: Path, mo
     write_workspace(tmp_path)
     body = tmp_path / "body.md"
     body.write_text("- looks like another item\nplain note\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["backlog", "add", "Parent backlog", "--body-file", str(body), "--json"]) == 0
 
@@ -100,7 +100,7 @@ def test_backlog_list_does_not_attach_unindented_comments_to_raw_block(tmp_path:
         "# BOARD\n\n## Board\n\n## Backlog\n\n- First item\n<!-- separator comment -->\n- Second item\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["backlog", "list", "--json"]) == 0
 
@@ -112,7 +112,7 @@ def test_backlog_list_does_not_attach_unindented_comments_to_raw_block(tmp_path:
 def test_backlog_duplicate_raw_blocks_cannot_be_removed_by_ambiguous_id(tmp_path: Path, monkeypatch, capsys) -> None:
     write_workspace(tmp_path)
     (tmp_path / "docs/BOARD.md").write_text("# BOARD\n\n## Board\n\n## Backlog\n\n- Duplicate item\n- Duplicate item\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["backlog", "list", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)

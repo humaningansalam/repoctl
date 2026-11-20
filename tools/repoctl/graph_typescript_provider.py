@@ -15,6 +15,7 @@ from .graph_semantic_model import (
     SemanticProviderResult,
     parse_provider_coverage,
     parse_provider_semantics,
+    parse_provider_imports,
 )
 from .io import atomic_write
 from .repositories import RepoTarget
@@ -128,10 +129,11 @@ def _bundled_compiler(root: Path) -> tuple[Path | None, str]:
 def _unavailable(paths: tuple[str, ...], *, code: str, message: str) -> SemanticProviderResult:
     failures: tuple[ProviderFailure, ...] = ()
     if paths:
-        failures = (ProviderFailure(PROVIDER, "symbols,calls", code, message, paths),)
+        failures = (ProviderFailure(PROVIDER, "imports,symbols,calls", code, message, paths),)
     return SemanticProviderResult(
         provider=PROVIDER,
         languages=tuple(sorted(TYPESCRIPT_PROVIDER_LANGUAGES)),
+        import_failed_paths=paths,
         symbol_failed_paths=paths,
         call_failed_paths=paths,
         failures=failures,
@@ -193,6 +195,7 @@ def build_typescript_semantics(
     selected_paths = set(selected)
     try:
         analyzed, failed = parse_provider_coverage(data, eligible_paths=selected_paths)
+        imports = parse_provider_imports(data, eligible_paths=set(analyzed))
         symbols, calls = parse_provider_semantics(
             data,
             provider=PROVIDER,
@@ -210,7 +213,7 @@ def build_typescript_semantics(
         failures = (
             ProviderFailure(
                 PROVIDER,
-                "symbols,calls",
+                "imports,symbols,calls",
                 "typescript_analysis_failed",
                 "TypeScript compiler analysis failed for one or more source files",
                 failed,
@@ -219,6 +222,9 @@ def build_typescript_semantics(
     return SemanticProviderResult(
         provider=PROVIDER,
         languages=tuple(sorted(TYPESCRIPT_PROVIDER_LANGUAGES)),
+        imports=imports,
+        import_analyzed_paths=analyzed,
+        import_failed_paths=failed,
         symbols=tuple(symbols),
         calls=tuple(calls),
         symbol_analyzed_paths=analyzed,

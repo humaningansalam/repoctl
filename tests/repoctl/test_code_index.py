@@ -23,13 +23,12 @@ def test_index_code_extracts_python_facts(tmp_path: Path, monkeypatch, capsys) -
         "        Path('token.txt').write_text(hashlib.sha256(value).hexdigest())\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["index", "code", "--json"]) == 0
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["command"] == "index.code"
-    assert payload["data"]["authoritative"] is False
     entry = next(file for file in payload["data"]["files"] if file["path"] == rel)
     assert entry["language"] == "python"
     assert entry["symbols"] == ["TokenService", "issue"]
@@ -40,8 +39,6 @@ def test_index_code_extracts_python_facts(tmp_path: Path, monkeypatch, capsys) -
     ]
     assert entry["module_certain_bindings"] == ["Path", "TokenService", "hashlib"]
     assert "hashlib.sha256" in entry["calls"]
-    assert entry["deps"] == ["hashlib", "pathlib"]
-    assert {"crypto", "fs"} <= set(entry["observed_effects"])
 
 
 def test_index_code_keeps_typescript_inventory_separate_from_semantic_provider(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -57,7 +54,7 @@ def test_index_code_keeps_typescript_inventory_separate_from_semantic_provider(t
         "export const charge = () => fetch('/charge');\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["index", "code", "--json"]) == 0
 
@@ -65,10 +62,8 @@ def test_index_code_keeps_typescript_inventory_separate_from_semantic_provider(t
     entry = next(file for file in payload["data"]["files"] if file["path"] == rel)
     assert entry["language"] == "typescript"
     assert entry["symbols"] == []
-    assert entry["imports"] == ["axios"]
+    assert entry["imports"] == []
     assert entry["calls"] == []
-    assert entry["deps"] == ["axios"]
-    assert entry["observed_effects"] == ["net"]
 
 
 def test_index_code_extracts_dart_and_csharp_inventory(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -80,7 +75,7 @@ def test_index_code_extracts_dart_and_csharp_inventory(tmp_path: Path, monkeypat
     (repo / "Assets/Scripts").mkdir(parents=True)
     (repo / "lib/main.dart").write_text("import 'package:demo/app.dart';\nvoid main() {}\n", encoding="utf-8")
     (repo / "Assets/Scripts/PlayerController.cs").write_text("namespace Game { public class PlayerController {} }\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["index", "code", "--json"]) == 0
 
@@ -92,7 +87,7 @@ def test_index_code_extracts_dart_and_csharp_inventory(tmp_path: Path, monkeypat
     assert dart_entry["parse_status"] == "ok"
     assert csharp_entry["language"] == "csharp"
     assert csharp_entry["symbols"] == []
-    assert csharp_entry["parse_status"] == "ok"
+    assert csharp_entry["parse_status"] == "skipped"
     assert payload["data"]["summary"]["languages"]["dart"] == 1
     assert payload["data"]["summary"]["languages"]["csharp"] == 1
 
@@ -102,7 +97,7 @@ def test_index_code_changed_requires_repo_git(tmp_path: Path, monkeypatch, capsy
     repo = tmp_path / "repos"
     repo.mkdir()
     (repo / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["index", "code", "--changed", "--json"]) == 2
 
@@ -118,7 +113,7 @@ def test_index_code_reports_truncation_separately_from_total(tmp_path: Path, mon
     init_repo(repo)
     for index in range(3):
         (repo / f"mod{index}.py").write_text(f"def run_{index}():\n    return {index}\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["index", "code", "--limit", "2", "--json"]) == 0
 

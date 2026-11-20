@@ -36,12 +36,8 @@ def import_ref_id(
     return "repo:" + encode_component(parts[0]) + ":import-ref:" + ":".join(encode_component(part) for part in parts[1:])
 
 
-def task_id(value: str) -> str:
-    return f"task:{encode_component(value)}"
 
 
-def artifact_id(value: str, artifact_path: str) -> str:
-    return f"task:{encode_component(value)}:artifact:{encode_component(artifact_path)}"
 
 
 def document_id(path: str) -> str:
@@ -69,9 +65,6 @@ def digest_data(data: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(data).encode("utf-8")).hexdigest()
 
 
-class GraphContextAnchorKind(StrEnum):
-    FILE = "file"
-    SYMBOL = "symbol"
 
 
 class GraphQuerySelectorKind(StrEnum):
@@ -82,8 +75,6 @@ class GraphQuerySelectorKind(StrEnum):
     CALLEES_OF = "callees_of"
     IMPACT_FILE = "impact_file"
     IMPACT_SYMBOL = "impact_symbol"
-    TASK = "task"
-    ARTIFACT = "artifact"
 
 
 @dataclass(frozen=True)
@@ -105,8 +96,6 @@ GRAPH_QUERY_SELECTOR_SCHEMAS: dict[GraphQuerySelectorKind, GraphQuerySelectorSch
         required_fields=frozenset({"depth"}),
         optional_fields=frozenset({"in_file"}),
     ),
-    GraphQuerySelectorKind.TASK: GraphQuerySelectorSchema("task_id"),
-    GraphQuerySelectorKind.ARTIFACT: GraphQuerySelectorSchema("path"),
 }
 
 
@@ -139,62 +128,8 @@ def canonical_graph_query_selector(value: Any) -> dict[str, Any]:
     return result
 
 
-@dataclass(frozen=True)
-class GraphContextAnchor:
-    kind: GraphContextAnchorKind
-    path: str
-    symbol: str = ""
-    line_start: int = 0
-    line_end: int = 0
-    provider: str = ""
-    provider_symbol_id: str = ""
-
-    def key(self) -> tuple[str, str, str, int, int, str, str]:
-        return (
-            self.kind.value,
-            self.path,
-            self.symbol,
-            self.line_start,
-            self.line_end,
-            self.provider,
-            self.provider_symbol_id,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {"kind": self.kind.value, "path": self.path}
-        if self.symbol:
-            data["symbol"] = self.symbol
-        if self.line_start:
-            data["line_start"] = self.line_start
-        if self.line_end:
-            data["line_end"] = self.line_end
-        if self.provider:
-            data["provider"] = self.provider
-        if self.provider_symbol_id:
-            data["provider_symbol_id"] = self.provider_symbol_id
-        return data
 
 
-@dataclass(frozen=True)
-class GraphContinuation:
-    kind: GraphContextAnchorKind
-    value: str
-    in_file: str = ""
-    query_types: tuple[GraphQuerySelectorKind, ...] = ()
-    actions: tuple[str, ...] = ()
-
-    def selector_dict(self) -> dict[str, str]:
-        data = {"kind": self.kind.value, "value": self.value}
-        if self.in_file:
-            data["in_file"] = self.in_file
-        return data
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "selector": self.selector_dict(),
-            "query_types": [query_type.value for query_type in self.query_types],
-            "actions": list(self.actions),
-        }
 
 
 @dataclass(frozen=True)
@@ -280,8 +215,7 @@ class GraphSnapshot:
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     schema: str = "repoctl.graph.snapshot"
-    schema_version: int = 1
-    authoritative: bool = False
+    schema_version: int = 2
     capabilities: list[str] = field(default_factory=lambda: ["repository", "file", "import_ref"])
     snapshot_digest: str = ""
 
@@ -289,7 +223,6 @@ class GraphSnapshot:
         data: dict[str, Any] = {
             "schema": self.schema,
             "schema_version": self.schema_version,
-            "authoritative": self.authoritative,
             "repository": self.repository,
             "capabilities": sorted(self.capabilities),
             "sources": sorted(self.sources, key=lambda source: (source.get("kind", ""), source.get("assertion", ""), source.get("digest", ""))),
@@ -310,7 +243,6 @@ class GraphSnapshot:
             edges=self.edges,
             schema=self.schema,
             schema_version=self.schema_version,
-            authoritative=self.authoritative,
             capabilities=self.capabilities,
             snapshot_digest=digest_data(self.to_dict(include_digest=False)),
         )

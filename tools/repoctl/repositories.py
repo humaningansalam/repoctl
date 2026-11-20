@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import subprocess
@@ -10,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from .io import RepoctlError, atomic_write
-from .settings import load_repoctl_settings
 
 
 REPO_ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -21,7 +19,6 @@ class RepositoryIdentitySource(StrEnum):
     WORKSPACE = "workspace"
     RESERVED = "reserved"
     PINNED = "pinned"
-    UNBOUND = "unbound"
 
 
 @dataclass(frozen=True)
@@ -58,20 +55,15 @@ class RepoSelectorResolution:
 
 @dataclass(frozen=True)
 class RepoCandidate:
-    root_path: Path
     display_path: str
     suggested_id: str
     git_toplevel: str
-    validation_status: str = "valid"
-    identity_status: str = "unbound"
 
     def to_dict(self) -> dict[str, str]:
         return {
             "path": self.display_path,
             "suggested_id": self.suggested_id,
             "git_toplevel": self.git_toplevel,
-            "validation_status": self.validation_status,
-            "identity_status": self.identity_status,
         }
 
 
@@ -80,20 +72,12 @@ class RepoLayout:
     placement: str
     targets: tuple[RepoTarget, ...]
     candidates: tuple[RepoCandidate, ...] = ()
-    registry_ready: bool = True
-    revision: str = ""
-    warnings: tuple[str, ...] = ()
-    problems: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "placement": self.placement,
-            "registry_ready": self.registry_ready,
-            "revision": self.revision,
             "targets": [target.to_dict() for target in self.targets],
             "candidates": [candidate.to_dict() for candidate in self.candidates],
-            "warnings": list(self.warnings),
-            "problems": list(self.problems),
         }
 
 
@@ -148,10 +132,6 @@ def resolve_repo_selector_path(
     return RepoSelectorResolution(RepoSelectorStatus.NOT_FOUND, workspace_candidate or normalized)
 
 
-def _casefold_id(value: str) -> str:
-    return value.casefold()
-
-
 def _git_toplevel(path: Path) -> Path | None:
     if not path.exists():
         return None
@@ -175,9 +155,6 @@ def is_git_repo_root(path: Path) -> bool:
         return False
 
 
-def _revision(layout_data: dict[str, Any]) -> str:
-    encoded = json.dumps(layout_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _target(root: Path, repo_id: str, rel: str, *, identity_source: str, require_git: bool = True) -> RepoTarget:
@@ -200,8 +177,8 @@ def _configured_targets(root: Path, settings: dict[str, Any]) -> tuple[RepoTarge
     raw = settings.get("repositories")
     if raw is None:
         return None
-    if not isinstance(raw, list) or not raw:
-        raise RepoctlError("docs/repoctl.json repositories must be a non-empty array")
+    if not isinstance(raw, list):
+        raise RepoctlError("docs/repoctl.json repositories must be an array")
     targets: list[RepoTarget] = []
     ids: set[str] = set()
     paths: set[str] = set()
@@ -216,7 +193,7 @@ def _configured_targets(root: Path, settings: dict[str, Any]) -> tuple[RepoTarge
             raise RepoctlError("repository id must be a non-empty string")
         if not isinstance(path, str) or not path.strip():
             raise RepoctlError("repository path must be a non-empty string")
-        folded = _casefold_id(repo_id.strip())
+        folded = repo_id.strip().casefold()
         if folded in ids:
             raise RepoctlError(f"duplicate repository id: {repo_id}")
         ids.add(folded)
@@ -264,7 +241,7 @@ def _candidates_for_discovered(root: Path, discovered: list[str]) -> tuple[RepoC
     for rel in discovered:
         path = root / rel
         top = _git_toplevel(path)
-        candidates.append(RepoCandidate(path, rel, _suggested_id_for_candidate(rel), top.as_posix() if top else ""))
+        candidates.append(RepoCandidate(rel, _suggested_id_for_candidate(rel), top.as_posix() if top else ""))
     return tuple(candidates)
 
 
@@ -276,14 +253,16 @@ def _layout_from_settings(root: Path, settings: dict[str, Any]) -> RepoLayout:
         layout = RepoLayout("collection", configured, candidates=_candidates_for_discovered(root, extras))
     elif "repos" in discovered:
         layout = RepoLayout("direct", (_target(root, "main", "repos", identity_source="reserved"),))
+    elif not discovered and is_git_repo_root(root):
+        layout = RepoLayout("direct", (_target(root, "main", ".", identity_source="reserved"),))
     else:
         candidates = _candidates_for_discovered(root, discovered)
-        layout = RepoLayout("collection" if candidates else "empty", (), candidates=candidates, registry_ready=not candidates)
-    return RepoLayout(layout.placement, layout.targets, layout.candidates, layout.registry_ready, _revision(layout.to_dict()))
+        layout = RepoLayout("collection" if candidates else "empty", (), candidates=candidates)
+    return layout
 
 
 def repo_layout(root: Path) -> RepoLayout:
-    return _layout_from_settings(root, load_repoctl_settings(root))
+    return _layout_from_settings(root, _load_settings(root))
 
 
 def default_repo_target(root: Path, *, layout: RepoLayout | None = None) -> RepoTarget | None:
@@ -305,11 +284,11 @@ def _require_git_target(root: Path, target: RepoTarget) -> RepoTarget:
 
 
 def workspace_target(root: Path) -> RepoTarget:
-    """An evidence scope, never a registered or writable product repository."""
+    """Select documents at the workspace root."""
     return RepoTarget("", root, ".", RepositoryIdentitySource.WORKSPACE)
 
 
-def evidence_target(root: Path, *, repo_id: str | None = None, workspace: bool = False) -> RepoTarget:
+def source_target(root: Path, *, repo_id: str | None = None, workspace: bool = False) -> RepoTarget:
     return workspace_target(root) if workspace else require_repo_target(root, repo_id=repo_id)
 
 
@@ -330,7 +309,7 @@ def require_repo_target(root: Path, repo_id: str | None = None, *, layout: RepoL
 def repo_check_problems(root: Path, layout: RepoLayout) -> list[dict[str, str]]:
     from .git import repo_git_state
 
-    problems: list[dict[str, str]] = list(layout.problems)
+    problems: list[dict[str, str]] = []
     for target in layout.targets:
         state = repo_git_state(root, target)
         if not state.available:
@@ -368,7 +347,7 @@ def adopt_repositories(root: Path, *, all_candidates: bool = False, path: str = 
         selected = [(repo_id or ("main" if rel == "repos" else _suggested_id_for_candidate(rel)), rel)]
     if not selected:
         raise RepoctlError("no repository candidates to adopt")
-    settings = load_repoctl_settings(root)
+    settings = _load_settings(root)
     entries = [{"id": target.id, "path": target.display_path} for target in layout.targets]
     for identity, rel in selected:
         _target(root, identity, rel, identity_source="pinned")
@@ -377,3 +356,16 @@ def adopt_repositories(root: Path, *, all_candidates: bool = False, path: str = 
     validated = _layout_from_settings(root, new_settings)
     atomic_write(root / "docs/repoctl.json", json.dumps(new_settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     return validated
+
+
+def _load_settings(root: Path) -> dict[str, Any]:
+    path = root / "docs/repoctl.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RepoctlError(f"invalid docs/repoctl.json: {exc.msg}", code="invalid_repoctl_settings", path="docs/repoctl.json") from exc
+    if not isinstance(data, dict):
+        raise RepoctlError("docs/repoctl.json must contain a JSON object", code="invalid_repoctl_settings", path="docs/repoctl.json")
+    return data

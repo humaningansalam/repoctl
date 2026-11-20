@@ -35,7 +35,7 @@ def test_graph_build_direct_repo_uses_main(tmp_path: Path, monkeypatch, capsys) 
     repo = tmp_path / "repos"
     init_repo(repo)
     (repo / "app.py").write_text("import hashlib\n\ndef run():\n    return hashlib.sha256(b'x').hexdigest()\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -46,29 +46,6 @@ def test_graph_build_direct_repo_uses_main(tmp_path: Path, monkeypatch, capsys) 
     assert any(node["id"] == file_id("main", "app.py") and node["kind"] == "file" for node in snapshot["nodes"])
 
 
-def test_graph_language_capabilities_do_not_claim_semantics_for_config_languages(tmp_path: Path, monkeypatch, capsys) -> None:
-    write_workspace(tmp_path)
-    repo = tmp_path / "repos"
-    init_repo(repo)
-    (repo / "config.yaml").write_text("feature: enabled\n", encoding="utf-8")
-    (repo / "index.html").write_text("<main>searchable product surface</main>\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
-
-    assert main(["graph", "build", "--full", "--json"]) == 0
-
-    snapshot = _snapshot(json.loads(capsys.readouterr().out))
-    assert snapshot["completeness"]["capabilities"]["symbols"] == "complete"
-    assert snapshot["completeness"]["capabilities"]["calls"] == "complete"
-    yaml = snapshot["completeness"]["language_capabilities"]["yaml"]
-    assert yaml["semantic_source"] is False
-    assert yaml["provider_defined"] is False
-    assert yaml["symbols_status"] == "unsupported"
-    assert yaml["calls_status"] == "unsupported"
-    assert yaml["precise_semantics"] is False
-    html = snapshot["completeness"]["language_capabilities"]["html"]
-    assert html["context_source"] is True
-    assert html["semantic_source"] is False
-    assert html["provider_defined"] is False
 
 
 def test_graph_build_json_is_summary_first_without_full(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -76,7 +53,7 @@ def test_graph_build_json_is_summary_first_without_full(tmp_path: Path, monkeypa
     repo = tmp_path / "repos"
     init_repo(repo)
     (repo / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--json"]) == 0
 
@@ -103,7 +80,7 @@ def test_graph_build_excludes_generated_dependency_dirs_by_default(tmp_path: Pat
     (repo / ".next/server/chunks/noise.js").write_text("export const generated = true\n", encoding="utf-8")
     (repo / "__pycache__").mkdir()
     (repo / "__pycache__/app.cpython-311.pyc").write_bytes(b"pyc")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -119,7 +96,7 @@ def test_graph_build_configured_multi_requires_repo_id(tmp_path: Path, monkeypat
     init_repo(tmp_path / "repos/web")
     init_repo(tmp_path / "repos/api")
     write_settings(tmp_path, {"repositories": [{"id": "web", "path": "repos/web"}, {"id": "api", "path": "repos/api"}]})
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 2
 
@@ -135,7 +112,7 @@ def test_graph_build_configured_multi_includes_only_selected_repo(tmp_path: Path
     (web / "app.py").write_text("import requests\n", encoding="utf-8")
     (api / "app.py").write_text("import urllib.request\n", encoding="utf-8")
     write_settings(tmp_path, {"repositories": [{"id": "web", "path": "repos/web"}, {"id": "api", "path": "repos/api"}]})
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--repo-id", "web", "--full", "--json"]) == 0
 
@@ -148,7 +125,7 @@ def test_graph_build_unconfigured_collection_fails(tmp_path: Path, monkeypatch, 
     write_workspace(tmp_path)
     init_repo(tmp_path / "repos/web")
     init_repo(tmp_path / "repos/api")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--repo-id", "web", "--full", "--json"]) == 2
 
@@ -287,7 +264,7 @@ def test_graph_materialization_invalidates_importers_when_module_identity_become
     )
 
 
-def test_graph_materialization_reuses_unchanged_source_evidence(tmp_path: Path) -> None:
+def test_graph_materialization_reuses_unchanged_inputs(tmp_path: Path) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
@@ -396,17 +373,7 @@ def test_graph_build_keeps_snapshot_with_code_index_warning(tmp_path: Path, monk
     def warning_index(*args, **kwargs):
         return (
             [
-                CodeIndexEntry(
-                    path="app.py",
-                    workspace_path="repos/app.py",
-                    language="python",
-                    classification="indexed_only",
-                    symbols=[],
-                    imports=[],
-                    calls=[],
-                    deps=[],
-                    observed_effects=[],
-                )
+                CodeIndexEntry(path='app.py', workspace_path='repos/app.py', language='python', classification='included', symbols=[], imports=[], calls=[])
             ],
             [Problem("warning", "index_warning", "non-fatal index warning", "repos/app.py")],
             {"summary": {"truncated": False, "parse_error": 0}},
@@ -425,7 +392,7 @@ def test_graph_parse_error_keeps_file_node_and_marks_completeness(tmp_path: Path
     repo = tmp_path / "repos"
     init_repo(repo)
     (repo / "bad.py").write_text("def broken(:\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -452,7 +419,7 @@ def test_graph_python_ast_provider_adds_symbol_and_anchor_nodes(tmp_path: Path, 
         "    return TokenService()\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -480,7 +447,7 @@ def test_graph_python_ast_provider_distinguishes_nested_function_from_method(tmp
         "        return inner()\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -488,3 +455,87 @@ def test_graph_python_ast_provider_distinguishes_nested_function_from_method(tmp
     kinds = {node["facts"]["provider"]["qualified_name"]: node["facts"]["provider"]["kind"] for node in snapshot["nodes"] if node["kind"] == "symbol"}
     assert kinds["Service.method"] == "method"
     assert kinds["Service.method.inner"] == "function"
+
+def test_typescript_import_edges_use_parsed_declarations_and_refresh(tmp_path: Path) -> None:
+    write_workspace(tmp_path)
+    repo = tmp_path / "repos"
+    init_repo(repo)
+    (repo / "real.ts").write_text("export function run() { return 1; }\n")
+    (repo / "fake.ts").write_text("export const fake = true;\n")
+    (repo / "app.ts").write_text(
+        "import { run } from './real';\n"
+        "export { value } from './future';\n"
+        "// import { fake } from './fake';\n"
+        "/* require('./fake'); */\n"
+        "const fixture = \"import { fake } from './fake';\";\n"
+        "const template = `require('./fake')`;\n"
+        "function shadowed(require: (name: string) => unknown) { return require('./fake'); }\n"
+        "export const result = run();\n"
+    )
+    target = require_repo_target(tmp_path, repo_id="main")
+    snapshot, problems, _meta = materialize_graph(tmp_path, target=target)
+    assert snapshot is not None
+    assert not [problem for problem in problems if problem.severity == "error"]
+    declarations = [
+        node.identity["raw_import"] for node in snapshot.nodes
+        if node.kind == "import_ref" and node.identity["importer_path"] == "app.ts"
+    ]
+    assert set(declarations) == {"./real", "./future"}
+    assert any(edge.kind == "IMPORTS_FILE" and edge.to_id == file_id("main", "real.ts") for edge in snapshot.edges)
+    assert not any(edge.kind == "IMPORTS_FILE" and edge.to_id == file_id("main", "fake.ts") for edge in snapshot.edges)
+
+    (repo / "future.ts").write_text("export const value = 2;\n")
+    refreshed, problems, _meta = materialize_graph(tmp_path, target=target)
+    assert refreshed is not None
+    assert not [problem for problem in problems if problem.severity == "error"]
+    assert any(edge.kind == "IMPORTS_FILE" and edge.to_id == file_id("main", "future.ts") for edge in refreshed.edges)
+
+    (repo / "app.ts").write_text("// import { run } from './real';\nexport const result = 3;\n")
+    changed, problems, _meta = materialize_graph(tmp_path, target=target)
+    assert changed is not None
+    assert not [problem for problem in problems if problem.severity == "error"]
+    assert not any(node.kind == "import_ref" and node.identity["importer_path"] == "app.ts" for node in changed.nodes)
+
+
+def test_graph_reports_unreadable_provider_input_without_materializing(tmp_path: Path, monkeypatch) -> None:
+    write_workspace(tmp_path)
+    repo = tmp_path / "repos"
+    init_repo(repo)
+    (repo / "pubspec.yaml").write_text("name: sample\n")
+    package_config = repo / ".dart_tool/package_config.json"
+    package_config.parent.mkdir()
+    package_config.write_text('{"configVersion":2,"packages":[]}\n')
+    read_bytes = Path.read_bytes
+    def read(path: Path) -> bytes:
+        if path == package_config:
+            raise PermissionError("package config is unreadable")
+        return read_bytes(path)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    snapshot, problems, meta = materialize_graph(tmp_path, target=require_repo_target(tmp_path, repo_id="main"))
+    assert snapshot is None
+    assert [problem.code for problem in problems] == ["graph_input_unreadable"]
+    assert meta["materialization"]["status"] == "unavailable"
+    assert not (tmp_path / ".repoctl-state/graph/main/snapshot.json").exists()
+
+
+def test_knowledge_citation_does_not_declare_code_applicability(tmp_path: Path, monkeypatch) -> None:
+    write_workspace(tmp_path)
+    repo = tmp_path / "repos"
+    init_repo(repo)
+    for name in ("applies.py", "cited.py"):
+        (repo / name).write_text("value = 1\n")
+    monkeypatch.setattr("tools.repoctl.graph.knowledge_records_for_graph", lambda *args, **kwargs: ([
+        {
+            "id": "K-1", "claim": "A saved decision", "status": "active",
+            "applies_to": {"paths": ["applies.py"]},
+            "source_refs": [{"path": "repos/cited.py", "content_sha256": "sha256:" + "a" * 64}],
+        }
+    ], []))
+    snapshot, problems, _meta = build_graph(tmp_path, target=require_repo_target(tmp_path, repo_id="main"))
+    assert snapshot is not None
+    assert not [problem for problem in problems if problem.severity == "error"]
+    applies = [edge.to_id for edge in snapshot.edges if edge.kind == "KNOWLEDGE_APPLIES_TO"]
+    assert applies == [file_id("main", "applies.py")]
+    provenance = [edge for edge in snapshot.edges if edge.kind == "KNOWLEDGE_SOURCED_FROM"]
+    assert len(provenance) == 1
+    assert provenance[0].assertion == "recorded"

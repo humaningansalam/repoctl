@@ -88,7 +88,7 @@ def _direct_target(call: Any, source: bytes) -> str:
 
 # Local binding syntax is not a type/target resolution. A locally declared
 # callable may shadow a same-file top-level function name: such a call is NOT
-# provider-confirmed even if there is only one function of that name.
+# provider-resolved even if there is only one function of that name.
 _LOCAL_BINDING_NODES = frozenset({
     "let_declaration", "short_var_declaration", "var_spec",
     "parameter", "parameter_declaration", "formal_parameter",
@@ -119,12 +119,8 @@ def _local_binding_names(node: Any, source: bytes) -> set[str]:
         return set()
     names: set[str] = set()
     pending = [binding]
-    budget = 0
     while pending:
         current = pending.pop()
-        budget += 1
-        if budget > 256:
-            return {"*"}  # unknown binding shape: do not assert a local target
         if current.type in {"identifier", "simple_identifier"}:
             names.add(_node_text(source, current))
             continue
@@ -149,7 +145,7 @@ def _unqualified_call_target_is_provable(
     if language in {"rust", "go"}:
         # `fn work` at module root is callable as `work()`. `impl A::work`
         # and Go `(a A) work` are not free functions. Inline module imports
-        # are deliberately unconfirmed without symbol scope resolution.
+        # are deliberately unresolved without symbol scope resolution.
         return callee.kind == "function" and not callee_scope and not caller_scope
     if language == "java":
         return bool(callee_scope) and caller_scope == callee_scope and callee.kind == "method"
@@ -406,7 +402,7 @@ def build_tree_sitter_semantics(
     # Java/Kotlin `import package.Type` is a real file dependency only if
     # that exact fully qualified top-level type is uniquely declared by one
     # known AST-validated source. Glob imports and inferred packages are not
-    # promoted to confirmed Graph edges.
+    # promoted to resolved Graph edges.
     for importer, language, imported_type, anchor in exact_imports:
         targets = declared_package_types.get((language, imported_type), [])
         if len(targets) == 1 and targets[0] != importer:
@@ -420,7 +416,7 @@ def build_tree_sitter_semantics(
     # In Go, free functions are visible across files in the *same directory
     # and declared package*. Resolve only a unique top-level declaration
     # (never a receiver method, external package, shadowed local, or a name
-    # found in text). Source AST analysis has already verified both endpoints.
+    # found in text). Source AST analysis has already resolved both endpoints.
     go_functions: dict[tuple[str, str, str], list[PreciseSymbol]] = defaultdict(list)
     for symbol in all_symbols:
         package_info = language_packages.get(symbol.path)

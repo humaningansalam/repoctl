@@ -1,23 +1,51 @@
 # JSON interface
 
-Commands that support `--json` return one object:
+Pass `--json` to receive a command result as one object:
 
 ```json
 {
   "ok": true,
   "command": "task.list",
-  "data": {},
+  "data": {"tasks": []},
   "warnings": [],
   "problems": []
 }
 ```
 
-`command` names the operation. `data` contains its result. Problems report errors; warnings provide additional context. Each diagnostic has a stable code and message, with a source path when relevant.
+`command` identifies the operation. `data` contains its result. Each diagnostic has a `code` and `message`, with `severity` and a source `path` where relevant. Warnings provide context; problems describe errors and set `ok` to `false`.
 
-Task output represents the current Markdown record and its relationships. A parent link identifies another Task. Handoff text is authored guidance; missing optional hints do not prevent reading or changing status.
+Successful commands exit with status 0. A result containing problems exits with status 1. Rejected arguments and command failures exit with status 2.
 
-A successful status change confirms the requested document operation. It does not claim that a product test, review, commit, or deployment happened.
+## Task results
 
-Source-navigation results include source identity and analysis coverage. A partial or unavailable result does not establish that a symbol or dependency is absent. Paths in repository results are repository-relative; an explicitly named workspace path is workspace-relative.
+Task identity includes `id`, `title`, `status`, `path`, `repo_id`, `parent` and `archived`. Task paths are relative to the workspace.
 
-The 1.0 interface removes the previous binding, receipt, ownership, catalogue, metadata, and field-gate protocol. Consumers of older command-specific fields must update rather than relying on synthetic compatibility values.
+| Command | Result |
+| --- | --- |
+| `task list` | `data.tasks`, with status and repository filters available |
+| `task show` | Task identity, parsed `frontmatter` and authored `body` |
+| `task show --summary` | Task identity |
+| `task show --section <HEADING>` | `task`, `section` and that section's `body` |
+| `task resume <ID>` | `task` and authored `handoff`; `--full` includes body and frontmatter |
+| `task resume` | The single live Task, or `task: null` and a `candidates` list |
+| `task create`, `start`, `block`, `finish`, `cancel` | `task_id`, resulting `path` and `status` |
+
+Task statuses are `todo`, `doing`, `blocked`, `done` and `canceled`. Finishing and canceling move the selected document to `docs/archive/tasks/`. Parent and dependency fields describe relationships; each Task changes status independently.
+
+`task create --body-file` reads an authored UTF-8 Markdown body. Lifecycle commands update the Task metadata and retain its body. Explicit finish summaries and block/cancel reasons are appended as authored notes.
+
+## Knowledge results
+
+Knowledge records contain an ID, repository association and claim. Optional fields hold a kind, reason, source references, applicability paths, replaced record IDs and author.
+
+Workspace notes use an empty `repo_id`. `--repo-id <ID>` selects records associated with that ID. A cited source is an existing workspace-relative file; its saved reference contains a `content_sha256`.
+
+`knowledge add` returns `record` and `record_path`. Query entries include `exact_match` and `matched_terms` for the match. Queries select active records by default; `--include-superseded` also returns replaced records. A negative `--limit` returns all matches; zero returns counts only.
+
+Record `status` is `active` or `superseded`. `source_statuses` independently observes each cited file as `unchanged`, `changed`, `missing` or `unavailable`. An unavailable source could not be read. The saved source hash identifies the cited content. Applicability in `applies_to.paths` is relative to the associated repository, or to the workspace for workspace records.
+
+## Source navigation
+
+Source-operation paths are relative to the selected repository, or to the workspace when `--workspace` is selected. `graph search` returns matching source snippets. Typed Graph queries include relationship resolution and analysis coverage.
+
+The [Graph contract](repoctl-graph-contract.md) defines the source-search and relationship results. Use each command's `--help` for its selectors and optional fields.

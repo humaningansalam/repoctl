@@ -4,7 +4,6 @@ import errno
 import os
 import time
 import uuid
-from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,12 +19,10 @@ class RepoctlError(RuntimeError):
         *,
         code: str = "repoctl_error",
         path: str | None = None,
-        cause_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.path = path
-        self.cause_code = cause_code
 
 
 @dataclass(frozen=True)
@@ -45,26 +42,26 @@ class Problem:
         return data
 
 
-def _is_workspace_root(candidate: Path) -> bool:
-    return (candidate / "docs/tasks").is_dir()
 
 
-def find_workspace_root() -> Path:
-    """Use an explicit workspace, otherwise find Task documents above cwd."""
-    external = os.environ.get("REPOCTL_WORKSPACE_ROOT")
+def find_workspace_root(explicit: str | Path | None = None) -> Path:
+    """Resolve an explicit directory or discover the workspace above cwd."""
+    external = explicit if explicit is not None else os.environ.get("REPOCTL_WORKSPACE_ROOT")
     if external is not None:
         try:
             candidate = Path(external).expanduser().resolve(strict=True)
         except (OSError, ValueError, RuntimeError) as error:
             raise RepoctlError("workspace root is inaccessible", code="workspace_root_invalid") from error
-        if not _is_workspace_root(candidate):
-            raise RepoctlError("workspace root has no docs/tasks directory", code="workspace_root_invalid", path=str(candidate))
+        if not candidate.is_dir():
+            raise RepoctlError("workspace root is not a directory", code="workspace_root_invalid", path=str(candidate))
         return candidate
     here = Path.cwd().resolve()
-    for candidate in (here, *here.parents):
-        if _is_workspace_root(candidate):
+    ancestors = (here, *here.parents)
+    for candidate in ancestors:
+        if ((candidate / "docs/tasks").is_dir() or (candidate / "docs/repoctl.json").is_file()
+                or (candidate / ".git").exists()):
             return candidate
-    raise RepoctlError("workspace not found; run inside a workspace or set REPOCTL_WORKSPACE_ROOT", code="workspace_root_not_found")
+    raise RepoctlError("workspace not found; pass --workspace-root or set REPOCTL_WORKSPACE_ROOT", code="workspace_root_not_found")
 
 
 @contextmanager
@@ -162,10 +159,3 @@ def write_temporary_text(path: Path, text: str, *, suffix: str = ".tmp") -> Path
             temporary.unlink()
         raise
     return temporary
-
-
-def decode_schema_version(value: object, *, supported: Collection[int]) -> int:
-    """Return an exact JSON integer schema version without numeric coercion."""
-    if type(value) is not int or value not in supported:
-        raise ValueError("schema version is not a supported exact integer")
-    return value

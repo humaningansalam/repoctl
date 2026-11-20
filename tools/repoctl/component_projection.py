@@ -831,11 +831,7 @@ def component_projection(snapshot: GraphSnapshot) -> dict[str, Any]:
 def annotate_graph_query_components(
     payload: dict[str, Any],
     projection: dict[str, Any],
-    *,
-    crossing_limit: int = 8,
 ) -> dict[str, Any]:
-    if type(crossing_limit) is not int or crossing_limit <= 0:
-        raise ValueError("crossing_limit must be a positive integer")
     subject_components = projection.get("subjects") if isinstance(projection.get("subjects"), dict) else {}
     relations = projection.get("relations") if isinstance(projection.get("relations"), list) else []
 
@@ -884,61 +880,11 @@ def annotate_graph_query_components(
         )
         in visible_relations
     ]
-    payload["component_crossings"] = eligible[:crossing_limit]
+    payload["component_crossings"] = eligible
     payload["component_crossing_count"] = len(eligible)
-    payload["component_crossings_truncated"] = len(eligible) > crossing_limit
     return payload
 
 
-def annotate_context_projection_components(
-    projection: dict[str, Any],
-    component_data: dict[str, Any],
-) -> dict[str, Any]:
-    """Add memberships/crossings to an existing Context Graph projection."""
-
-    path_components = component_data.get("paths") if isinstance(component_data.get("paths"), dict) else {}
-    crossings = component_data.get("relations") if isinstance(component_data.get("relations"), list) else []
-    by_edge = {
-        (
-            str(item.get("edge") or ""),
-            str(item.get("from_id") or ""),
-            str(item.get("to_id") or ""),
-        ): item
-        for item in crossings
-        if isinstance(item, dict)
-    }
-    visible_crossings: list[dict[str, Any]] = []
-    for relation in projection.get("relations", []):
-        if not isinstance(relation, dict):
-            continue
-        crossing = by_edge.get(
-            (
-                str(relation.get("edge") or ""),
-                str(relation.get("from_id") or ""),
-                str(relation.get("to_id") or ""),
-            )
-        )
-        if crossing is None:
-            continue
-        relation.update(
-            {
-                "from_component_ids": crossing["from_component_ids"],
-                "to_component_ids": crossing["to_component_ids"],
-                "crossed_component_ids": crossing["crossed_component_ids"],
-            }
-        )
-        visible_crossings.append(crossing)
-    for anchor in projection.get("seed_anchors", []):
-        if not isinstance(anchor, dict):
-            continue
-        path = str(anchor.get("path") or "")
-        component_ids = path_components.get(path)
-        if component_ids:
-            anchor["component_ids"] = component_ids
-    projection["component_crossings"] = visible_crossings
-    projection["component_crossing_count"] = len(visible_crossings)
-    projection["component_crossings_truncated"] = False
-    return projection
 
 
 def _node_path(

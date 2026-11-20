@@ -110,17 +110,13 @@ def _heading_ranges(text: str) -> list[tuple[str, int, int]]:
         visible, in_comment = _without_comments(line, in_comment)
         marker = re.match(r"^ {0,3}(\x60{3,}|~{3,})(.*)$", visible.rstrip("\r\n"))
         if marker:
-            sequence, suffix = marker.groups()
-            if not fence_char:
-                fence_char, fence_length = sequence[0], len(sequence)
-            elif sequence[0] == fence_char and len(sequence) >= fence_length and not suffix.strip():
-                fence_char, fence_length = "", 0
+            sequence = marker.group(1)
+            fence_char, fence_length = sequence[0], len(sequence)
             offset += len(line)
             continue
-        if not fence_char:
-            heading = re.match(r"^ {0,3}##[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$", visible.rstrip("\r\n"))
-            if heading:
-                ranges.append(("## " + heading.group(1).strip(), offset, offset + len(line)))
+        heading = re.match(r"^ {0,3}##[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$", visible.rstrip("\r\n"))
+        if heading:
+            ranges.append(("## " + heading.group(1).strip(), offset, offset + len(line)))
         offset += len(line)
     return ranges
 
@@ -153,60 +149,10 @@ def has_section(text: str, heading: str) -> bool:
     return True
 
 
-def labeled_list_lines(text: str, heading: str, labels: tuple[str, ...]) -> list[tuple[str, str, int, int]]:
-    """Return field values and their source-line spans, excluding examples."""
-    section = find_section(text, heading)
-    entries: list[tuple[str, str, int, int]] = []
-    current = ""
-    fence_char, fence_length = "", 0
-    in_comment = False
-    offset = section.body_start
-    for line in text[section.body_start:section.end].splitlines(keepends=True):
-        start, offset = offset, offset + len(line)
-        stripped = line.strip()
-        marker = re.match(r"^(\x60{3,}|~{3,})(.*)$", stripped)
-        if fence_char:
-            if marker and marker.group(1)[0] == fence_char and len(marker.group(1)) >= fence_length and not marker.group(2).strip():
-                fence_char, fence_length = "", 0
-            continue
-        visible, in_comment = _without_comments(line, in_comment)
-        stripped = visible.strip()
-        marker = re.match(r"^(\x60{3,}|~{3,})(.*)$", stripped)
-        if marker:
-            sequence, _suffix = marker.groups()
-            fence_char, fence_length = sequence[0], len(sequence)
-            current = ""
-            continue
-        if not stripped:
-            continue
-        if visible.startswith("- "):
-            label, separator, value = visible[2:].partition(":")
-            current = label if separator and label in labels else ""
-            if current:
-                entries.append((current, value.strip(), start, offset))
-        elif current and visible.startswith(("  ", "\t")) and stripped.startswith("- "):
-            entries.append((current, stripped[2:].strip(), start, offset))
-        else:
-            current = ""
-    return entries
 
 
-def parse_labeled_list_section(text: str, heading: str, labels: tuple[str, ...]) -> dict[str, list[str]]:
-    parsed: dict[str, list[str]] = {}
-    for label, value, _start, _end in labeled_list_lines(text, heading, labels):
-        values = parsed.setdefault(label, [])
-        if value:
-            values.append(value)
-    return parsed
 
 
-def replace_section(text: str, heading: str, body: str) -> str:
-    section = find_section(text, heading)
-    newline = "\r\n" if "\r\n" in text else "\n"
-    normalized = body.replace("\r\n", "\n").replace("\n", newline).rstrip("\r\n") + newline
-    if text[section.end:]:
-        normalized += newline
-    return text[:section.body_start] + newline + normalized + text[section.end:]
 
 
 def append_section_entry(text: str, heading: str, entry: str) -> str:

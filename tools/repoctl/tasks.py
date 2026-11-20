@@ -1,4 +1,4 @@
-"""Task documents and edits. No product Git state is changed or inferred here."""
+"""Task documents and prepared lifecycle edits."""
 
 from __future__ import annotations
 
@@ -7,15 +7,14 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from .io import Problem, RepoctlError
 from .markdown import (
-    append_section_entry, find_section, labeled_list_lines, parse_frontmatter,
-    parse_labeled_list_section, replace_frontmatter_line,
-    section_ranges,
+    append_section_entry, find_section, parse_frontmatter,
+    replace_frontmatter_line, section_ranges,
 )
 
 LIVE = {"todo", "doing", "blocked"}
@@ -29,8 +28,8 @@ class Task:
     rel_path: str
     frontmatter: dict[str, Any]
     body: str
+    source_text: str
     archived: bool = False
-    source_text: str | None = None
 
     @property
     def id(self) -> str:
@@ -52,21 +51,6 @@ class Task:
     def repo_id(self) -> str:
         return str(self.frontmatter.get("repo_id") or "")
 
-    def to_list_dict(self, *, compact: bool = False) -> dict[str, Any]:
-        result = {
-            "id": self.id, "path": self.rel_path, "title": self.title,
-            "status": self.status, "parent": self.parent, "repo_id": self.repo_id,
-            "area": str(self.frontmatter.get("area") or ""), "archived": self.archived,
-        }
-        if not compact:
-            result.update({
-                "owner": str(self.frontmatter.get("owner") or ""),
-                "repo_ref": str(self.frontmatter.get("repo_ref") or ""),
-                "depends_on": self.frontmatter.get("depends_on") or [],
-                "completed_at": str(self.frontmatter.get("completed_at") or ""),
-            })
-        return result
-
 
 def _read_text(path: Path) -> str:
     with path.open(encoding="utf-8", newline="") as source:
@@ -86,7 +70,7 @@ def load_task(path: Path, root: Path, *, archived: bool = False) -> Task:
     _contained_path(root, path)
     text = _read_text(path)
     fields, body = parse_frontmatter(text)
-    return Task(path, path.relative_to(root).as_posix(), fields, body, archived, source_text=text)
+    return Task(path, path.relative_to(root).as_posix(), fields, body, source_text=text, archived=archived)
 
 
 def load_tasks(root: Path, *, include_archived: bool = False) -> list[Task]:
@@ -96,22 +80,12 @@ def load_tasks(root: Path, *, include_archived: bool = False) -> list[Task]:
         folders.append((root / "docs/archive/tasks", True))
     for folder, archived in folders:
         for path in sorted(folder.glob("*.md")):
-            if path.name.endswith("TEMPLATE.md"):
+            if path.name == "TEMPLATE.md":
                 continue
             task = load_task(path, root, archived=archived)
             if task.id or path.name.startswith("T-"):
                 tasks.append(task)
     return tasks
-
-
-def normalize_task_id(value: str) -> str:
-    """Accept exact IDs, and extract an ID from a conventional Task filename."""
-    candidate = str(value).strip()
-    if not candidate or any(character in candidate for character in "\x00\r\n"):
-        raise RepoctlError("Task id is empty or contains a control character", code="invalid_task_id")
-    if candidate.endswith(".md"):
-        return candidate.replace("\\", "/").rsplit("/", 1)[-1][:-3].split("--", 1)[0]
-    return candidate
 
 
 def _read_task_ids(path: Path, root: Path) -> set[str]:
@@ -134,7 +108,8 @@ def _read_task_ids(path: Path, root: Path) -> set[str]:
 
 def resolve_task(root: Path, task_id: str) -> Task:
     raw = str(task_id).strip()
-    normalize_task_id(raw)
+    if not raw or any(character in raw for character in "\x00\r\n"):
+        raise RepoctlError("Task reference is empty or contains a control character", code="invalid_task_reference")
     folders = (root / "docs/tasks", root / "docs/archive/tasks")
     reference = raw.replace("\\", "/").removeprefix("./")
 
@@ -160,7 +135,7 @@ def resolve_task(root: Path, task_id: str) -> Task:
     # identities, then read the selected body; unrelated damage does not block it.
     for folder in folders:
         for path in sorted(folder.glob("*.md")):
-            if path.name.endswith("TEMPLATE.md"):
+            if path.name == "TEMPLATE.md":
                 continue
             try:
                 identities = _read_task_ids(path, root)
@@ -178,40 +153,14 @@ def resolve_task(root: Path, task_id: str) -> Task:
     return task
 
 
-def live_tasks(tasks: list[Task]) -> list[Task]:
-    return [task for task in tasks if task.status in LIVE and not task.archived]
-
-
-def children_by_parent(tasks: list[Task]) -> dict[str, list[Task]]:
-    result: dict[str, list[Task]] = {}
-    for task in tasks:
-        if task.parent:
-            result.setdefault(task.parent, []).append(task)
-    return result
-
-
 def utc_stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _plan(root: Path, text: str, *, task: Task | None, new_path: str, original_text: str | None = None) -> dict[str, Any]:
-    fields, body = parse_frontmatter(text)
-    archived = new_path.startswith("docs/archive/tasks/")
-    return {
-        "task_id": str(fields["id"]),
-        "task": task or Task(root / new_path, new_path, fields, body, archived, source_text=text),
-        "old_path": task.rel_path if task is not None else "",
-        "new_path": new_path,
-        "text": text,
-        "original_text": original_text,
-        "archived": archived,
-    }
-
-
-def create_task_file(
-    root: Path, *, title: str, slug: str | None = None, area: str = "",
-    owner: str = "unassigned", parent: str = "", repo_ref: str = "",
-    repo_id: str = "", depends_on: list[str] | tuple[str, ...] = (),
+def prepare_task_create(
+    *, title: str, slug: str | None = None, area: str = "",
+    owner: str = "", parent: str = "", repo_ref: str = "",
+    repo_id: str = "", depends_on: list[str] | tuple[str, ...] = (), body: str | None = None,
 ) -> dict[str, Any]:
     """Prepare a new document; publishing it is the caller's single write."""
     title = title.strip()
@@ -223,16 +172,24 @@ def create_task_file(
         raise RepoctlError("Task slug must be a filename component", code="invalid_slug")
     task_id = "T-" + datetime.now(UTC).strftime("%Y%m%d%H%M%SZ") + "-" + uuid4().hex[:8]
     fields: dict[str, Any] = {
-        "id": task_id, "title": title, "status": "todo", "owner": owner,
-        "repo_id": repo_id, "repo_ref": repo_ref, "created": utc_stamp(),
-        "area": area, "parent": parent, "depends_on": list(depends_on),
+        "id": task_id, "title": title, "status": "todo", "created": utc_stamp(),
     }
+    for field, value in (
+        ("owner", owner), ("repo_id", repo_id), ("repo_ref", repo_ref),
+        ("area", area), ("parent", parent),
+    ):
+        if value:
+            fields[field] = value
+    if depends_on:
+        fields["depends_on"] = list(depends_on)
     front = "---\n" + "".join(f"{key}: {json.dumps(value, ensure_ascii=False)}\n" for key, value in fields.items()) + "---\n"
-    body = (
-        f"\n# {task_id} — {title}\n\n## Goal\n\n{title}\n\n"
-        "## Handoff\n\n- Next exact step:\n- Done when:\n"
-    )
-    return _plan(root, front + body, task=None, new_path=f"docs/tasks/{task_id}--{slug}.md")
+    return {
+        "task_id": task_id,
+        "old_path": "",
+        "new_path": f"docs/tasks/{task_id}--{slug}.md",
+        "text": front + (f"\n# {title}\n" if body is None else body),
+        "original_text": None,
+    }
 
 
 def _live_task(root: Path, task_id: str) -> Task:
@@ -246,8 +203,8 @@ def _live_task(root: Path, task_id: str) -> Task:
     return task
 
 
-def _status_plan(root: Path, task: Task, status: str, *, note: str = "") -> dict[str, Any]:
-    original = task.source_text if task.source_text is not None else _read_text(task.path)
+def _prepare_status_change(root: Path, task: Task, status: str, *, note: str = "") -> dict[str, Any]:
+    original = task.source_text
     text = replace_frontmatter_line(original, "status", status)
     new_path = task.rel_path
     if status == "doing" and not task.frontmatter.get("started_at"):
@@ -258,121 +215,50 @@ def _status_plan(root: Path, task: Task, status: str, *, note: str = "") -> dict
         target = root / new_path
         if target != task.path and (target.exists() or target.is_symlink()):
             raise RepoctlError("Archive target already exists", code="archive_task_conflict", path=new_path)
-    if note:
-        text = _append_note(text, note)
-    return _plan(root, text, task=task, new_path=new_path, original_text=original)
+    if note.strip():
+        text = _append_lifecycle_note(text, note)
+    return {
+        "task_id": task.id,
+        "old_path": task.rel_path,
+        "new_path": new_path,
+        "text": text,
+        "original_text": original,
+    }
 
 
-def start_task(root: Path, task_id: str) -> dict[str, Any]:
-    return _status_plan(root, _live_task(root, task_id), "doing")
+def prepare_task_start(root: Path, task_id: str) -> dict[str, Any]:
+    return _prepare_status_change(root, _live_task(root, task_id), "doing")
 
 
-def finish_task(root: Path, task_id: str, *, summary: str = "") -> dict[str, Any]:
-    return _status_plan(root, _live_task(root, task_id), "done", note=summary)
+def prepare_task_finish(root: Path, task_id: str, *, summary: str = "") -> dict[str, Any]:
+    return _prepare_status_change(root, _live_task(root, task_id), "done", note=summary)
 
 
-def cancel_task(root: Path, task_id: str, *, reason: str = "") -> dict[str, Any]:
-    return _status_plan(root, _live_task(root, task_id), "canceled", note=reason)
+def prepare_task_cancel(root: Path, task_id: str, *, reason: str = "") -> dict[str, Any]:
+    return _prepare_status_change(root, _live_task(root, task_id), "canceled", note=reason)
 
 
-def block_task(root: Path, task_id: str, *, reason: str = "") -> dict[str, Any]:
-    return _status_plan(root, _live_task(root, task_id), "blocked", note=reason)
+def prepare_task_block(root: Path, task_id: str, *, reason: str = "") -> dict[str, Any]:
+    return _prepare_status_change(root, _live_task(root, task_id), "blocked", note=reason)
 
 
-def _append_note(text: str, message: str) -> str:
+def _append_lifecycle_note(text: str, message: str) -> str:
     lines = message.replace("\r\n", "\n").strip("\n").splitlines()
-    if not lines or not any(line.strip() for line in lines):
-        raise RepoctlError("Task log message is empty", code="empty_task_log")
     entry = f"- {utc_stamp()}: {lines[0]}" + "".join("\n  " + line for line in lines[1:])
     return append_section_entry(text, "Execution Log", entry)
 
 
-def append_task_log(root: Path, task_id: str, message: str) -> dict[str, Any]:
-    task = _live_task(root, task_id)
-    original = task.source_text if task.source_text is not None else _read_text(task.path)
-    return _plan(root, _append_note(original, message), task=task, new_path=task.rel_path, original_text=original)
-
-
 def task_handoff_body(task: Task) -> str | None:
-    headings = ("Last Active Handoff", "Handoff") if task.status in NON_LIVE else ("Handoff",)
-    for heading in headings:
-        try:
-            section = find_section(task.body, heading)
-        except RepoctlError as exc:
-            if exc.code == "missing_section":
-                continue
-            raise
-        return task.body[section.body_start:section.end].strip()
-    return None
-
-
-def task_discovery_values(task: Task) -> dict[str, list[str]]:
     try:
-        fields = parse_labeled_list_section(task.body, "Discovery", ("Chosen files", "Notes"))
+        section = find_section(task.body, "Handoff")
     except RepoctlError as exc:
         if exc.code == "missing_section":
-            return {"Chosen files": [], "Notes": []}
+            return None
         raise
-    result: dict[str, list[str]] = {}
-    for key in ("Chosen files", "Notes"):
-        result[key] = []
-        for raw in fields.get(key, []):
-            value = raw.strip()
-            if len(value) >= 2 and value[0] == value[-1] == chr(96):
-                value = value[1:-1]
-            if value and value.casefold() not in {"none", "none yet", "n/a", "pending"} and value not in result[key]:
-                result[key].append(value)
-    return result
+    return task.body[section.body_start:section.end].strip()
 
 
-def _set_chosen_paths(text: str, paths: list[str]) -> str:
-    newline = "\r\n" if "\r\n" in text else "\n"
-    replacement = "- Chosen files:" + newline + "".join(f"  - {chr(96)}{path}{chr(96)}{newline}" for path in paths)
-    try:
-        entries = labeled_list_lines(text, "Discovery", ("Chosen files",))
-    except RepoctlError as exc:
-        if exc.code != "missing_section":
-            raise
-        return append_section_entry(text, "Discovery", replacement)
-    if not entries:
-        section = find_section(text, "Discovery")
-        return text[:section.body_start] + newline + replacement + text[section.body_start:]
-    pieces: list[str] = []
-    offset = 0
-    for index, (_label, _value, start, end) in enumerate(entries):
-        pieces.append(text[offset:start])
-        if index == 0:
-            pieces.append(replacement)
-        offset = end
-    pieces.append(text[offset:])
-    return "".join(pieces)
-
-
-def update_task_discovery(
-    root: Path, task_id: str, *, chosen: list[str] | None = None,
-    replace_chosen: list[str] | None = None, note: str = "", reason: str = "",
-) -> dict[str, Any]:
-    task = _live_task(root, task_id)
-    if chosen is not None and replace_chosen is not None:
-        raise RepoctlError("Choose append or replacement, not both", code="ambiguous_chosen_update")
-    previous = task_discovery_values(task)
-    paths = list(dict.fromkeys(replace_chosen if replace_chosen is not None else previous["Chosen files"] + (chosen or [])))
-    for path in paths:
-        relative = PurePosixPath(path)
-        if not path or relative.is_absolute() or ".." in relative.parts or any(character in path for character in "\x00\r\n"):
-            raise RepoctlError("Chosen paths must be workspace-relative", code="invalid_discovery_path", path=path)
-    original = task.source_text if task.source_text is not None else _read_text(task.path)
-    text = _set_chosen_paths(original, paths) if chosen is not None or replace_chosen is not None else original
-    if note:
-        text = append_section_entry(text, "Discovery", "- Notes: " + note.replace("\n", "\n  "))
-    if reason:
-        text = _append_note(text, reason)
-    result = _plan(root, text, task=task, new_path=task.rel_path, original_text=original)
-    result["discovery"] = {"chosen_files": paths, "notes": previous["Notes"] + ([note] if note else [])}
-    return result
-
-
-def validate_tasks(tasks: list[Task], *, include_archived_warnings: bool = False) -> list[Problem]:
+def validate_tasks(tasks: list[Task]) -> list[Problem]:
     """Diagnose document identity and relations without deciding work readiness."""
     problems: list[Problem] = []
     by_id: dict[str, Task] = {}
@@ -389,7 +275,7 @@ def validate_tasks(tasks: list[Task], *, include_archived_warnings: bool = False
         for section in section_ranges(task.body):
             headings[section.heading] = headings.get(section.heading, 0) + 1
         for heading, count in headings.items():
-            if count > 1 and heading in {"## Goal", "## Handoff", "## Last Active Handoff", "## Discovery", "## Context Docs", "## Execution Log"}:
+            if count > 1 and heading in {"## Handoff", "## Execution Log"}:
                 problems.append(Problem("error", "duplicate_section", f"Duplicate section: {heading}", task.rel_path))
     for task in tasks:
         if task.parent and task.parent not in by_id:

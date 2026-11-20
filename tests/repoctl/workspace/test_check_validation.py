@@ -85,7 +85,7 @@ def test_unknown_status_is_readable_but_not_silently_rewritten(tmp_path: Path, c
 
 @pytest.mark.parametrize("body,expected", [
     ("---\nid: one\nid: another\nstatus: todo\n---\n", "duplicate_frontmatter_key"),
-    (task_text("one") + "\n## Handoff\n\nA second conflicting handoff.\n", "duplicate_section"),
+    (task_text("one", body="## Handoff\n\nReview payment retries.\n") + "\n## Handoff\n\nA second conflicting handoff.\n", "duplicate_section"),
 ])
 def test_check_reports_ambiguous_document_structure(tmp_path: Path, capsys, body: str, expected: str) -> None:
     write_workspace(tmp_path)

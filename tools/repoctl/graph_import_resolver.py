@@ -131,7 +131,7 @@ def resolve_code_imports(entries: list[CodeIndexEntry], *, repo: Path | None = N
     return sorted(resolutions, key=lambda item: (*item.occurrence_key, item.target_path)), {
         "providers": ["python_import_resolver", "js_ts_relative_import_resolver", "dart_import_resolver"],
         "languages": sorted(IMPORT_RESOLVER_LANGUAGES),
-        "analyzed_paths": sorted(entry.path for entry in entries if entry.language in IMPORT_RESOLVER_LANGUAGES),
+        "analyzed_paths": sorted(entry.path for entry in entries if entry.language in IMPORT_RESOLVER_LANGUAGES and entry.parse_status == "ok"),
         "resolution_count": len(resolutions),
         "python_import_roots": [
             {"path": path, "module_prefix": module_prefix}

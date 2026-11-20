@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import re
 import symtable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +12,7 @@ from .repositories import RepoTarget
 from .io import Problem
 
 
-CODE_INDEX_INPUT_VERSION = 10
+CODE_INDEX_INPUT_VERSION = 12
 
 
 @dataclass(frozen=True, order=True)
@@ -43,8 +42,6 @@ class CodeIndexEntry:
     symbols: list[str]
     imports: list[str]
     calls: list[str]
-    deps: list[str]
-    observed_effects: list[str]
     parse_status: str = "ok"
     parse_error: str = ""
     import_occurrences: tuple[PythonImportOccurrence, ...] = ()
@@ -53,7 +50,7 @@ class CodeIndexEntry:
     module_wildcard_import: bool = False
 
     def __post_init__(self) -> None:
-        for field_name in ("symbols", "imports", "calls", "deps", "observed_effects"):
+        for field_name in ("symbols", "imports", "calls"):
             values = getattr(self, field_name)
             object.__setattr__(self, field_name, sorted({value for value in values if value}))
         object.__setattr__(self, "import_occurrences", tuple(sorted(set(self.import_occurrences))))
@@ -73,8 +70,6 @@ class CodeIndexEntry:
             "symbols": list(self.symbols),
             "imports": list(self.imports),
             "calls": list(self.calls),
-            "deps": list(self.deps),
-            "observed_effects": list(self.observed_effects),
             "parse_status": self.parse_status,
             "import_occurrences": [occurrence.to_dict() for occurrence in self.import_occurrences],
             "module_bindings": list(self.module_bindings),
@@ -93,30 +88,13 @@ def semantic_provider_entries(entries: list[CodeIndexEntry]) -> list[CodeIndexEn
         if entry.classification != "excluded"
         and (
             entry.parse_status == "ok"
-            # The syntax provider intentionally handles languages that the
-            # old lexical CodeIndex marks as unparsed/skipped; do not pretend
-            # their lexical fields were parsed by that index.
-            or (entry.parse_status == "skipped" and entry.language in {"rust", "go", "java", "swift"})
+            # These languages are parsed by the structural provider.
+            or (entry.parse_status == "skipped" and entry.language in {"javascript", "typescript", "csharp", "rust", "go", "java", "swift"})
         )
     ]
 
 
-JS_IMPORT_RE = re.compile(r"(?:import\s+(?:[^'\"]+\s+from\s+)?|require\()\s*['\"]([^'\"]+)['\"]")
 
-EFFECT_IMPORT_PREFIXES = {
-    "crypto": ("hashlib", "crypto", "bcrypt", "jwt"),
-    "db": ("sqlite", "sqlite3", "psycopg", "mysql", "sqlalchemy", "prisma"),
-    "fs": ("os", "pathlib", "shutil", "fs"),
-    "net": ("requests", "urllib", "http", "axios"),
-    "time": ("time", "datetime"),
-}
-EFFECT_CALLS = {
-    "crypto": {"hashlib.sha256", "hashlib.md5", "crypto.createHash"},
-    "db": {"execute", "executemany", "query", "transaction"},
-    "fs": {"open", "read_text", "write_text", "readFile", "writeFile"},
-    "net": {"fetch", "axios", "requests.get", "requests.post", "urllib.request.urlopen"},
-    "time": {"sleep", "datetime.now", "Date.now", "setTimeout", "setInterval"},
-}
 
 
 def _dedupe_sorted(values: list[str]) -> list[str]:
@@ -269,38 +247,28 @@ def _index_python(
     )
 
 
-def _index_js_imports(text: str) -> tuple[list[str], list[str], list[str], str, str]:
-    imports = [match.group(1) for match in JS_IMPORT_RE.finditer(text)]
-    return [], _dedupe_sorted(imports), [], "ok", ""
 
 
-def _observed_effects_for(imports: list[str], calls: list[str]) -> list[str]:
-    effects: list[str] = []
-    for effect, prefixes in EFFECT_IMPORT_PREFIXES.items():
-        if any(import_name == prefix or import_name.startswith(f"{prefix}.") for import_name in imports for prefix in prefixes):
-            effects.append(effect)
-    for effect, names in EFFECT_CALLS.items():
-        if any(call in names for call in calls):
-            effects.append(effect)
-    return _dedupe_sorted(effects)
 
 
 def _index_file(repo: Path, file: InventoryFile) -> CodeIndexEntry:
     language = language_for_path(file.path)
     if file.classification == "excluded":
-        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "skipped", "excluded from source indexing")
+        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], "skipped", "excluded from source indexing")
+    if language in {"javascript", "typescript"}:
+        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], "skipped", "TypeScript provider required")
     if language == "csharp":
-        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "ok", "")
-    if language not in {"python", "javascript", "typescript", "dart"}:
-        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "skipped", "unsupported language")
+        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], "skipped", "C# provider required")
+    if language not in {"python", "dart"}:
+        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], "skipped", "unsupported language")
 
     path = repo / file.path
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "skipped", "non-utf8 file")
+        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], "skipped", "non-utf8 file")
     except OSError as exc:
-        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], [], [], "parse_error", str(exc))
+        return CodeIndexEntry(file.path, file.workspace_path, language, file.classification, [], [], [], "parse_error", str(exc))
 
     if language == "python":
         (
@@ -314,12 +282,6 @@ def _index_file(repo: Path, file: InventoryFile) -> CodeIndexEntry:
             module_certain_bindings,
             module_wildcard_import,
         ) = _index_python(text)
-    elif language in {"javascript", "typescript"}:
-        symbols, imports, calls, status, error = _index_js_imports(text)
-        import_occurrences = ()
-        module_bindings = ()
-        module_certain_bindings = ()
-        module_wildcard_import = False
     else:
         symbols, imports, calls, status, error = index_dart(text)
         import_occurrences = ()
@@ -327,8 +289,6 @@ def _index_file(repo: Path, file: InventoryFile) -> CodeIndexEntry:
         module_certain_bindings = ()
         module_wildcard_import = False
 
-    deps = _dedupe_sorted([import_name.split(".", 1)[0] for import_name in imports])
-    effects = _observed_effects_for(imports, calls)
     return CodeIndexEntry(
         file.path,
         file.workspace_path,
@@ -337,8 +297,6 @@ def _index_file(repo: Path, file: InventoryFile) -> CodeIndexEntry:
         symbols,
         imports,
         calls,
-        deps,
-        effects,
         status,
         error,
         import_occurrences,
@@ -357,8 +315,6 @@ def _reused_index_entry(file: InventoryFile, previous: CodeIndexEntry) -> CodeIn
         symbols=list(previous.symbols),
         imports=list(previous.imports),
         calls=list(previous.calls),
-        deps=list(previous.deps),
-        observed_effects=list(previous.observed_effects),
         parse_status=previous.parse_status,
         parse_error=previous.parse_error,
         import_occurrences=previous.import_occurrences,
@@ -369,7 +325,6 @@ def _reused_index_entry(file: InventoryFile, previous: CodeIndexEntry) -> CodeIn
 
 
 def build_code_index_from_inventory(
-    root: Path,
     *,
     files: list[InventoryFile],
     inventory_problems: list[Problem],
@@ -380,13 +335,16 @@ def build_code_index_from_inventory(
     limit: int = -1,
 ) -> tuple[list[CodeIndexEntry], list[Problem], dict[str, Any]]:
     if inventory_problems:
-        return [], inventory_problems, {**inventory_meta, "authoritative": False}
+        return [], inventory_problems, inventory_meta
     previous_by_path = {entry.path: entry for entry in previous_entries or []}
     reindex_paths = reindex_paths or set()
     entries: list[CodeIndexEntry] = []
     reindexed = 0
     reused = 0
-    for file in files:
+    ordered_files = sorted(files, key=lambda file: file.path)
+    total_before_limit = len(ordered_files)
+    selected_files = ordered_files if limit < 0 else ordered_files[:limit]
+    for file in selected_files:
         previous = previous_by_path.get(file.path)
         excluded_boundary_changed = previous is not None and ((previous.classification == "excluded") != (file.classification == "excluded"))
         can_reuse = (
@@ -401,10 +359,6 @@ def build_code_index_from_inventory(
         else:
             entries.append(_index_file(target.root_path, file))
             reindexed += 1
-    entries.sort(key=lambda entry: entry.path)
-    total_before_limit = len(entries)
-    if limit >= 0:
-        entries = entries[:limit]
     returned = len(entries)
     summary = {
         "total": total_before_limit,
@@ -421,33 +375,13 @@ def build_code_index_from_inventory(
             for language in sorted({entry.language for entry in entries})
         },
     }
-    return entries, inventory_problems, {**inventory_meta, "summary": summary, "authoritative": False}
+    return entries, inventory_problems, {**inventory_meta, "summary": summary}
 
 
 def build_code_index(root: Path, *, changed: bool = False, limit: int = 200, target: RepoTarget | None = None) -> tuple[list[CodeIndexEntry], list[Problem], dict[str, Any]]:
+    from .repositories import require_repo_target
+
+    target = target or require_repo_target(root)
     files, problems, meta = file_inventory(root, changed=changed, target=target)
-    if problems:
-        return [], problems, {**meta, "authoritative": False}
-
-    repo = target.root_path if target is not None else root / str(meta.get("repository", {}).get("path") or "repos")
-    entries = [_index_file(repo, file) for file in files]
-    entries.sort(key=lambda entry: entry.path)
-    total_before_limit = len(entries)
-    if limit >= 0:
-        entries = entries[:limit]
-    returned = len(entries)
-
-    summary = {
-        "total": total_before_limit,
-        "returned": returned,
-        "truncated": returned < total_before_limit,
-        "dropped_count": max(0, total_before_limit - returned),
-        "ok": sum(1 for entry in entries if entry.parse_status == "ok"),
-        "skipped": sum(1 for entry in entries if entry.parse_status == "skipped"),
-        "parse_error": sum(1 for entry in entries if entry.parse_status == "parse_error"),
-        "languages": {
-            language: sum(1 for entry in entries if entry.language == language)
-            for language in sorted({entry.language for entry in entries})
-        },
-    }
-    return entries, problems, {**meta, "summary": summary, "authoritative": False}
+    return build_code_index_from_inventory(files=files, inventory_problems=problems,
+                                           inventory_meta=meta, target=target, limit=limit)

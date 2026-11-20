@@ -16,6 +16,6 @@ jobs:
         with:
           python-version: "3.11"
       - run: uv sync --locked --extra structural
-      - name: Test public behavior and the release artifact
+      - name: Test public behavior
         run: uv run --locked --extra structural pytest -q
       - run: git diff --check

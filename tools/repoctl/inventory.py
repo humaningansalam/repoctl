@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -17,7 +18,7 @@ from .repositories import RepoTarget, default_repo_target
 class InventoryFile:
     path: str
     workspace_path: str
-    classification: str = "indexed_only"
+    classification: str = "included"
     change: str = ""
     old_path: str = ""
 
@@ -96,6 +97,16 @@ def file_inventory(
         if any(fnmatch(path, pattern) for pattern in excludes):
             continue
         source = selected.root_path / path
+        if not changed:
+            try:
+                mode = source.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            else:
+                if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                    continue
         try:
             source.resolve().relative_to(selected.root_path.resolve())
             outside = False
@@ -108,14 +119,14 @@ def file_inventory(
             InventoryFile(
                 path,
                 workspace_path,
-                "excluded" if excluded else "indexed_only",
+                "excluded" if excluded else "included",
                 kind,
                 old_path,
             )
         )
     data["summary"] = {
         "total": len(files),
-        "indexed_only": sum(file.classification == "indexed_only" for file in files),
+        "included": sum(file.classification == "included" for file in files),
         "excluded": sum(file.classification == "excluded" for file in files),
     }
     return files, [], data

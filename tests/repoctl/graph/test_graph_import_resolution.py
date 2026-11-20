@@ -36,7 +36,7 @@ def test_graph_imports_are_raw_import_refs(tmp_path: Path, monkeypatch, capsys) 
     init_repo(repo)
     (repo / "frontend/src").mkdir(parents=True)
     (repo / "frontend/src/app.ts").write_text("import axios from 'axios';\nexport const run = () => fetch('/');\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -59,7 +59,7 @@ def test_graph_resolves_repo_local_python_imports(tmp_path: Path, monkeypatch, c
         "from utils.tokens import issue_token as make_session\n\n\ndef login(user_id: str) -> str:\n    return make_session(user_id)\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -78,7 +78,7 @@ def test_graph_resolves_repo_local_python_imports(tmp_path: Path, monkeypatch, c
     assert any(edge["kind"] == "RESOLVES_TO" and edge["from"] == import_node_id and edge["to"] == target_file_id for edge in snapshot["edges"])
     assert any(edge["kind"] == "IMPORTS_FILE" and edge["from"] == source_file_id and edge["to"] == target_file_id for edge in snapshot["edges"])
 
-    assert main(["graph", "query", "--file", "utils/tokens.py", "--full", "--json"]) == 0
+    assert main(['graph', 'query', '--file', 'utils/tokens.py', '--json']) == 0
 
     result = json.loads(capsys.readouterr().out)["data"]["result"]
     assert any(node["id"] == source_file_id for node in result["nodes"])
@@ -101,7 +101,7 @@ def test_graph_resolves_python_imports_from_manifest_declared_src_root(tmp_path:
         "from relayboard.retry_worker import RetryWorker\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -139,7 +139,7 @@ def test_graph_resolves_relative_python_imports(tmp_path: Path, monkeypatch, cap
         "from .tokens import issue_token as make_session\n\n\ndef login(user_id: str) -> str:\n    return make_session(user_id)\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -166,7 +166,7 @@ def test_graph_relative_import_occurrences_keep_importer_identity(tmp_path: Path
         (repo / package / "__init__.py").write_text("", encoding="utf-8")
         (repo / package / "target.py").write_text("def target():\n    return 1\n", encoding="utf-8")
         (repo / package / "use.py").write_text("from . import target\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -213,7 +213,7 @@ def test_graph_python_imports_use_module_identity_and_package_attribute_preceden
     (repo / "wildpkg/impl_b.py").write_text("__all__ = ['target']\n\ndef target():\n    return 'wildcard attribute'\n", encoding="utf-8")
     (repo / "wildpkg/target.py").write_text("def target():\n    return 'submodule'\n", encoding="utf-8")
     (repo / "wild_consumer.py").write_text("from wildpkg import target\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -264,7 +264,7 @@ def test_graph_skips_ambiguous_python_import_resolution(tmp_path: Path, monkeypa
     (repo / "pkg/mod.py").write_text("VALUE = 'module'\n", encoding="utf-8")
     (repo / "pkg/mod/__init__.py").write_text("VALUE = 'package'\n", encoding="utf-8")
     (repo / "consumer/app.py").write_text("from pkg.mod import VALUE\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -287,7 +287,7 @@ def test_graph_resolves_js_ts_relative_imports(tmp_path: Path, monkeypatch, caps
     (repo / "frontend/src/api").mkdir(parents=True)
     (repo / "frontend/src/client.ts").write_text("import { issueToken } from './api/tokens';\nexport const login = () => issueToken();\n", encoding="utf-8")
     (repo / "frontend/src/api/tokens.ts").write_text("export const issueToken = () => 'token';\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -313,7 +313,7 @@ def test_graph_resolves_dart_relative_and_local_package_imports(tmp_path: Path, 
     )
     (repo / "lib/src/local.dart").write_text("class Local {}\n", encoding="utf-8")
     (repo / "lib/src/session.dart").write_text("class Session {}\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 
@@ -335,7 +335,7 @@ def test_graph_skips_ambiguous_js_ts_relative_import_resolution(tmp_path: Path, 
     (repo / "frontend/src/client.ts").write_text("import { issueToken } from './api/tokens';\n", encoding="utf-8")
     (repo / "frontend/src/api/tokens.ts").write_text("export const issueToken = () => 'ts';\n", encoding="utf-8")
     (repo / "frontend/src/api/tokens.js").write_text("export const issueToken = () => 'js';\n", encoding="utf-8")
-    monkeypatch.setattr("tools.repoctl.cli.find_workspace_root", lambda: tmp_path)
+    monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
     assert main(["graph", "build", "--full", "--json"]) == 0
 

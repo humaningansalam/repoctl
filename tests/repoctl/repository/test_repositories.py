@@ -152,4 +152,49 @@ def test_inventory_uses_git_ignore_and_preserves_unusual_filenames(
     assert name in by_path
     assert "ignored.py" not in by_path
     assert by_path["linked.py"].classification == "excluded"
-    assert not (repo / ".repometa").exists()
+
+
+def test_plain_git_root_is_a_source_repository_without_task_documents(tmp_path: Path, monkeypatch, capsys) -> None:
+    from tools.repoctl.cli import main
+
+    init_repo(tmp_path)
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("REPOCTL_WORKSPACE_ROOT", raising=False)
+    assert main(["index", "code", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert data["repository"]["path"] == "."
+    assert next(item for item in data["files"] if item["path"] == "app.py")["symbols"] == ["run"]
+    assert not (tmp_path / "docs/tasks").exists()
+
+
+def test_empty_repository_configuration_allows_workspace_documents(tmp_path: Path) -> None:
+    write_settings(tmp_path, {"repositories": []})
+    assert repo_layout(tmp_path).targets == ()
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "changed"])
+def test_working_tree_identity_reports_failed_reads_without_inventing_content(tmp_path: Path, monkeypatch, failure: str) -> None:
+    from tools.repoctl.git import repo_file_state_records
+
+    init_repo(tmp_path / "repos")
+    source = tmp_path / "repos/app.py"
+    source.write_text("value = 1\n")
+    original_read = Path.read_bytes
+
+    def read(path):
+        if path != source:
+            return original_read(path)
+        if failure == "unreadable":
+            raise PermissionError("source cannot be read")
+        content = original_read(path)
+        path.write_text("value = 2\n")
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    records, state = repo_file_state_records(tmp_path, paths=["app.py"])
+    assert records == {}
+    assert not state.available
+    expected = "repository_file_unreadable" if failure == "unreadable" else "repository_file_changed_during_read"
+    assert state.problem_code == expected
+    assert "app.py" in state.reason

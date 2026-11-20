@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from .repositories import RepoTarget, default_repo_target
+from .io import RepoctlError
 
 
 ChangedEntry: TypeAlias = tuple[str, str, str]
@@ -35,6 +36,8 @@ class GitNameStatusProblem(StrEnum):
 class GitObservationProblem(StrEnum):
     COMMAND_FAILED = "git_observation_command_failed"
     INDEX_MALFORMED = "git_index_observation_malformed"
+    FILE_UNREADABLE = "repository_file_unreadable"
+    FILE_CHANGED = "repository_file_changed_during_read"
 
 
 @dataclass(frozen=True)
@@ -57,14 +60,17 @@ def _target(root: Path, target: RepoTarget | None = None) -> RepoTarget | None:
 def repo_git_state(root: Path, target: RepoTarget | None = None) -> RepoGitState:
     try:
         selected = _target(root, target)
-    except Exception as exc:
+    except (OSError, RepoctlError) as exc:
         return RepoGitState(False, str(exc))
     if selected is None:
         return RepoGitState(False, "product repository directory is missing")
     repo = selected.root_path
     if not (repo / ".git").exists():
         return RepoGitState(False, f"{selected.display_path}/ is not an independent git repository", selected.id, selected.display_path)
-    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    try:
+        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    except OSError as exc:
+        return RepoGitState(False, str(exc), selected.id, selected.display_path, GitObservationProblem.COMMAND_FAILED.value)
     if result.returncode != 0:
         return RepoGitState(False, f"{selected.display_path}/ git metadata is not usable", selected.id, selected.display_path)
     try:
@@ -215,16 +221,11 @@ def repo_changed_entries(root: Path, target: RepoTarget | None = None) -> tuple[
             if item not in seen:
                 seen.add(item)
                 changes.append(item)
-    untracked_result = subprocess.run(
-        ["git", "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=repo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if untracked_result.returncode != 0:
-        return [], RepoGitState(False, f"{selected.display_path}/ cannot read untracked paths", selected.id, selected.display_path)
-    for token in untracked_result.stdout.split(b"\0"):
+    untracked = _git_bytes_result(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    if untracked.problem is not None:
+        return [], RepoGitState(False, f"{selected.display_path}/ cannot read untracked paths",
+                                selected.id, selected.display_path, untracked.problem.value)
+    for token in untracked.data.split(b"\0"):
         if not token:
             continue
         path = normalize_repo_path(token.decode("utf-8", errors="surrogateescape"))
@@ -279,7 +280,7 @@ def _git_index_records(repo: Path) -> tuple[dict[str, dict[str, str]], GitObserv
 def _stat_probe(path: Path) -> dict[str, Any]:
     try:
         file_stat = os.lstat(path)
-    except OSError:
+    except FileNotFoundError:
         return {"kind": "missing"}
     probe: dict[str, Any] = {
         "mode": f"{stat.S_IMODE(file_stat.st_mode):04o}",
@@ -348,11 +349,12 @@ def repo_file_state_records(
             }
             continue
 
-        probe = {
-            "index": index,
-            "changes": path_changes,
-            "stat": _stat_probe(repo / path),
-        }
+        try:
+            file_stat = _stat_probe(repo / path)
+        except OSError as exc:
+            return {}, RepoGitState(False, f"{path}: {exc}", selected.id, selected.display_path,
+                                    GitObservationProblem.FILE_UNREADABLE.value)
+        probe = {"index": index, "changes": path_changes, "stat": file_stat}
         old = previous.get(path)
         if isinstance(old, dict) and old.get("probe") == probe and old.get("source") == "working_tree":
             records[path] = old
@@ -366,9 +368,14 @@ def repo_file_state_records(
         kind = str(probe["stat"].get("kind") or "")
         if kind == "file":
             try:
-                record["content_sha256"] = _sha256_bytes((repo / path).read_bytes())
-            except OSError:
-                record["content_sha256"] = _sha256_bytes(b"<unreadable>")
+                content = (repo / path).read_bytes()
+                if _stat_probe(repo / path) != file_stat:
+                    return {}, RepoGitState(False, f"{path}: source changed while it was being read",
+                                            selected.id, selected.display_path, GitObservationProblem.FILE_CHANGED.value)
+                record["content_sha256"] = _sha256_bytes(content)
+            except OSError as exc:
+                return {}, RepoGitState(False, f"{path}: {exc}", selected.id, selected.display_path,
+                                        GitObservationProblem.FILE_UNREADABLE.value)
         elif kind == "symlink":
             record["symlink_target"] = str(probe["stat"].get("target") or "")
         records[path] = record

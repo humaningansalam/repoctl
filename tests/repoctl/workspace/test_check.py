@@ -10,7 +10,7 @@ from tests.repoctl.task_lifecycle_helpers import add_task, init_repo, task_text,
 from tools.repoctl import cli
 from tools.repoctl.io import RepoctlError
 from tools.repoctl.markdown import parse_frontmatter
-from tools.repoctl.tasks import finish_task
+from tools.repoctl.tasks import prepare_task_finish
 
 
 def run_json(root: Path, capsys, *args: str) -> tuple[int, dict]:
@@ -26,25 +26,27 @@ def snapshot(root: Path) -> dict[str, bytes]:
 
 def test_cli_create_start_and_finish_in_minimal_workspace(tmp_path: Path, capsys) -> None:
     write_workspace(tmp_path)
-    code, created = run_json(tmp_path, capsys, "task", "create", "한글 제목 그대로", "--area", "product research", "--start")
+    authored = "\r\n## 조사\r\n\r\n작성한 내용을 보존한다.\r\n".encode("utf-8")
+    (tmp_path / "task-body.md").write_bytes(authored)
+    code, created = run_json(tmp_path, capsys, "task", "create", "한글 제목 그대로", "--area", "product research", "--body-file", "task-body.md", "--start")
     assert code == 0
     path = tmp_path / created["data"]["path"]
-    frontmatter, original_body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    frontmatter, original_body = parse_frontmatter(path.read_bytes().decode("utf-8"))
     assert frontmatter["title"] == "한글 제목 그대로"
     assert frontmatter["area"] == "product research"
     assert frontmatter["status"] == "doing"
     assert frontmatter["started_at"]
-    assert not (tmp_path / "docs/BOARD.md").exists()
+    assert original_body.encode("utf-8") == authored
 
     code, finished = run_json(tmp_path, capsys, "task", "finish", created["data"]["task_id"])
     assert code == 0
     assert not path.exists()
     archive = tmp_path / finished["data"]["path"]
-    final_frontmatter, final_body = parse_frontmatter(archive.read_text(encoding="utf-8"))
+    final_frontmatter, final_body = parse_frontmatter(archive.read_bytes().decode("utf-8"))
     assert final_frontmatter["status"] == "done"
     assert final_frontmatter["completed_at"]
     assert final_body == original_body
-    assert set(snapshot(tmp_path)) == {str(archive.relative_to(tmp_path))}
+    assert set(snapshot(tmp_path)) == {"task-body.md", str(archive.relative_to(tmp_path))}
 
 
 def test_cli_parent_and_child_finish_independently(tmp_path: Path, capsys) -> None:
@@ -67,34 +69,19 @@ def test_cli_parent_and_child_finish_independently(tmp_path: Path, capsys) -> No
     assert child_frontmatter["parent"] == "parent"
 
 
-def test_cli_doctor_and_finish_share_archive_conflict_verdict(tmp_path: Path, capsys) -> None:
+def test_cli_finish_preserves_existing_archive(tmp_path: Path, capsys) -> None:
     write_workspace(tmp_path)
     source = add_task(tmp_path, "task.md", task_text("one", status="doing"))
     archive = tmp_path / "docs/archive/tasks/task.md"
     archive.write_text("existing historical content", encoding="utf-8")
     before = snapshot(tmp_path)
 
-    doctor_code, doctor = run_json(tmp_path, capsys, "task", "doctor", "one")
     finish_code, finish = run_json(tmp_path, capsys, "task", "finish", "one")
 
-    assert doctor_code == finish_code == 2
-    assert doctor["data"]["finish_ready"] is False
-    assert doctor["problems"][0]["code"] == finish["problems"][0]["code"] == "archive_task_conflict"
+    assert finish_code == 2
+    assert finish["problems"][0]["code"] == "archive_task_conflict"
     assert source.exists()
     assert snapshot(tmp_path) == before
-
-
-def test_cli_doctor_is_read_only_and_finish_accepts_the_same_document(tmp_path: Path, capsys) -> None:
-    write_workspace(tmp_path)
-    add_task(tmp_path, "task.md", "---\nid: one\ntitle: Authored task\nstatus: todo\n---\n\nNo prescribed sections.\n")
-    before = snapshot(tmp_path)
-
-    code, doctor = run_json(tmp_path, capsys, "task", "doctor", "one")
-    assert code == 0
-    assert doctor["data"]["finish_ready"] is True
-    assert doctor["data"]["changed"] is False
-    assert snapshot(tmp_path) == before
-    assert run_json(tmp_path, capsys, "task", "finish", "one")[0] == 0
 
 
 @pytest.mark.parametrize("failure", ["stage", "publish", "remove_source"])
@@ -132,7 +119,7 @@ def test_archive_failure_keeps_original_task_and_removes_partial_archive(tmp_pat
 def test_prepared_finish_does_not_overwrite_concurrent_document_edit(tmp_path: Path) -> None:
     write_workspace(tmp_path)
     source = add_task(tmp_path, "task.md", task_text("one", status="doing"))
-    result = finish_task(tmp_path, "one")
+    result = prepare_task_finish(tmp_path, "one")
     edited = source.read_text(encoding="utf-8") + "\nA human added this after preparation.\n"
     source.write_text(edited, encoding="utf-8")
 
@@ -144,7 +131,7 @@ def test_prepared_finish_does_not_overwrite_concurrent_document_edit(tmp_path: P
 
 
 @pytest.mark.parametrize("create", [False, True])
-def test_start_publish_failure_leaves_no_partial_task_or_auxiliary_state(tmp_path: Path, monkeypatch, capsys, create: bool) -> None:
+def test_task_publish_failure_preserves_workspace(tmp_path: Path, monkeypatch, capsys, create: bool) -> None:
     write_workspace(tmp_path)
     if not create:
         add_task(tmp_path, "task.md", task_text("one"))

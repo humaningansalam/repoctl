@@ -24,6 +24,19 @@ class SourceAnchor:
 
 
 @dataclass(frozen=True)
+class ImportDeclaration:
+    module: str
+    anchor: SourceAnchor
+
+    @property
+    def path(self) -> str:
+        return self.anchor.path
+
+    def to_dict(self) -> dict[str, object]:
+        return {"module": self.module, "anchor": self.anchor.to_dict()}
+
+
+@dataclass(frozen=True)
 class PreciseSymbol:
     path: str
     provider: str
@@ -119,6 +132,22 @@ def parse_provider_anchor(
     if values[0] < 1 or values[1] < 0 or values[2] < values[0] or values[3] < 0:
         return None
     return SourceAnchor(path, *values)
+
+
+def parse_provider_imports(
+    data: object, *, eligible_paths: set[str]
+) -> tuple[ImportDeclaration, ...]:
+    if not isinstance(data, dict) or not isinstance(data.get("imports"), list):
+        raise ProviderOutputError("imports must be an array")
+    declarations: list[ImportDeclaration] = []
+    for value in data["imports"]:
+        if not isinstance(value, dict) or not isinstance(value.get("module"), str) or not value["module"]:
+            raise ProviderOutputError("import module must be a non-empty string")
+        anchor = parse_provider_anchor(value.get("anchor"), eligible_paths=eligible_paths)
+        if anchor is None:
+            raise ProviderOutputError("import anchor is outside the eligible analysis set")
+        declarations.append(ImportDeclaration(value["module"], anchor))
+    return tuple(sorted(set(declarations), key=lambda item: (item.path, item.module, item.anchor.start_line, item.anchor.start_col)))
 
 
 def parse_provider_semantics(
@@ -489,6 +518,9 @@ class SemanticProviderResult:
     languages: tuple[str, ...]
     symbols: tuple[PreciseSymbol, ...] = ()
     calls: tuple[PreciseCall, ...] = ()
+    imports: tuple[ImportDeclaration, ...] = ()
+    import_analyzed_paths: tuple[str, ...] = ()
+    import_failed_paths: tuple[str, ...] = ()
     rpc_invocations: tuple[RpcInvocationFact, ...] = ()
     symbol_analyzed_paths: tuple[str, ...] = ()
     call_analyzed_paths: tuple[str, ...] = ()
@@ -506,6 +538,9 @@ class SemanticProviderResult:
         return {
             "provider": self.provider,
             "languages": list(self.languages),
+            "import_analyzed_paths": list(self.import_analyzed_paths),
+            "import_failed_paths": list(self.import_failed_paths),
+            "import_count": len(self.imports),
             "symbol_analyzed_paths": list(self.symbol_analyzed_paths),
             "call_analyzed_paths": list(self.call_analyzed_paths),
             "rpc_analyzed_paths": list(self.rpc_analyzed_paths),

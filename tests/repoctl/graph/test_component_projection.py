@@ -192,7 +192,7 @@ def test_shipped_manifest_providers_project_declared_field_components() -> None:
     }
 
 
-def test_graph_result_digest_is_pinned_until_explicit_rebuild(tmp_path: Path) -> None:
+def test_component_membership_uses_the_stored_snapshot(tmp_path: Path) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"
     init_repo(repo)
@@ -208,14 +208,12 @@ def test_graph_result_digest_is_pinned_until_explicit_rebuild(tmp_path: Path) ->
     payload, problems = query_graph(snapshot, file=path)
     assert problems == []
     assert payload is not None
-    original_digest = payload["result_digest"]
     (repo / "apps/web/package.json").write_text('{"name":"web-renamed"}\n', encoding="utf-8")
 
     replay, replay_problems = query_graph(snapshot, file=path)
     assert replay_problems == []
     assert replay is not None
     assert replay["matches"][0]["component_ids"] == payload["matches"][0]["component_ids"]
-    assert replay["result_digest"] == original_digest
 
     rebuilt, rebuild_problems, _meta = materialize_graph(tmp_path, target=target, rebuild=True)
     assert rebuilt is not None
@@ -224,7 +222,6 @@ def test_graph_result_digest_is_pinned_until_explicit_rebuild(tmp_path: Path) ->
     assert refreshed_problems == []
     assert refreshed is not None
     assert refreshed["matches"][0]["component_ids"] != payload["matches"][0]["component_ids"]
-    assert refreshed["result_digest"] != original_digest
 
 
 def test_component_registry_identity_invalidates_a_reused_graph(tmp_path: Path) -> None:

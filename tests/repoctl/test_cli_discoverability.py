@@ -43,17 +43,17 @@ def test_domain_and_argument_errors_keep_the_selected_command_identity(tmp_path:
     assert argument["problems"][0]["code"] == "argparse_error"
 
 
-def test_resume_selects_a_unique_task_and_reports_choices_without_hidden_authority(tmp_path: Path, capsys) -> None:
+def test_resume_returns_a_unique_task_or_selection_choices(tmp_path: Path, capsys) -> None:
     write_workspace(tmp_path)
     code, empty = run_json(tmp_path, capsys, "task", "resume")
     assert code == 0
     assert empty["data"] == {"task": None, "candidates": []}
 
-    add_task(tmp_path, "first.md", task_text("first"))
+    add_task(tmp_path, "first.md", task_text("first", body="## Handoff\n\nReview retry handling in src/payments.py.\n"))
     code, single = run_json(tmp_path, capsys, "task", "resume")
     assert code == 0
     assert single["data"]["task"]["id"] == "first"
-    assert "inspect the source" in single["data"]["handoff"]
+    assert single["data"]["handoff"] == "Review retry handling in src/payments.py."
 
     add_task(tmp_path, "second.md", task_text("second", status="doing"))
     code, choices = run_json(tmp_path, capsys, "task", "resume")
@@ -64,18 +64,3 @@ def test_resume_selects_a_unique_task_and_reports_choices_without_hidden_authori
     code, selected = run_json(tmp_path, capsys, "task", "resume", "second")
     assert code == 0
     assert selected["data"]["task"]["id"] == "second"
-
-
-def test_discovery_updates_preserve_unmentioned_authored_notes(tmp_path: Path, capsys) -> None:
-    write_workspace(tmp_path)
-    path = add_task(tmp_path, "task.md", task_text("one"))
-    path.write_text(path.read_text() + "\n## Local considerations\n\nKeep this paragraph as written.\n", encoding="utf-8")
-
-    assert run_json(tmp_path, capsys, "task", "discovery", "add", "one", "--chosen", "src/future.py", "--note", "Initial scope")[0] == 0
-    assert run_json(tmp_path, capsys, "task", "discovery", "add", "one", "--replace-chosen", "docs/plan.md")[0] == 0
-    code, discovery = run_json(tmp_path, capsys, "task", "show", "one", "--section", "Discovery")
-    assert code == 0
-    assert "docs/plan.md" in discovery["data"]["body"]
-    assert "src/future.py" not in discovery["data"]["body"]
-    assert "Initial scope" in discovery["data"]["body"]
-    assert "Keep this paragraph as written." in path.read_text(encoding="utf-8")
