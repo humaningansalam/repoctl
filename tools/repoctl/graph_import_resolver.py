@@ -354,32 +354,31 @@ def _resolve_dart_import(raw_import: str, file_paths: set[str], *, importer_path
 
 
 def _dart_part_directive_state(repo: Path, importer_path: str, target_path: str, uri: str) -> str:
-    """Verify Dart library/part reciprocal literal paths before asserting an edge.
-
-    Exact file names alone are not sufficient for part-library identity. A
-    missing/mismatched `part of` is not a verified import, and unsafe or large
-    source files are never read through a symlink or outside the repository.
-    """
-    texts = []
-    for rel in (importer_path, target_path):
-        file = repo / rel
-        try:
-            if file.is_symlink() or not file.is_file() or file.stat().st_size > 2 * 1024 * 1024:
-                return "invalid"
-            resolved = file.resolve(strict=True)
-            if repo.resolve(strict=True) not in (resolved, *resolved.parents):
-                return "invalid"
-            texts.append(file.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError):
+    """Resolve a part's reciprocal URI relative to that part's directory."""
+    try:
+        repository_root = repo.resolve(strict=True)
+        owner_file = repo / importer_path
+        if owner_file.is_symlink() or not owner_file.resolve(strict=True).is_relative_to(repository_root):
             return "invalid"
-    owner_text, part_text = texts
-    declarations = {value for kind, value in dart_directives(owner_text) if kind == "part"}
-    if uri not in declarations:
-        return "ordinary"
-    # A `part of 'owner.dart'` points to the defining library. No text-only
-    # guess is made for symbolic library names or missing reciprocal evidence.
+        owner_text = owner_file.read_text(encoding="utf-8")
+        declarations = {value for kind, value in dart_directives(owner_text) if kind == "part"}
+        if uri not in declarations:
+            return "ordinary"
+        part_file = repo / target_path
+        if part_file.is_symlink() or not part_file.resolve(strict=True).is_relative_to(repository_root):
+            return "invalid"
+        part_text = part_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError):
+        return "invalid"
     owner_refs = {value for kind, value in dart_directives(part_text) if kind == "part of"}
-    return "verified" if Path(importer_path).name in owner_refs else "invalid"
+    package_name = _dart_package_name(repo)
+    for owner_uri in owner_refs:
+        owner_path = _resolve_dart_import(
+            owner_uri, {importer_path}, importer_path=target_path, package_name=package_name,
+        )
+        if owner_path == importer_path:
+            return "verified"
+    return "invalid"
 
 
 def _dart_package_name(repo: Path | None) -> str:

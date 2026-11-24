@@ -344,3 +344,29 @@ def test_graph_skips_ambiguous_js_ts_relative_import_resolution(tmp_path: Path, 
     assert any(edge["kind"] == "DECLARES_IMPORT" and edge["to"] == import_node_id for edge in snapshot["edges"])
     assert not any(edge["kind"] == "RESOLVES_TO" and edge["from"] == import_node_id for edge in snapshot["edges"])
     assert not any(edge["kind"] == "IMPORTS_FILE" and edge["from"] == file_id("main", "frontend/src/client.ts") for edge in snapshot["edges"])
+
+
+def test_dart_parts_resolve_reciprocal_relative_and_package_uris(tmp_path: Path) -> None:
+    from tools.repoctl.code_index import CodeIndexEntry
+    from tools.repoctl.graph_import_resolver import resolve_code_imports
+
+    sources = {
+        "lib/owner.dart": "part 'parts/valid.dart';\npart 'parts/wrong.dart';\npart 'parts/package.dart';\n",
+        "lib/parts/valid.dart": "part of '../owner.dart';\n",
+        "lib/parts/wrong.dart": "part of 'owner.dart';\n",
+        "lib/parts/owner.dart": "library another_owner;\n",
+        "lib/parts/package.dart": "part of 'package:demo/owner.dart';\n",
+    }
+    (tmp_path / "pubspec.yaml").write_text("name: demo\n", encoding="utf-8")
+    entries = []
+    for path, source in sources.items():
+        source_path = tmp_path / path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(source, encoding="utf-8")
+        imports = ["parts/valid.dart", "parts/wrong.dart", "parts/package.dart"] if path == "lib/owner.dart" else []
+        entries.append(CodeIndexEntry(path, path, "dart", "source", [], imports, []))
+
+    resolutions, _ = resolve_code_imports(entries, repo=tmp_path)
+
+    assert {item.target_path for item in resolutions} == {"lib/parts/valid.dart", "lib/parts/package.dart"}
+    assert all(item.match_kind == "dart_part_directive" for item in resolutions)

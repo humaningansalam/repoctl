@@ -51,11 +51,11 @@ def test_parent_cycle_is_diagnostic_without_completion_gate(tmp_path: Path, caps
     assert code == 0
     assert {warning["code"] for warning in checked["warnings"]} == {"parent_cycle"}
     assert run_json(tmp_path, capsys, "task", "finish", "first")[0] == 0
-    assert not first.exists()
+    assert "status: done" in first.read_text()
     assert second.read_bytes() == second_original
 
 
-def test_archived_parent_remains_a_valid_classification_reference(tmp_path: Path, capsys) -> None:
+def test_closed_parent_remains_a_valid_classification_reference(tmp_path: Path, capsys) -> None:
     write_workspace(tmp_path)
     add_task(tmp_path, "parent.md", task_text("parent"))
     add_task(tmp_path, "child.md", task_text("child", parent="parent"))
@@ -107,6 +107,6 @@ def test_explicit_task_operations_ignore_unrelated_malformed_archive(tmp_path: P
     assert run_json(tmp_path, capsys, "task", "start", "one")[0] == 0
     assert run_json(tmp_path, capsys, "task", "finish", "one")[0] == 0
     assert malformed.read_bytes() == original
-    code, checked = run_json(tmp_path, capsys, "check", "--include-archived")
+    code, checked = run_json(tmp_path, capsys, "check")
     assert code == 2
     assert checked["problems"][0]["code"] == "duplicate_frontmatter_key"

@@ -588,30 +588,10 @@ def _parenthesized_calls(text: str, name: str) -> list[str] | None:
     calls: list[str] = []
     pattern = re.compile(rf"(?m)^[ \t]*{re.escape(name)}\s*\(")
     for match in pattern.finditer(text):
-        index = match.end()
-        start = index
-        depth = 1
-        quote = ""
-        while index < len(text) and depth:
-            char = text[index]
-            if quote:
-                if char == "\\":
-                    index += 2
-                    continue
-                if char == quote:
-                    quote = ""
-            elif char in {'"', "'"}:
-                quote = char
-            elif char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    calls.append(text[start:index])
-                    break
-            index += 1
-        if depth:
+        call = _balanced_call_body(text, match.end())
+        if call is None:
             return None
+        calls.append(call[0])
     return calls
 
 

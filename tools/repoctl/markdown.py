@@ -149,12 +149,6 @@ def has_section(text: str, heading: str) -> bool:
     return True
 
 
-
-
-
-
-
-
 def append_section_entry(text: str, heading: str, entry: str) -> str:
     newline = "\r\n" if "\r\n" in text else "\n"
     entry = entry.replace("\r\n", "\n").replace("\n", newline).rstrip("\r\n") + newline

@@ -119,6 +119,8 @@ def test_large_realistic_rust_ast_is_iterative_and_preserves_module_line_anchors
     (root/'crates/daemon/src/audio_clock.rs').write_text('pub struct AudioClockDriftEstimator;\n',encoding='utf-8')
     chunks=['mod audio_clock;\n','fn work() -> i64 { 1 }\n','fn entry() -> i64 { work() }\n']
     chunks.extend(f'fn generated_{i}() -> i64 {{ entry() + {i} }}\n' for i in range(3100))
+    chunks.append('/*' + 'x' * (2 * 1024 * 1024) + '*/\n')
+    chunks.append('fn large_body() {\n' + 'let value = 1;\n' * 30000 + '}\n')
     src.write_text(''.join(chunks),encoding='utf-8')
     target=RepoTarget(id='main',root_path=root,display_path='repos',identity_source=RepositoryIdentitySource.RESERVED)
     entries=[CodeIndexEntry(p, 'repos/' + p, 'rust', 'source', [], [], []) for p in (path,'crates/daemon/src/audio_clock.rs')]

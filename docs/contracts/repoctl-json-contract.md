@@ -18,11 +18,13 @@ Successful commands exit with status 0. A result containing problems exits with 
 
 ## Task results
 
-Task identity includes `id`, `title`, `status`, `path`, `repo_id`, `parent` and `archived`. Task paths are relative to the workspace.
+Task identity includes `id`, `title`, `status`, `path`, `repo_id` and `parent`. Task paths are relative to the workspace.
 
 | Command | Result |
 | --- | --- |
-| `task list` | `data.tasks`, with status and repository filters available |
+| `task list` | `data.tasks`; excludes `done` and `canceled` by default |
+| `task list --all` | All Tasks, with optional repository filter |
+| `task list --status <STATUS>` | Tasks with the selected status, with optional repository filter |
 | `task show` | Task identity, parsed `frontmatter` and authored `body` |
 | `task show --summary` | Task identity |
 | `task show --section <HEADING>` | `task`, `section` and that section's `body` |
@@ -30,9 +32,9 @@ Task identity includes `id`, `title`, `status`, `path`, `repo_id`, `parent` and 
 | `task resume` | The single live Task, or `task: null` and a `candidates` list |
 | `task create`, `start`, `block`, `finish`, `cancel` | `task_id`, resulting `path` and `status` |
 
-Task statuses are `todo`, `doing`, `blocked`, `done` and `canceled`. Finishing and canceling move the selected document to `docs/archive/tasks/`. Parent and dependency fields describe relationships; each Task changes status independently.
+Task statuses are `todo`, `doing`, `blocked`, `done` and `canceled`. Finishing and canceling update the selected document in place. Task selection reads `docs/tasks/` and `docs/archive/tasks/`; location does not determine status. Parent and dependency fields describe relationships; each Task changes status independently.
 
-`task create --body-file` reads an authored UTF-8 Markdown body. Lifecycle commands update the Task metadata and retain its body. Explicit finish summaries and block/cancel reasons are appended as authored notes.
+`task create --body-file` reads an authored UTF-8 Markdown body. Lifecycle commands update the Task metadata while retaining its path and body. Explicit finish summaries and block/cancel reasons are appended as authored notes.
 
 ## Knowledge results
 

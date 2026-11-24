@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Task document template
+  - name: Project handoff documents
     url: https://github.com/humaningansalam/agent-handoff-template/issues
-    about: Document examples and authoring guidance belong to the template project.
+    about: Starting documents and authoring guidance belong to the template project.

@@ -905,17 +905,18 @@ def _path_from_edge(
 
 
 def _definition_edges(snapshot: GraphSnapshot, node_ids: set[str]) -> list[GraphEdge]:
-    wanted = set(node_ids)
-    edges: list[GraphEdge] = []
-    for edge in snapshot.edges:
-        if edge.kind == "DEFINES" and (edge.from_id in wanted or edge.to_id in wanted):
-            wanted.add(edge.from_id)
-            wanted.add(edge.to_id)
-            edges.append(edge)
-        elif edge.kind == "ANCHORS" and edge.from_id in wanted:
-            wanted.add(edge.to_id)
-            edges.append(edge)
-    node_ids.update(wanted)
+    definitions = [
+        edge for edge in snapshot.edges
+        if edge.kind == "DEFINES" and (edge.from_id in node_ids or edge.to_id in node_ids)
+    ]
+    symbol_ids = node_ids | {edge.to_id for edge in definitions}
+    anchors = [
+        edge for edge in snapshot.edges
+        if edge.kind == "ANCHORS" and edge.from_id in symbol_ids
+    ]
+    edges = [*definitions, *anchors]
+    for edge in edges:
+        node_ids.update((edge.from_id, edge.to_id))
     return edges
 
 

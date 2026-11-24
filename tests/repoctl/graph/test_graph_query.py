@@ -203,10 +203,6 @@ def test_graph_shell_only_repo_reports_provider_coverage_as_unsupported(tmp_path
     _materialize(tmp_path)
     monkeypatch.setenv("REPOCTL_WORKSPACE_ROOT", str(tmp_path))
 
-    assert main(["graph", "query", "--symbol", "run_task", "--json"]) == 0
-
-    compact = json.loads(capsys.readouterr().out)
-    assert compact["data"]["query_status"] == "unsupported"
 
     assert main(["graph", "query", "--symbol", "run_task", "--json"]) == 0
 
@@ -236,3 +232,29 @@ def test_graph_relations_are_independent_of_source_index(tmp_path: Path, monkeyp
         "provider_artifacts": "available",
     }
     assert result["data"]["materialization"]["status"] == "materialized"
+
+
+def test_symbol_neighborhood_is_independent_of_snapshot_edge_order(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from tools.repoctl.graph import build_graph, query_graph
+
+    write_workspace(tmp_path)
+    repo = tmp_path / "repos"
+    init_repo(repo)
+    (repo / "app.py").write_text(
+        "def chosen():\n    return 1\n\ndef unrelated():\n    return 2\n",
+        encoding="utf-8",
+    )
+    target = require_repo_target(tmp_path, repo_id="main")
+    snapshot, problems, _ = build_graph(tmp_path, target=target)
+    assert snapshot is not None and not problems
+
+    forward, forward_problems = query_graph(snapshot, callees_of="chosen")
+    reversed_result, reverse_problems = query_graph(
+        replace(snapshot, edges=list(reversed(snapshot.edges))), callees_of="chosen",
+    )
+
+    assert not forward_problems and not reverse_problems
+    assert forward == reversed_result
+    assert {node["facts"]["provider"]["name"] for node in forward["nodes"] if node["kind"] == "symbol"} == {"chosen"}
+    assert len([node for node in forward["nodes"] if node["kind"] == "anchor"]) == 1

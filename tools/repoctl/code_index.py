@@ -94,9 +94,6 @@ def semantic_provider_entries(entries: list[CodeIndexEntry]) -> list[CodeIndexEn
     ]
 
 
-
-
-
 def _dedupe_sorted(values: list[str]) -> list[str]:
     return sorted({value for value in values if value})
 
@@ -245,10 +242,6 @@ def _index_python(
             for node in ast.walk(tree)
         ),
     )
-
-
-
-
 
 
 def _index_file(repo: Path, file: InventoryFile) -> CodeIndexEntry:
