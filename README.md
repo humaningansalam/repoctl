@@ -34,11 +34,11 @@ Each Task is an editable Markdown file under `docs/tasks/`. Frontmatter contains
 ./scripts/repoctl task finish T-... --json
 ```
 
-Add `--body-file <PATH>` when creating a Task to use an existing UTF-8 Markdown body. Edit the resulting document directly as the work changes.
+Creation supplies metadata and a title. Add `--body-file <PATH>` to use an existing UTF-8 Markdown body, then edit the document directly as the work changes.
 
-`task list` lists current records. `task resume` reads a selected Task's Handoff, or returns candidates when several Tasks are live. `task show --section <HEADING>` reads a named section.
+`task list` lists open records. Use `--status done` to find completed work, another `--status` value to select that status, or `--all` to list every Task. These selections read both `docs/tasks/` and `docs/archive/tasks/`. `task resume` reads a selected Task's Handoff, or returns candidates when several Tasks are live. `task show --section <HEADING>` reads a named section.
 
-`task start` sets the status to `doing`; `task block` sets it to `blocked`. Finishing or canceling records `done` or `canceled` and moves that Task to `docs/archive/tasks/`. An optional finish summary or block/cancel reason records the supplied text in the Task. Each command's `--help` lists its text and file inputs.
+`task start` sets the status to `doing`; `task block` sets it to `blocked`. Finishing or canceling records `done` or `canceled` in the same document. Its path and relative links stay unchanged. An optional finish summary or block/cancel reason records the supplied text in the Task. Each command's `--help` lists its text and file inputs.
 
 `parent` and `depends_on` link related Tasks. Each Task has its own status. Repository, area and owner metadata can describe the work. `docs/BOARD.md` is an optional overview; `backlog` commands edit its deferred-work entries.
 

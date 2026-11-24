@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import tomllib
 from pathlib import Path
 from typing import Any
 
-from .io import Problem, RepoctlError, atomic_write, find_workspace_root, repoctl_lock, write_temporary_text
+from .io import Problem, RepoctlError, atomic_write, find_workspace_root, repoctl_lock
 
 
 class RepoctlArgumentParser(argparse.ArgumentParser):
@@ -64,12 +63,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     from .repositories import repo_check_problems, repo_layout
     from .tasks import load_tasks, validate_tasks
     root = _root(args)
-    all_tasks = load_tasks(root, include_archived=True)
-    tasks = all_tasks if args.include_archived else [task for task in all_tasks if not task.archived]
-    paths = {task.rel_path for task in tasks}
-    task_problems = [problem for problem in validate_tasks(all_tasks)
-                     if args.include_archived or problem.path in paths or problem.code == "duplicate_task_id"]
-    problems = [*task_problems, *repo_check_problems(root, repo_layout(root))]
+    tasks = load_tasks(root)
+    problems = [*validate_tasks(tasks), *repo_check_problems(root, repo_layout(root))]
     return _emit(args, {"task_count": len(tasks)}, problems,
                  text=f"Checked {len(tasks)} Task documents.")
 
@@ -92,70 +87,23 @@ def cmd_repo(args: argparse.Namespace) -> int:
 
 def _task_data(task: Any, *, full: bool = False) -> dict[str, Any]:
     data = {"id": task.id, "title": task.title, "status": task.status,
-            "path": task.rel_path, "repo_id": task.repo_id, "parent": task.parent, "archived": task.archived}
+            "path": task.rel_path, "repo_id": task.repo_id, "parent": task.parent}
     if full:
         data.update(frontmatter=task.frontmatter, body=task.body)
     return data
 
 
-def _write_changes(root: Path, writes: dict[Path, str], deletes=(), *, require_new=()) -> None:
-    """Stage text first; restore the original files if a publish operation fails."""
-    all_paths = set(writes) | set(deletes)
-    root = root.resolve()
-    for path in all_paths:
-        if not path.resolve().is_relative_to(root) or path.is_symlink():
-            raise RepoctlError("write path is outside the workspace or is a symlink", code="unsafe_write_path", path=str(path))
-        current = path.parent
-        while current != root and current != current.parent:
-            if current.is_symlink():
-                raise RepoctlError("write path crosses a symlink", code="unsafe_write_path", path=str(path))
-            current = current.parent
-    for path in require_new:
-        if path.exists():
-            raise RepoctlError("destination already exists", code="destination_exists", path=str(path))
-    originals = {p: p.read_bytes() if p.exists() else None for p in all_paths}
-    staged: dict[Path, Path] = {}
-    changed: list[Path] = []
-    try:
-        for path, text in writes.items():
-            staged[path] = write_temporary_text(path, text)
-        for path, temporary in staged.items():
-            os.replace(temporary, path)
-            changed.append(path)
-        for path in deletes:
-            path.unlink()
-            changed.append(path)
-    except Exception:
-        for path in reversed(changed):
-            original = originals[path]
-            if original is None:
-                path.unlink(missing_ok=True)
-            else:
-                atomic_write(path, original.decode("utf-8"))
-        raise
-    finally:
-        for temporary in staged.values():
-            temporary.unlink(missing_ok=True)
-
-
-def apply_task_result(root: Path, result: dict[str, Any]) -> None:
-    old = root / result["old_path"] if result.get("old_path") else None
-    new = root / result["new_path"]
-    if old and old.read_bytes() != result["original_text"].encode("utf-8"):
-        raise RepoctlError("Task changed after it was read; retry with the current document", code="task_changed", path=str(old))
-    _write_changes(root, {new: result["text"]}, (old,) if old and old != new else (),
-                   require_new=[new] if old != new else [])
-
-
 def cmd_task_list(args: argparse.Namespace) -> int:
-    from .tasks import load_tasks
-    tasks = load_tasks(_root(args), include_archived=args.include_archived)
-    if args.status:
-        tasks = [t for t in tasks if t.status == args.status]
+    from .tasks import CLOSED_STATUSES, load_tasks
+    tasks = load_tasks(_root(args))
+    if args.status is not None:
+        tasks = [task for task in tasks if task.status == args.status]
+    elif not args.all:
+        tasks = [task for task in tasks if task.status not in CLOSED_STATUSES]
     if args.repo_id is not None:
-        tasks = [t for t in tasks if t.repo_id == args.repo_id]
-    return _emit(args, {"tasks": [_task_data(t) for t in tasks]},
-                 text="\n".join(f"{t.id} {t.status} {t.title}" for t in tasks) or "No Tasks.")
+        tasks = [task for task in tasks if task.repo_id == args.repo_id]
+    return _emit(args, {"tasks": [_task_data(task) for task in tasks]},
+                 text="\n".join(f"{task.id} {task.status} {task.title}" for task in tasks) or "No Tasks.")
 
 
 def cmd_task_show(args: argparse.Namespace) -> int:
@@ -172,14 +120,14 @@ def cmd_task_show(args: argparse.Namespace) -> int:
 
 
 def cmd_task_resume(args: argparse.Namespace) -> int:
-    from .tasks import LIVE, load_tasks, resolve_task, task_handoff_body
+    from .tasks import OPEN_STATUSES, load_tasks, resolve_task, task_handoff_body
     root = _root(args)
     if args.task_id:
         task = resolve_task(root, args.task_id)
     else:
-        candidates = [t for t in load_tasks(root) if t.status in LIVE]
+        candidates = [task for task in load_tasks(root) if task.status in OPEN_STATUSES]
         if len(candidates) != 1:
-            return _emit(args, {"task": None, "candidates": [_task_data(t) for t in candidates]},
+            return _emit(args, {"task": None, "candidates": [_task_data(task) for task in candidates]},
                          text="Select a Task by ID." if candidates else "No live Tasks.")
         task = candidates[0]
     data = {"task": _task_data(task, full=args.full), "handoff": task_handoff_body(task)}
@@ -187,8 +135,7 @@ def cmd_task_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_task_create(args: argparse.Namespace) -> int:
-    from .markdown import replace_frontmatter_line
-    from .tasks import prepare_task_create, utc_stamp
+    from .tasks import apply_task_edit, prepare_task_create
     root = _root(args)
     body = None
     if args.body_file:
@@ -196,15 +143,12 @@ def cmd_task_create(args: argparse.Namespace) -> int:
         with (path if path.is_absolute() else root / path).open(encoding="utf-8", newline="") as handle:
             body = handle.read()
     with repoctl_lock(root):
-        result = prepare_task_create(title=args.title, slug=args.slug, area=args.area, owner=args.owner,
-                                     parent=args.parent, repo_ref=args.repo_ref, repo_id=args.repo_id,
-                                     depends_on=args.depends_on, body=body)
-        if args.start:
-            result["text"] = replace_frontmatter_line(result["text"], "status", "doing")
-            result["text"] = replace_frontmatter_line(result["text"], "started_at", json.dumps(utc_stamp()))
-        apply_task_result(root, result)
-    return _emit(args, {"task_id": result["task_id"], "path": result["new_path"],
-                        "status": "doing" if args.start else "todo"}, text=f"Created {result['task_id']}: {result['new_path']}")
+        edit = prepare_task_create(title=args.title, slug=args.slug, area=args.area, owner=args.owner,
+                                   parent=args.parent, repo_ref=args.repo_ref, repo_id=args.repo_id,
+                                   depends_on=args.depends_on, body=body, start=args.start)
+        apply_task_edit(root, edit)
+    return _emit(args, {"task_id": edit.task_id, "path": edit.path,
+                        "status": "doing" if args.start else "todo"}, text=f"Created {edit.task_id}: {edit.path}")
 
 
 def _read_text_arg(root: Path, value: str | None, file: str | None) -> str:
@@ -215,28 +159,22 @@ def _read_text_arg(root: Path, value: str | None, file: str | None) -> str:
 
 
 def cmd_task_transition(args: argparse.Namespace) -> int:
-    from .tasks import prepare_task_block, prepare_task_cancel, prepare_task_finish, prepare_task_start
+    from .tasks import apply_task_edit, prepare_task_block, prepare_task_cancel, prepare_task_finish, prepare_task_start
     root = _root(args)
     operation = args.command.split(".")[-1]
     with repoctl_lock(root):
         if operation == "finish":
-            result = prepare_task_finish(root, args.task_id, summary=_read_text_arg(root, args.summary, args.summary_file))
+            edit = prepare_task_finish(root, args.task_id, summary=_read_text_arg(root, args.summary, args.summary_file))
         elif operation == "start":
-            result = prepare_task_start(root, args.task_id)
+            edit = prepare_task_start(root, args.task_id)
         else:
             reason = _read_text_arg(root, args.reason, args.reason_file)
             prepare = prepare_task_cancel if operation == "cancel" else prepare_task_block
-            result = prepare(root, args.task_id, reason=reason)
-        apply_task_result(root, result)
+            edit = prepare(root, args.task_id, reason=reason)
+        apply_task_edit(root, edit)
     status = {"start": "doing", "finish": "done", "cancel": "canceled", "block": "blocked"}[operation]
-    return _emit(args, {"task_id": result["task_id"], "path": result["new_path"], "status": status},
-                 text=f"{result['task_id']}: {status}")
-
-
-
-
-
-
+    return _emit(args, {"task_id": edit.task_id, "path": edit.path, "status": status},
+                 text=f"{edit.task_id}: {status}")
 
 
 def _board_text(root: Path) -> str:
@@ -296,9 +234,6 @@ def cmd_graph_build(args: argparse.Namespace) -> int:
     if args.full:
         data["snapshot"] = snapshot.to_dict() if snapshot else None
     return _emit(args, data, problems)
-
-
-
 
 
 def cmd_graph_query(args: argparse.Namespace) -> int:
@@ -423,8 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
         pair.add_argument(f"--{name}-file", default="", help=f"UTF-8 file containing {name.replace('-', ' ')}")
 
     command(groups, "version", "version", cmd_version, "Show runtime version.")
-    check = command(groups, "check", "check", cmd_check, "Check Task structure and repository registration.")
-    check.add_argument("--include-archived", action="store_true", help="also read archived Task documents")
+    command(groups, "check", "check", cmd_check, "Check all Task documents and repository registration.")
 
     repo = group("repo", "Select and register repositories.")
     command(repo, "list", "repo.list", cmd_repo, "List repositories and unregistered candidates.")
@@ -448,9 +382,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--repo-ref", default="", help="optional descriptive repository reference")
     create.add_argument("--depends-on", action="append", default=[], help="advisory Task dependency; repeat as needed")
     create.add_argument("--start", action="store_true", help="create in doing status")
-    listing = command(task, "list", "task.list", cmd_task_list, "List Task documents.")
-    listing.add_argument("--include-archived", action="store_true", help="include archived Task documents")
-    listing.add_argument("--status", help="filter by status")
+    listing = command(task, "list", "task.list", cmd_task_list, "List open Task documents.")
+    selection = listing.add_mutually_exclusive_group()
+    selection.add_argument("--all", action="store_true", help="include completed and canceled Tasks")
+    selection.add_argument("--status", help="select one status, regardless of document location")
     listing.add_argument("--repo-id", help="filter by repository ID")
     show = command(task, "show", "task.show", cmd_task_show, "Read one Task.")
     show.add_argument("task_id", help="Task ID or document path")
@@ -461,8 +396,8 @@ def build_parser() -> argparse.ArgumentParser:
     full(resume)
     for name, help in (
         ("start", "Set a Task to doing."),
-        ("finish", "Complete and archive one Task."),
-        ("cancel", "Cancel and archive one Task."),
+        ("finish", "Mark a Task done without moving its document."),
+        ("cancel", "Mark a Task canceled without moving its document."),
         ("block", "Set a Task to blocked."),
     ):
         child = command(task, name, f"task.{name}", cmd_task_transition, help)

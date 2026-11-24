@@ -28,7 +28,6 @@ from .io import atomic_write
 from .repositories import RepoTarget
 
 
-DART_PROVIDER_LANGUAGES = frozenset({"dart"})
 PROVIDER = "dart_analyzer"
 HELPER_PUBSPEC = """name: repoctl_dart_analyzer_helper
 publish_to: none

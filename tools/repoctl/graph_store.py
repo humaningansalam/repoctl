@@ -258,7 +258,7 @@ def _provider_config_state(
     return files, digest_data(records)
 
 
-def _root_record_fingerprint(record: dict[str, Any]) -> str:
+def _knowledge_input_fingerprint(record: dict[str, Any]) -> str:
     return digest_data(
         {
             "path": str(record.get("path") or ""),
@@ -400,19 +400,19 @@ def collect_graph_inputs(
             "units": _provider_units(provider, target, paths),
         }
 
-    previous_root_records = previous_manifest.get("knowledge_input_records") if isinstance(previous_manifest.get("knowledge_input_records"), dict) else {}
-    root_records = _knowledge_input_records(
+    previous_knowledge_records = previous_manifest.get("knowledge_input_records") if isinstance(previous_manifest.get("knowledge_input_records"), dict) else {}
+    knowledge_records = _knowledge_input_records(
         root,
         target,
-        previous={str(path): value for path, value in previous_root_records.items() if isinstance(value, dict)},
+        previous={str(path): value for path, value in previous_knowledge_records.items() if isinstance(value, dict)},
     )
     knowledge_input_records = {
         str(record.get("path") or ""): record
-        for record in root_records
+        for record in knowledge_records
         if str(record.get("path") or "")
     }
     knowledge_input_fingerprints = {
-        path: _root_record_fingerprint(record)
+        path: _knowledge_input_fingerprint(record)
         for path, record in knowledge_input_records.items()
     }
     state = {
@@ -461,7 +461,7 @@ def _read_materialization_json(root: Path, path: Path) -> tuple[dict[str, Any] |
         return None, "missing", None
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         return None, "unavailable", Problem(
             "error",
             "graph_materialization_unavailable",
@@ -854,7 +854,7 @@ def _validate_materialization_state(
     return None, "materialized"
 
 
-def _admit_materialization(
+def _read_graph_artifacts(
     root: Path,
     *,
     target: RepoTarget,
@@ -912,7 +912,7 @@ def _admit_materialization(
         return None, [problem], status
 
     component_problems: list[Problem] = []
-    provider_results, provider_problems = _load_provider_results_strict(
+    provider_results, provider_problems = _read_provider_results(
         root,
         state_dir=state_dir,
         manifest=manifest_data,
@@ -950,7 +950,7 @@ def load_materialized_graph(
     state_root: Path | None = None,
     with_freshness: bool = False,
 ) -> tuple[GraphSnapshot | None, list[Problem], dict[str, Any]]:
-    materialized, problems, status = _admit_materialization(
+    materialized, problems, status = _read_graph_artifacts(
         root,
         target=target,
         state_root=state_root,
@@ -995,9 +995,9 @@ def graph_materialization_freshness(
     provider_results: dict[str, SemanticProviderResult]
     provider_advisories: list[Problem] = []
     if snapshot is None:
-        materialized, admission_problems, status = _admit_materialization(root, target=target, state_root=state_root)
+        materialized, load_problems, status = _read_graph_artifacts(root, target=target, state_root=state_root)
         if materialized is None:
-            return {"status": status, "changed_paths": []}, admission_problems
+            return {"status": status, "changed_paths": []}, load_problems
         manifest = materialized.manifest
         snapshot = materialized.snapshot
         provider_results = materialized.provider_results
@@ -1014,16 +1014,16 @@ def graph_materialization_freshness(
                     _state_path_label(root, state_dir),
                 )
             ]
-        admission_problem, status = _validate_materialization_state(
+        validation_problem, status = _validate_materialization_state(
             root,
             target=target,
             state_dir=state_dir,
             manifest=manifest,
             snapshot=snapshot,
         )
-        if admission_problem is not None:
-            return {"status": status, "changed_paths": []}, [admission_problem]
-        provider_results, provider_problems = _load_provider_results_strict(
+        if validation_problem is not None:
+            return {"status": status, "changed_paths": []}, [validation_problem]
+        provider_results, provider_problems = _read_provider_results(
             root,
             state_dir=state_dir,
             manifest=manifest,
@@ -1076,11 +1076,7 @@ def _collect_graph_freshness(
     provider_results: dict[str, SemanticProviderResult],
     component_manifest_registry: ComponentManifestRegistry,
 ) -> tuple[dict[str, Any], list[Problem]]:
-    """Check live inputs against artifacts admitted once in this observation.
-
-    This is invocation-local reuse, never a cache across queries. Admission
-    still validates repository/schema/digests/providers before entry.
-    """
+    """Compare live inputs with the artifacts already read for this query."""
     inventory, inventory_problems, _inventory_meta = file_inventory(root, changed=False, target=target)
     previous_records = manifest.get("file_records") if isinstance(manifest.get("file_records"), dict) else {}
     current_records, git_state = repo_file_state_records(
@@ -1197,15 +1193,15 @@ def _collect_graph_freshness(
         for path in stale_paths
         if path in current_classifications
     }
-    previous_root_records = manifest.get("knowledge_input_records") if isinstance(manifest.get("knowledge_input_records"), dict) else {}
-    root_records = _knowledge_input_records(
+    previous_knowledge_records = manifest.get("knowledge_input_records") if isinstance(manifest.get("knowledge_input_records"), dict) else {}
+    knowledge_records = _knowledge_input_records(
         root,
         target,
-        previous={str(path): value for path, value in previous_root_records.items() if isinstance(value, dict)},
+        previous={str(path): value for path, value in previous_knowledge_records.items() if isinstance(value, dict)},
     )
     current_root_fingerprints = {
-        str(record.get("path") or ""): _root_record_fingerprint(record)
-        for record in root_records
+        str(record.get("path") or ""): _knowledge_input_fingerprint(record)
+        for record in knowledge_records
         if str(record.get("path") or "")
     }
     previous_root_fingerprints = manifest.get("knowledge_input_fingerprints") if isinstance(manifest.get("knowledge_input_fingerprints"), dict) else {}
@@ -1315,6 +1311,8 @@ def _affected_paths(
     current_paths = set(str(path) for path in current_files)
     previous_files = previous_state.get("files") if isinstance(previous_state.get("files"), dict) else {}
     previous_paths = set(str(path) for path in previous_files)
+    if provider == "tree_sitter_structural":
+        return current_paths if changed_paths else set()
     if provider == "python_ast" and current_paths != previous_paths:
         return current_paths
     current_units = current_state.get("units") if isinstance(current_state.get("units"), dict) else {}
@@ -1398,6 +1396,8 @@ def _merge_provider_result(
     replace_paths: set[str],
     current_paths: set[str],
 ) -> SemanticProviderResult:
+    if not current_paths:
+        return _empty_provider_result(previous.provider)
     imports = tuple(sorted(
         {
             *[item for item in previous.imports if item.path not in replace_paths and item.path in current_paths],
@@ -1480,7 +1480,7 @@ def _merge_provider_result(
     )
 
 
-def _load_provider_results_strict(
+def _read_provider_results(
     root: Path,
     *,
     state_dir: Path,
@@ -1547,16 +1547,16 @@ def materialize_graph(
     previous_snapshot: GraphSnapshot | None = None
     previous_provider_results: dict[str, SemanticProviderResult] = {}
     if not rebuild:
-        materialized, admission_problems, admission_status = _admit_materialization(
+        materialized, load_problems, load_status = _read_graph_artifacts(
             root,
             target=target,
             state_root=state_root,
         )
-        if admission_status != "missing":
-            if admission_problems or materialized is None:
-                return None, admission_problems, {
+        if load_status != "missing":
+            if load_problems or materialized is None:
+                return None, load_problems, {
                     "repository": target.to_dict(),
-                    "materialization": {"status": admission_status},
+                    "materialization": {"status": load_status},
                 }
             previous_manifest = materialized.manifest
             previous_snapshot = materialized.snapshot
@@ -1637,7 +1637,7 @@ def materialize_graph(
                 previous_snapshot=previous_snapshot,
             )
             replace_paths = analysis_paths | (changed_paths - current_paths)
-        if previous_result is not None and not replace_paths:
+        if previous_result is not None and not replace_paths and not config_changed:
             results.append(previous_result)
             reused_providers.append(provider)
             continue

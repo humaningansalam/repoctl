@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 
 
-
-
 TEST_DIRECTORIES = {"test", "tests", "__tests__"}
 TEST_SUFFIXES = (
     "_test.py",
@@ -19,9 +17,6 @@ TEST_SUFFIXES = (
     "_test.mts",
     "_test.dart",
 )
-
-
-
 
 
 def is_test_path(path: str, *, repository_path: str = "") -> bool:

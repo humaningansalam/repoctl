@@ -15,7 +15,7 @@ from .graph_semantic_model import RpcInvocationFact, RpcInvocationStatus, RpcPar
 from .io import Problem
 
 
-STRUCTURED_RELATION_INPUT_VERSION = 6
+STRUCTURED_RELATION_INPUT_VERSION = 7
 STRUCTURED_EDGE_KIND = "USES_FILE"
 class StructuredRelationType(StrEnum):
     DOCKER_COPY_SOURCE = "docker_copy_source"
@@ -489,7 +489,6 @@ def build_structured_file_relations(
                 path,
                 _shell_facts(
                     text,
-                    path=path,
                     known_paths=known_paths,
                     bases=_default_shell_bases(path),
                 ),
@@ -1169,7 +1168,6 @@ def _workflow_facts(text: str, *, path: str, known_paths: set[str]) -> _ParseRes
             run_text, run_line = run_values[0]
             shell = _shell_facts(
                 run_text,
-                path=path,
                 known_paths=known_paths,
                 bases=(base,),
                 line_offset=run_line - 1,
@@ -1219,7 +1217,6 @@ def _default_shell_bases(path: str) -> tuple[str, ...]:
 def _shell_facts(
     text: str,
     *,
-    path: str,
     known_paths: set[str],
     bases: tuple[str, ...],
     line_offset: int = 0,
@@ -1254,7 +1251,9 @@ def _shell_facts(
                 build = _docker_build_from_shell(tokens[2:], bases=bases, known_paths=known_paths)
                 if build is not None:
                     builds.append(build)
-                    pending.append((build.dockerfile, StructuredRelationType.SHELL_RUN_FILE))
+                    references.append(
+                        _ResolvedFileFact(build.dockerfile, StructuredRelationType.SHELL_RUN_FILE, build.dockerfile, command.line)
+                    )
             elif tokens[1] == "compose":
                 compose_file = _option_value(tokens[2:], "-f", "--file")
                 if compose_file:
@@ -1788,7 +1787,7 @@ def _sql_routine_parameter(tokens: list[_Token]) -> _SqlRoutineParameter:
         and values[0].value not in _SQL_TYPE_START
         and values[1].value != "."
     ):
-        name = values[0].value if not values[0].quoted else values[0].value
+        name = values[0].value
         values = values[1:]
     return _SqlRoutineParameter(name=name, type_name=_sql_type_text(values), mode=mode, has_default=has_default)
 
@@ -2947,10 +2946,7 @@ def _resolve_sql_relations(
                     active = [definition]
                 else:
                     active.append(definition)
-            if len(active) == 1:
-                owners.extend(active)
-            elif len(active) > 1:
-                owners.extend(active)
+            owners.extend(active)
         if len(owners) != 1:
             continue
         owner = owners[0]

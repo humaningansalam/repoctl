@@ -42,8 +42,6 @@ class Problem:
         return data
 
 
-
-
 def find_workspace_root(explicit: str | Path | None = None) -> Path:
     """Resolve an explicit directory or discover the workspace above cwd."""
     external = explicit if explicit is not None else os.environ.get("REPOCTL_WORKSPACE_ROOT")

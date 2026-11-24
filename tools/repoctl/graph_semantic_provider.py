@@ -14,7 +14,6 @@ from .graph_semantic_model import CapabilityEvidence, ProviderFailure, SemanticP
 from .repositories import RepoTarget
 
 
-SEMANTIC_PROVIDER_LANGUAGES = frozenset({"python", "javascript", "typescript", "dart", "csharp"})
 PROVIDER_LANGUAGES = {
     "python_ast": frozenset({"python"}),
     "typescript_compiler": frozenset({"javascript", "typescript"}),
@@ -27,12 +26,11 @@ PROVIDER_INPUT_VERSIONS = {
     "typescript_compiler": 4,
     "dart_analyzer": 3,
     "csharp_roslyn": 2,
-    "tree_sitter_structural": 3,
+    "tree_sitter_structural": 4,
 }
 
 
 def _python_result(
-    root: Path,
     *,
     target: RepoTarget,
     entries: list[CodeIndexEntry],
@@ -41,7 +39,6 @@ def _python_result(
     previous: SemanticProviderResult | None = None,
 ) -> SemanticProviderResult:
     symbols, calls, meta = build_python_semantics(
-        root,
         target=target,
         entries=entries,
         import_resolutions=import_resolutions,
@@ -106,7 +103,6 @@ def build_semantic_provider(
 ) -> SemanticProviderResult:
     if provider == "python_ast":
         return _python_result(
-            root,
             target=target,
             entries=entries,
             import_resolutions=import_resolutions,

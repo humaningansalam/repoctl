@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .graph_model import GraphSnapshot
+from .graph_model import GraphNode, GraphSnapshot
 from .git import normalize_repo_path
 from .path_roles import is_test_path
 from .repositories import RepoTarget
@@ -47,7 +47,7 @@ def _source(target: RepoTarget, path: str) -> tuple[str | None, int, str]:
         return None, len(raw), "decode_error"
 
 
-def _node_path_index(snapshot: GraphSnapshot) -> tuple[dict[str, str], dict[str, dict[str, str]], dict[str, dict[str, Any]]]:
+def _node_path_index(snapshot: GraphSnapshot) -> tuple[dict[str, dict[str, str]], dict[str, GraphNode]]:
     nodes = {node.id: node for node in snapshot.nodes}
     owner = {
         edge.to_id: str(nodes[edge.from_id].identity.get("path") or "")
@@ -63,7 +63,7 @@ def _node_path_index(snapshot: GraphSnapshot) -> tuple[dict[str, str], dict[str,
         for node in snapshot.nodes
         if node.kind == "symbol" and isinstance(node.facts.get("provider"), dict)
     }
-    return owner, symbols, nodes
+    return symbols, nodes
 
 
 def _route_functions(tree: ast.AST | None, route: str) -> list[tuple[str, int, ast.AST]]:
@@ -284,7 +284,7 @@ def _rust_embedded_test_evidence(source: str) -> tuple[str, int] | None:
                     identifier = text[item.start_byte:item.end_byte].decode("utf-8")
                     if identifier in definitions:
                         return (text[name.start_byte:name.end_byte].decode("utf-8"),
-                                node.start_point.row + 1)
+                                text.count(b"\n", 0, node.start_byte) + 1)
                 pending.extend(item.named_children)
     return None
 
@@ -449,7 +449,7 @@ def query_graph_workflow(
         return {"status": "invalid", "problem": "--in-file must be a normalized repository-relative file"}
     freshness = freshness or {}
     stale = set(freshness.get("stale_paths") or [])
-    _owner, symbols, nodes = _node_path_index(snapshot)
+    symbols, nodes = _node_path_index(snapshot)
     graph_files = {
         str(node.identity.get("path") or "")
         for node in snapshot.nodes
@@ -516,7 +516,7 @@ def query_graph_workflow(
             }
         for path, name, _function in entrypoint_source:
             chosen_symbol_ids.update(
-                sid for sid, info in symbols.items()
+                symbol_id for symbol_id, info in symbols.items()
                 if info["path"] == path and info["name"].rsplit(".", 1)[-1] == name and path not in stale
             )
         # Use provider CALLS edges for resolved targets. Attribute names and
@@ -536,13 +536,13 @@ def query_graph_workflow(
         if entrypoint_source:
             route_path, _name, function = entrypoint_source[0]
             methods = {method for method, receiver in collect_route_value_flow(function) if receiver}
-            for sid, info in symbols.items():
-                if sid in chosen_symbol_ids or not info["path"].endswith(".py") or is_test_path(info["path"]):
+            for symbol_id, info in symbols.items():
+                if symbol_id in chosen_symbol_ids or not info["path"].endswith(".py") or is_test_path(info["path"]):
                     continue
                 method = info["name"].rsplit(".", 1)[-1]
                 if method not in methods or not _current_class_method(python_tree(info["path"]), info["name"], method):
                     continue
-                chosen_symbol_ids.add(sid)
+                chosen_symbol_ids.add(symbol_id)
                 implementations.append(_entry(info["path"], relation="candidate",
                                                evidence="matching declaration for an unresolved attribute call",
                                                symbol=info["name"]))
@@ -550,7 +550,7 @@ def query_graph_workflow(
                               "evidence": "unresolved attribute call"})
     else:
         matches = [
-            (sid, info) for sid, info in symbols.items()
+            (symbol_id, info) for symbol_id, info in symbols.items()
             if info["path"] and (info["name"] == symbol or info["name"].rsplit(".", 1)[-1] == symbol)
             and (not in_file or info["path"] == in_file)
             and info["path"] not in stale
@@ -560,10 +560,10 @@ def query_graph_workflow(
                 "query": {"symbol": symbol, "in_file": in_file},
                 "status": "ambiguous", "implementations": [
                     _entry(info["path"], relation="resolved", evidence="provider symbol", symbol=info["name"])
-                    for _sid, info in matches
+                    for _symbol_id, info in matches
                 ], "warnings": ["Multiple precise symbols match; pass a qualified name and --in-file"],
             }
-        for sid, info in matches:
+        for symbol_id, info in matches:
             # Rust `mod audio_clock;` declares the module file, rather than
             # implementing the code inside the declaring main.rs.
             if info.get("kind") == "module":
@@ -582,7 +582,7 @@ def query_graph_workflow(
                     implementations.append(_entry(next(iter(linked_paths)), relation="resolved",
                                                   evidence="resolved Rust mod file", symbol=info["name"]))
                     continue
-            chosen_symbol_ids.add(sid)
+            chosen_symbol_ids.add(symbol_id)
             implementations.append(_entry(info["path"], relation="resolved", evidence="provider symbol", symbol=info["name"]))
         if not matches and symbol:
             # Unsupported languages still get source locations, never a
@@ -663,10 +663,10 @@ def query_graph_workflow(
     for edge in snapshot.edges:
         if edge.kind not in {"CALLS", "IMPORTS_FILE", "TESTS_FILE"}:
             continue
-        a = nodes.get(edge.from_id)
-        b = nodes.get(edge.to_id)
-        from_path = symbols.get(edge.from_id, {}).get("path", "") if edge.kind == "CALLS" else str(a.identity.get("path") or "") if a else ""
-        to_path = symbols.get(edge.to_id, {}).get("path", "") if edge.kind == "CALLS" else str(b.identity.get("path") or "") if b else ""
+        source_node = nodes.get(edge.from_id)
+        target_node = nodes.get(edge.to_id)
+        from_path = symbols.get(edge.from_id, {}).get("path", "") if edge.kind == "CALLS" else str(source_node.identity.get("path") or "") if source_node else ""
+        to_path = symbols.get(edge.to_id, {}).get("path", "") if edge.kind == "CALLS" else str(target_node.identity.get("path") or "") if target_node else ""
         if not from_path or not to_path or from_path in stale or to_path in stale:
             continue
         if edge.kind == "CALLS" and edge.to_id in chosen_symbol_ids:

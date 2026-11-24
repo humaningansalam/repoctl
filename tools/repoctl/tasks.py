@@ -1,4 +1,4 @@
-"""Task documents and prepared lifecycle edits."""
+"""Editable Task documents with status independent of file location."""
 
 from __future__ import annotations
 
@@ -11,15 +11,15 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .io import Problem, RepoctlError
+from .io import Problem, RepoctlError, atomic_write
 from .markdown import (
     append_section_entry, find_section, parse_frontmatter,
     replace_frontmatter_line, section_ranges,
 )
 
-LIVE = {"todo", "doing", "blocked"}
-NON_LIVE = {"done", "canceled"}
-STATUSES = LIVE | NON_LIVE
+OPEN_STATUSES = {"todo", "doing", "blocked"}
+CLOSED_STATUSES = {"done", "canceled"}
+TASK_STATUSES = OPEN_STATUSES | CLOSED_STATUSES
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,6 @@ class Task:
     frontmatter: dict[str, Any]
     body: str
     source_text: str
-    archived: bool = False
 
     @property
     def id(self) -> str:
@@ -66,23 +65,18 @@ def _contained_path(root: Path, path: Path) -> None:
         raise RepoctlError("Task files cannot be symlinks", code="invalid_task_path", path=str(path))
 
 
-def load_task(path: Path, root: Path, *, archived: bool = False) -> Task:
+def load_task(path: Path, root: Path) -> Task:
     _contained_path(root, path)
     text = _read_text(path)
     fields, body = parse_frontmatter(text)
-    return Task(path, path.relative_to(root).as_posix(), fields, body, source_text=text, archived=archived)
+    return Task(path, path.relative_to(root).as_posix(), fields, body, source_text=text)
 
 
-def load_tasks(root: Path, *, include_archived: bool = False) -> list[Task]:
+def load_tasks(root: Path) -> list[Task]:
     tasks: list[Task] = []
-    folders = [(root / "docs/tasks", False)]
-    if include_archived:
-        folders.append((root / "docs/archive/tasks", True))
-    for folder, archived in folders:
+    for folder in (root / "docs/tasks", root / "docs/archive/tasks"):
         for path in sorted(folder.glob("*.md")):
-            if path.name == "TEMPLATE.md":
-                continue
-            task = load_task(path, root, archived=archived)
+            task = load_task(path, root)
             if task.id or path.name.startswith("T-"):
                 tasks.append(task)
     return tasks
@@ -113,9 +107,6 @@ def resolve_task(root: Path, task_id: str) -> Task:
     folders = (root / "docs/tasks", root / "docs/archive/tasks")
     reference = raw.replace("\\", "/").removeprefix("./")
 
-    def read(path: Path) -> Task:
-        return load_task(path, root, archived=path.parent == folders[1])
-
     if reference.endswith(".md"):
         if "/" in reference:
             path = Path(reference)
@@ -124,19 +115,17 @@ def resolve_task(root: Path, task_id: str) -> Task:
                 raise RepoctlError("Task path is outside Task directories", code="invalid_task_path", path=reference)
             if not path.is_file() and not path.is_symlink():
                 raise RepoctlError(f"Task not found: {raw}", code="task_not_found")
-            return read(path)
+            return load_task(path, root)
         named = [folder / reference for folder in folders if (folder / reference).is_file() or (folder / reference).is_symlink()]
         if len(named) > 1:
             raise RepoctlError(f"Task reference is ambiguous: {raw}", code="duplicate_task_id")
         if named:
-            return read(named[0])
+            return load_task(named[0], root)
     matches: list[Path] = []
     # Generated and human-authored filenames have equal standing. Inspect all
     # identities, then read the selected body; unrelated damage does not block it.
     for folder in folders:
         for path in sorted(folder.glob("*.md")):
-            if path.name == "TEMPLATE.md":
-                continue
             try:
                 identities = _read_task_ids(path, root)
             except (RepoctlError, OSError, UnicodeError):
@@ -147,10 +136,29 @@ def resolve_task(root: Path, task_id: str) -> Task:
         raise RepoctlError(f"Task not found: {raw}", code="task_not_found")
     if len(matches) > 1:
         raise RepoctlError(f"Task id is ambiguous: {raw}", code="duplicate_task_id")
-    task = read(matches[0])
+    task = load_task(matches[0], root)
     if task.id != raw:
         raise RepoctlError("Task identity changed while it was being selected; retry", code="task_changed", path=task.rel_path)
     return task
+
+
+@dataclass(frozen=True)
+class TaskEdit:
+    task_id: str
+    path: str
+    text: str
+    original_text: str | None = None
+
+
+def apply_task_edit(root: Path, edit: TaskEdit) -> None:
+    path = root / edit.path
+    _contained_path(root, path)
+    if edit.original_text is None:
+        if path.exists():
+            raise RepoctlError("Task destination already exists", code="destination_exists", path=edit.path)
+    elif path.read_bytes() != edit.original_text.encode("utf-8"):
+        raise RepoctlError("Task changed after it was read; retry with the current document", code="task_changed", path=edit.path)
+    atomic_write(path, edit.text)
 
 
 def utc_stamp() -> str:
@@ -161,7 +169,8 @@ def prepare_task_create(
     *, title: str, slug: str | None = None, area: str = "",
     owner: str = "", parent: str = "", repo_ref: str = "",
     repo_id: str = "", depends_on: list[str] | tuple[str, ...] = (), body: str | None = None,
-) -> dict[str, Any]:
+    start: bool = False,
+) -> TaskEdit:
     """Prepare a new document; publishing it is the caller's single write."""
     title = title.strip()
     if not title or "\n" in title or "\r" in title:
@@ -172,7 +181,7 @@ def prepare_task_create(
         raise RepoctlError("Task slug must be a filename component", code="invalid_slug")
     task_id = "T-" + datetime.now(UTC).strftime("%Y%m%d%H%M%SZ") + "-" + uuid4().hex[:8]
     fields: dict[str, Any] = {
-        "id": task_id, "title": title, "status": "todo", "created": utc_stamp(),
+        "id": task_id, "title": title, "status": "doing" if start else "todo", "created": utc_stamp(),
     }
     for field, value in (
         ("owner", owner), ("repo_id", repo_id), ("repo_ref", repo_ref),
@@ -180,66 +189,54 @@ def prepare_task_create(
     ):
         if value:
             fields[field] = value
+    if start:
+        fields["started_at"] = utc_stamp()
     if depends_on:
         fields["depends_on"] = list(depends_on)
     front = "---\n" + "".join(f"{key}: {json.dumps(value, ensure_ascii=False)}\n" for key, value in fields.items()) + "---\n"
-    return {
-        "task_id": task_id,
-        "old_path": "",
-        "new_path": f"docs/tasks/{task_id}--{slug}.md",
-        "text": front + (f"\n# {title}\n" if body is None else body),
-        "original_text": None,
-    }
+    return TaskEdit(
+        task_id, f"docs/tasks/{task_id}--{slug}.md",
+        front + (f"\n# {title}\n" if body is None else body),
+    )
 
 
-def _live_task(root: Path, task_id: str) -> Task:
+def _open_task(root: Path, task_id: str) -> Task:
     task = resolve_task(root, task_id)
     if not task.id:
         raise RepoctlError("Task has no id", code="missing_task_id", path=task.rel_path)
-    if task.status not in STATUSES:
+    if task.status not in TASK_STATUSES:
         raise RepoctlError(f"Unknown Task status: {task.status}", code="invalid_task_status", path=task.rel_path)
-    if task.archived or task.status in NON_LIVE:
+    if task.status in CLOSED_STATUSES:
         raise RepoctlError("Task is already closed", code="task_not_live", path=task.rel_path)
     return task
 
 
-def _prepare_status_change(root: Path, task: Task, status: str, *, note: str = "") -> dict[str, Any]:
+def _prepare_status_change(task: Task, status: str, *, note: str = "") -> TaskEdit:
     original = task.source_text
     text = replace_frontmatter_line(original, "status", status)
-    new_path = task.rel_path
     if status == "doing" and not task.frontmatter.get("started_at"):
         text = replace_frontmatter_line(text, "started_at", json.dumps(utc_stamp()))
-    if status in NON_LIVE:
+    if status in CLOSED_STATUSES:
         text = replace_frontmatter_line(text, "completed_at", json.dumps(utc_stamp()))
-        new_path = f"docs/archive/tasks/{task.path.name}"
-        target = root / new_path
-        if target != task.path and (target.exists() or target.is_symlink()):
-            raise RepoctlError("Archive target already exists", code="archive_task_conflict", path=new_path)
     if note.strip():
         text = _append_lifecycle_note(text, note)
-    return {
-        "task_id": task.id,
-        "old_path": task.rel_path,
-        "new_path": new_path,
-        "text": text,
-        "original_text": original,
-    }
+    return TaskEdit(task.id, task.rel_path, text, original)
 
 
-def prepare_task_start(root: Path, task_id: str) -> dict[str, Any]:
-    return _prepare_status_change(root, _live_task(root, task_id), "doing")
+def prepare_task_start(root: Path, task_id: str) -> TaskEdit:
+    return _prepare_status_change(_open_task(root, task_id), "doing")
 
 
-def prepare_task_finish(root: Path, task_id: str, *, summary: str = "") -> dict[str, Any]:
-    return _prepare_status_change(root, _live_task(root, task_id), "done", note=summary)
+def prepare_task_finish(root: Path, task_id: str, *, summary: str = "") -> TaskEdit:
+    return _prepare_status_change(_open_task(root, task_id), "done", note=summary)
 
 
-def prepare_task_cancel(root: Path, task_id: str, *, reason: str = "") -> dict[str, Any]:
-    return _prepare_status_change(root, _live_task(root, task_id), "canceled", note=reason)
+def prepare_task_cancel(root: Path, task_id: str, *, reason: str = "") -> TaskEdit:
+    return _prepare_status_change(_open_task(root, task_id), "canceled", note=reason)
 
 
-def prepare_task_block(root: Path, task_id: str, *, reason: str = "") -> dict[str, Any]:
-    return _prepare_status_change(root, _live_task(root, task_id), "blocked", note=reason)
+def prepare_task_block(root: Path, task_id: str, *, reason: str = "") -> TaskEdit:
+    return _prepare_status_change(_open_task(root, task_id), "blocked", note=reason)
 
 
 def _append_lifecycle_note(text: str, message: str) -> str:
@@ -269,7 +266,7 @@ def validate_tasks(tasks: list[Task]) -> list[Problem]:
         if task.id in by_id:
             problems.append(Problem("error", "duplicate_task_id", f"Duplicate Task id: {task.id}", task.rel_path))
         by_id[task.id] = task
-        if task.status not in STATUSES:
+        if task.status not in TASK_STATUSES:
             problems.append(Problem("warning", "unknown_status", f"Unknown Task status: {task.status}", task.rel_path))
         headings: dict[str, int] = {}
         for section in section_ranges(task.body):

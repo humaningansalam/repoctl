@@ -1,6 +1,6 @@
 [project]
 name = "repoctl"
-version = "1.0.0"
+version = "2.0.0"
 description = "Markdown tasks and project source navigation"
 requires-python = ">=3.11"
 dependencies = []

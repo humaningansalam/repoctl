@@ -26,7 +26,6 @@ public sealed class ProjectInput
 
 public sealed class CompilationBundle
 {
-    public ProjectInput Input;
     public CSharpCompilation Compilation;
     public Dictionary<string, SyntaxTree> TreesByPath;
     public HashSet<string> FailedPaths;
@@ -80,15 +79,6 @@ public sealed class CallWalker : CSharpSyntaxWalker
 static string NormalizePath(string value)
 {
     return Path.GetFullPath(value).Replace('\\', '/');
-}
-
-static string RelativePath(string repoRoot, string value)
-{
-    var root = NormalizePath(repoRoot).TrimEnd('/') + "/";
-    var path = NormalizePath(value);
-    if (!path.StartsWith(root, StringComparison.Ordinal))
-        return "";
-    return path.Substring(root.Length);
 }
 
 static Dictionary<string, object> Anchor(SyntaxNode node, string path)
@@ -289,7 +279,7 @@ static CompilationBundle BuildCompilation(ProjectInput input, string repoRoot)
         trees.Values,
         references,
         new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true));
-    return new CompilationBundle { Input = input, Compilation = compilation, TreesByPath = trees, FailedPaths = failed };
+    return new CompilationBundle { Compilation = compilation, TreesByPath = trees, FailedPaths = failed };
 }
 
 var serializer = new JavaScriptSerializer { MaxJsonLength = Int32.MaxValue, RecursionLimit = 256 };

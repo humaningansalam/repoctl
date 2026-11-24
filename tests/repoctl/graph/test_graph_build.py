@@ -296,6 +296,12 @@ def test_graph_materialization_reuses_unchanged_inputs(tmp_path: Path) -> None:
     assert [problem.code for problem in invalid_problems] == ["graph_materialization_invalid"]
     assert invalid_meta["materialization"]["status"] == "invalid"
     assert provider_path.read_text(encoding="utf-8") == "{not-json\n"
+    provider_path.write_bytes(b"\xff")
+    unreadable, read_problems, read_meta = materialize_graph(tmp_path, target=target)
+    assert unreadable is None
+    assert [problem.code for problem in read_problems] == ["graph_materialization_unavailable"]
+    assert read_meta["materialization"]["status"] == "unavailable"
+    assert provider_path.read_bytes() == b"\xff"
     provider_path.write_text(provider_text, encoding="utf-8")
 
 
@@ -539,3 +545,45 @@ def test_knowledge_citation_does_not_declare_code_applicability(tmp_path: Path, 
     provenance = [edge for edge in snapshot.edges if edge.kind == "KNOWLEDGE_SOURCED_FROM"]
     assert len(provenance) == 1
     assert provenance[0].assertion == "recorded"
+
+
+def test_structural_incremental_build_preserves_cross_file_context(tmp_path: Path) -> None:
+    write_workspace(tmp_path)
+    repo = tmp_path / "repos"
+    init_repo(repo)
+    sources = {
+        "go/main.go": "package queue\nfunc Dispatch() { Run() }\n",
+        "go/run.go": "package queue\nfunc Run() {}\n",
+        "main.rs": "mod clock;\nfn main() { clock::tick(); }\n",
+        "clock.rs": "pub fn tick() {}\n",
+    }
+    for path, source in sources.items():
+        source_path = repo / path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(source, encoding="utf-8")
+    target = require_repo_target(tmp_path, repo_id="main")
+    original, original_problems, _ = materialize_graph(tmp_path, target=target)
+    assert original is not None and not original_problems
+    assert len([edge for edge in original.edges if edge.kind == "CALLS"]) == 2
+
+    (repo / "go/run.go").write_text("// shifted declaration\n" + sources["go/run.go"], encoding="utf-8")
+    updated, update_problems, _ = materialize_graph(tmp_path, target=target)
+    rebuilt, rebuild_problems, _ = materialize_graph(tmp_path, target=target, rebuild=True)
+
+    assert updated is not None and rebuilt is not None
+    assert not update_problems and not rebuild_problems
+    assert len([edge for edge in updated.edges if edge.kind == "CALLS"]) == 2
+    assert updated.to_dict() == rebuilt.to_dict()
+
+    (repo / "placeholder.txt").write_text("excluded source\n", encoding="utf-8")
+    for path in sources:
+        source_path = repo / path
+        source_path.unlink()
+        source_path.symlink_to(repo / "placeholder.txt")
+    empty, empty_problems, _ = materialize_graph(tmp_path, target=target)
+    clean, clean_problems, _ = materialize_graph(tmp_path, target=target, rebuild=True)
+
+    assert empty is not None and clean is not None
+    assert not empty_problems and not clean_problems
+    assert not [edge for edge in empty.edges if edge.kind in {"CALLS", "IMPORTS_FILE"}]
+    assert empty.to_dict() == clean.to_dict()

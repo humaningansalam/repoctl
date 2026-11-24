@@ -568,37 +568,33 @@ final class _Collector extends RecursiveAstVisitor<void> {
     };
   }
 
-  void _recordDeclaration(Element? element) {
-    _descriptor(element);
-  }
-
   @override
   void visitClassDeclaration(ClassDeclaration node) {
-    _recordDeclaration(node.declaredFragment?.element);
+    _descriptor(node.declaredFragment?.element);
     super.visitClassDeclaration(node);
   }
 
   @override
   void visitEnumDeclaration(EnumDeclaration node) {
-    _recordDeclaration(node.declaredFragment?.element);
+    _descriptor(node.declaredFragment?.element);
     super.visitEnumDeclaration(node);
   }
 
   @override
   void visitMixinDeclaration(MixinDeclaration node) {
-    _recordDeclaration(node.declaredFragment?.element);
+    _descriptor(node.declaredFragment?.element);
     super.visitMixinDeclaration(node);
   }
 
   @override
   void visitExtensionDeclaration(ExtensionDeclaration node) {
-    _recordDeclaration(node.declaredFragment?.element);
+    _descriptor(node.declaredFragment?.element);
     super.visitExtensionDeclaration(node);
   }
 
   @override
   void visitExtensionTypeDeclaration(ExtensionTypeDeclaration node) {
-    _recordDeclaration(node.declaredFragment?.element);
+    _descriptor(node.declaredFragment?.element);
     super.visitExtensionTypeDeclaration(node);
   }
 

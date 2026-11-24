@@ -1,1 +1,1 @@
-"""repoctl: deterministic file-native workspace management."""
+"""Markdown Tasks, repository source navigation and authored Knowledge notes."""

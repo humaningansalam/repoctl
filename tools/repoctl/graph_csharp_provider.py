@@ -18,7 +18,6 @@ from .graph_semantic_model import (
 from .repositories import RepoTarget
 
 
-CSHARP_PROVIDER_LANGUAGES = frozenset({"csharp"})
 PROVIDER = "csharp_roslyn"
 
 

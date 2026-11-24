@@ -373,6 +373,31 @@ def test_structured_yaml_relations_require_schema_locations_and_working_director
     assert (".github/workflows/release.yml", "deploy.sh", {"workflow_run_file"}) not in rows
 
 
+def test_workflow_docker_build_resolves_from_working_directory(tmp_path: Path) -> None:
+    write_workspace(tmp_path)
+    repo = tmp_path / "repos"
+    init_repo(repo)
+    (repo / "app/docker").mkdir(parents=True)
+    (repo / "app/config.json").write_text("{}\n", encoding="utf-8")
+    for path in ("app/Dockerfile", "app/docker/Dockerfile.prod"):
+        (repo / path).write_text("COPY config.json /app/config.json\n", encoding="utf-8")
+    workflow = repo / ".github/workflows/build.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        "jobs:\n  build:\n    steps:\n"
+        "      - working-directory: app\n        run: docker build .\n"
+        "      - working-directory: app\n        run: docker build -f docker/Dockerfile.prod .\n",
+        encoding="utf-8",
+    )
+
+    _materialize(tmp_path)
+    rows = _structured_edge_rows(tmp_path)
+
+    for dockerfile in ("app/Dockerfile", "app/docker/Dockerfile.prod"):
+        assert (".github/workflows/build.yml", dockerfile, {"workflow_run_file"}) in rows
+        assert (dockerfile, "app/config.json", {"docker_copy_source"}) in rows
+
+
 def test_structured_docker_and_shell_relations_use_typed_file_resolution(tmp_path: Path) -> None:
     write_workspace(tmp_path)
     repo = tmp_path / "repos"

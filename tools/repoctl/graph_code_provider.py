@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import symtable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal
 
 from .code_index import CodeIndexEntry
@@ -1270,7 +1269,6 @@ def _calls_for_analysis(
 
 
 def build_python_semantics(
-    root: Path,
     *,
     target: RepoTarget,
     entries: list[CodeIndexEntry],
@@ -1279,7 +1277,6 @@ def build_python_semantics(
     known_symbols: tuple[PreciseSymbol, ...] = (),
     known_exported_callables: tuple[PythonCallableExport, ...] = (),
 ) -> tuple[list[PreciseSymbol], list[PreciseCall], dict[str, object]]:
-    del root
     selected_paths = {
         entry.path
         for entry in entries

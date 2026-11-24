@@ -64,3 +64,33 @@ def test_resume_returns_a_unique_task_or_selection_choices(tmp_path: Path, capsy
     code, selected = run_json(tmp_path, capsys, "task", "resume", "second")
     assert code == 0
     assert selected["data"]["task"]["id"] == "second"
+
+
+def test_task_list_selects_status_across_document_locations(tmp_path: Path, capsys) -> None:
+    write_workspace(tmp_path)
+    add_task(tmp_path, "current.md", task_text("current", status="doing"))
+    add_task(tmp_path, "completed.md", task_text("completed", status="done"))
+    add_task(tmp_path, "custom.md", task_text("custom", status="waiting-for-user"))
+    archive = tmp_path / "docs/archive/tasks"
+    (archive / "history.md").write_text(task_text("history", status="done"))
+    (archive / "revisited.md").write_text(task_text("revisited", status="todo"))
+    (archive / "canceled.md").write_text(task_text("canceled", status="canceled"))
+
+    code, current = run_json(tmp_path, capsys, "task", "list")
+    assert code == 0
+    assert {task["id"] for task in current["data"]["tasks"]} == {"current", "custom", "revisited"}
+    code, completed = run_json(tmp_path, capsys, "task", "list", "--status", "done")
+    assert code == 0
+    assert {task["id"] for task in completed["data"]["tasks"]} == {"completed", "history"}
+    code, all_tasks = run_json(tmp_path, capsys, "task", "list", "--all")
+    assert code == 0
+    assert {task["id"] for task in all_tasks["data"]["tasks"]} == {
+        "current", "completed", "custom", "history", "revisited", "canceled",
+    }
+
+    code, resumed = run_json(tmp_path, capsys, "task", "resume")
+    assert code == 0
+    assert {task["id"] for task in resumed["data"]["candidates"]} == {"current", "revisited"}
+    code, checked = run_json(tmp_path, capsys, "check")
+    assert code == 0
+    assert checked["data"]["task_count"] == 6

@@ -17,12 +17,9 @@ from .graph_semantic_model import CapabilityEvidence, PreciseCall, PreciseSymbol
 from .repositories import RepoTarget
 
 PROVIDER = "tree_sitter_structural"
-LANGUAGES = frozenset({"rust", "go", "java", "kotlin", "swift"})
 # The index has one Java profile for both Java and Kotlin; use actual suffix.
 EXTENSIONS = {".rs": "rust", ".go": "go", ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".swift": "swift"}
 LANGUAGE_IDS = frozenset(EXTENSIONS.values())
-MAX_SOURCE_BYTES = 2 * 1024 * 1024
-MAX_AST_NODES = 150000  # bounded non-recursive AST walk
 DEFINITION_KINDS = {
     "rust": {"function_item": "function", "struct_item": "type", "enum_item": "type", "trait_item": "type", "mod_item": "module", "type_item": "type"},
     "go": {"function_declaration": "function", "method_declaration": "method", "type_spec": "type"},
@@ -262,9 +259,6 @@ def build_tree_sitter_semantics(
             resolved = source_path.resolve(strict=True)
             if target.root_path.resolve(strict=True) not in (resolved, *resolved.parents) or source_path.is_symlink():
                 raise ValueError("symbol source escapes selected repository")
-            size = source_path.stat().st_size
-            if size > MAX_SOURCE_BYTES:
-                raise ValueError("source exceeds 2MiB AST budget")
             source = source_path.read_bytes()
             line_starts = [0, *(i + 1 for i, byte in enumerate(source) if byte == 10)]
             if language not in parsers:
@@ -293,19 +287,15 @@ def build_tree_sitter_semantics(
             pending: list[tuple[Any, PreciseSymbol | None, tuple[str, ...]]] = [
                 (tree.root_node, None, ())
             ]
-            node_count = 0
             while pending:
                 node, current_function, scopes = pending.pop()
-                node_count += 1
-                if node_count > MAX_AST_NODES:
-                    raise ValueError("source AST exceeds bounded walk budget")
                 is_container = node.type in CONTAINERS
                 container = _container_name(node, source) if is_container else ""
                 inner_scopes = (*scopes, container) if container else scopes
                 kind = DEFINITION_KINDS[language].get(node.type)
                 name = _definition_name(node, source) if kind else ""
                 discovered = current_function
-                if node.type == "mod_item" and name and path.endswith(('/main.rs', '/lib.rs', '/mod.rs')):
+                if node.type == "mod_item" and name and Path(path).name in {"main.rs", "lib.rs", "mod.rs"}:
                     # A Rust `mod name;` references a sibling module file;
                     # inline modules have no separate file target.
                     if _node_text(source, node).rstrip().endswith(';'):

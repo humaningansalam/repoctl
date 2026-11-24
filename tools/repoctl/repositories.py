@@ -155,8 +155,6 @@ def is_git_repo_root(path: Path) -> bool:
         return False
 
 
-
-
 def _target(root: Path, repo_id: str, rel: str, *, identity_source: str, require_git: bool = True) -> RepoTarget:
     if not REPO_ID_RE.match(repo_id):
         raise RepoctlError(f"invalid repository id: {repo_id}")
